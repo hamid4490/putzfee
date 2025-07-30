@@ -8,6 +8,7 @@ from sqlalchemy.orm import relationship
 from databases import Database
 from dotenv import load_dotenv
 import datetime
+from sqlalchemy.dialects.postgresql import JSONB
 
 load_dotenv()
 
@@ -43,9 +44,7 @@ class RequestTable(Base):
     user_phone = Column(String)
     latitude = Column(Float)
     longitude = Column(Float)
-    brand = Column(String)
-    model = Column(String)
-    plate = Column(String)
+    car_list = Column(JSONB)  # فیلد لیست ماشین‌ها به صورت JSONB
     address = Column(String)
     service_type = Column(String)
     price = Column(Integer)
@@ -111,9 +110,7 @@ async def create_order(order: OrderRequest):
         user_phone=order.user_phone,
         latitude=order.location.latitude,
         longitude=order.location.longitude,
-        brand=order.car_info.brand,
-        model=order.car_info.model,
-        plate=order.car_info.plate,
+        car_list=[car.dict() for car in order.car_list],  # تبدیل لیست ماشین‌ها به دیکشنری
         address=order.address,
         service_type=order.service_type,
         price=order.price,
