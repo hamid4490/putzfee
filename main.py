@@ -69,7 +69,7 @@ class Location(BaseModel):
 class OrderRequest(BaseModel):
     user_phone: str
     location: Location
-    car_info: CarInfo
+    car_list: List[CarInfo]
     address: str
     service_type: str
     price: int
