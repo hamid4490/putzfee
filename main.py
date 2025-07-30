@@ -129,3 +129,23 @@ async def get_orders():
     query = RequestTable.__table__.select()
     result = await database.fetch_all(query)
     return [dict(row) for row in result]
+
+# مدل Pydantic برای کنسل کردن سفارش
+class CancelRequest(BaseModel):
+    user_phone: str
+
+
+@app.post("/cancel_order")
+async def cancel_order(cancel: CancelRequest):
+    # پیدا کردن سفارش فعال با شماره کاربر و مختصات
+    query = RequestTable.__table__.update().where(
+        (RequestTable.user_phone == cancel.user_phone) &
+        (RequestTable.status == "در انتظار")
+    ).values(
+        status="کنسل شده"
+    )
+    result = await database.execute(query)
+    if result:
+        return {"status": "ok", "message": "درخواست کنسل شد"}
+    else:
+        return {"status": "error", "message": "سفارشی پیدا نشد یا قبلاً کنسل شده"}
