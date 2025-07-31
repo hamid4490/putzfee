@@ -197,3 +197,24 @@ async def get_user_active_services(user_phone: str):
     )
     result = await database.fetch_all(query)
     return [dict(row) for row in result]
+
+# مدل Pydantic برای ثبت‌نام کاربر
+class UserRegisterRequest(BaseModel):
+    phone: str
+    address: Optional[str] = None
+
+@app.post("/register_user")
+async def register_user(user: UserRegisterRequest):
+    # چک کن کاربر وجود دارد یا نه
+    query = UserTable.__table__.select().where(UserTable.phone == user.phone)
+    existing = await database.fetch_one(query)
+    if existing:
+        return {"status": "ok", "message": "User already exists"}
+    # اگر وجود ندارد، بساز
+    query = UserTable.__table__.insert().values(
+        phone=user.phone,
+        address=user.address or "",
+        car_list=[]
+    )
+    await database.execute(query)
+    return {"status": "ok", "message": "User registered"}
