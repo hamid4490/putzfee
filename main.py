@@ -149,3 +149,13 @@ async def cancel_order(cancel: CancelRequest):
         return {"status": "ok", "message": "درخواست کنسل شد"}
     else:
         return {"status": "error", "message": "سفارشی پیدا نشد یا قبلاً کنسل شده"}
+
+
+@app.get("/user_active_services/{user_phone}")
+async def get_user_active_services(user_phone: str):
+    query = RequestTable.__table__.select().where(
+        (RequestTable.user_phone == user_phone) &
+        (RequestTable.status == "در انتظار")
+    )
+    result = await database.fetch_all(query)
+    return [dict(row) for row in result]
