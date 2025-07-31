@@ -1,31 +1,37 @@
+# ایمپورت‌های لازم
 import os
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, Boolean
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
 from databases import Database
 from dotenv import load_dotenv
 import datetime
-from sqlalchemy.dialects.postgresql import JSONB
 
+# بارگذاری متغیرهای محیطی (مثلاً DATABASE_URL)
 load_dotenv()
 
+# گرفتن آدرس دیتابیس از env
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# ساخت آبجکت دیتابیس و بیس مدل SQLAlchemy
 database = Database(DATABASE_URL)
 Base = declarative_base()
 
+# ساخت اپلیکیشن FastAPI
 app = FastAPI()
 
-# SQLAlchemy Models
+# مدل دیتابیس کاربر (UserTable) با لیست ماشین‌ها به صورت JSONB
 class UserTable(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String, unique=True, index=True)
     address = Column(String)
+    car_list = Column(JSONB, default=list)  # لیست ماشین‌ها به صورت JSONB
 
+# مدل دیتابیس راننده (DriverTable)
 class DriverTable(Base):
     __tablename__ = "drivers"
     id = Column(Integer, primary_key=True, index=True)
@@ -38,13 +44,14 @@ class DriverTable(Base):
     is_online = Column(Boolean, default=False)
     status = Column(String, default="فعال")
 
+# مدل دیتابیس سفارش (RequestTable)
 class RequestTable(Base):
     __tablename__ = "requests"
     id = Column(Integer, primary_key=True, index=True)
     user_phone = Column(String)
     latitude = Column(Float)
     longitude = Column(Float)
-    car_list = Column(JSONB)  # فیلد لیست ماشین‌ها به صورت JSONB
+    car_list = Column(JSONB)  # لیست ماشین‌ها به صورت JSONB
     address = Column(String)
     service_type = Column(String)
     price = Column(Integer)
@@ -55,16 +62,18 @@ class RequestTable(Base):
     finish_datetime = Column(String)
     payment_type = Column(String)
 
-# Pydantic Models
+# مدل Pydantic برای اطلاعات ماشین
 class CarInfo(BaseModel):
     brand: str
     model: str
     plate: str
 
+# مدل Pydantic برای لوکیشن
 class Location(BaseModel):
     latitude: float
     longitude: float
 
+# مدل Pydantic برای ثبت سفارش
 class OrderRequest(BaseModel):
     user_phone: str
     location: Location
@@ -75,20 +84,17 @@ class OrderRequest(BaseModel):
     request_datetime: str
     payment_type: str
 
-class User(BaseModel):
-    phone: str
-    address: Optional[str] = None
+# مدل Pydantic برای ثبت/ویرایش ماشین کاربر
+class CarListUpdateRequest(BaseModel):
+    user_phone: str
+    car_list: List[CarInfo]
 
-class Driver(BaseModel):
-    first_name: str
-    last_name: str
-    photo_url: Optional[str] = None
-    id_card_number: str
-    phone: str
-    phone_verified: bool = False
-    is_online: bool = False
-    status: str = "فعال"
+# مدل Pydantic برای کنسل کردن سفارش
+class CancelRequest(BaseModel):
+    user_phone: str
+    service_type: str
 
+# رویداد استارتاپ: ساخت جداول و اتصال به دیتابیس
 @app.on_event("startup")
 async def startup():
     import sqlalchemy
@@ -96,21 +102,52 @@ async def startup():
     Base.metadata.create_all(engine)
     await database.connect()
 
+# رویداد شات‌داون: قطع اتصال دیتابیس
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
 
+# روت اصلی برای تست سرور
 @app.get("/")
 def read_root():
     return {"message": "Putzfee FastAPI Server is running!"}
 
+# --- مدیریت ماشین‌های کاربر ---
+
+# گرفتن لیست ماشین‌های کاربر
+@app.get("/user_cars/{user_phone}")
+async def get_user_cars(user_phone: str):
+    query = UserTable.__table__.select().where(UserTable.phone == user_phone)
+    user = await database.fetch_one(query)
+    if user:
+        return user["car_list"] or []
+    else:
+        raise HTTPException(status_code=404, detail="User not found")
+
+# ذخیره/آپدیت لیست ماشین‌های کاربر
+@app.post("/user_cars")
+async def update_user_cars(data: CarListUpdateRequest):
+    # اگر کاربر وجود دارد، car_list را آپدیت کن
+    query = UserTable.__table__.update().where(UserTable.phone == data.user_phone).values(
+        car_list=[car.dict() for car in data.car_list]
+    )
+    result = await database.execute(query)
+    if result:
+        return {"status": "ok", "message": "لیست ماشین‌ها ذخیره شد"}
+    else:
+        # اگر کاربر وجود ندارد، خطا بده
+        raise HTTPException(status_code=404, detail="User not found")
+
+# --- مدیریت سفارش‌ها ---
+
+# ثبت سفارش جدید
 @app.post("/order")
 async def create_order(order: OrderRequest):
     query = RequestTable.__table__.insert().values(
         user_phone=order.user_phone,
         latitude=order.location.latitude,
         longitude=order.location.longitude,
-        car_list=[car.dict() for car in order.car_list],  # تبدیل لیست ماشین‌ها به دیکشنری
+        car_list=[car.dict() for car in order.car_list],
         address=order.address,
         service_type=order.service_type,
         price=order.price,
@@ -124,22 +161,23 @@ async def create_order(order: OrderRequest):
     await database.execute(query)
     return {"status": "ok", "message": "درخواست ثبت شد"}
 
+# گرفتن لیست همه سفارش‌ها
 @app.get("/orders")
 async def get_orders():
     query = RequestTable.__table__.select()
     result = await database.fetch_all(query)
     return [dict(row) for row in result]
 
-# مدل Pydantic برای کنسل کردن سفارش
-class CancelRequest(BaseModel):
-    user_phone: str
-
-
+# کنسل کردن سفارش (بر اساس شماره تلفن و نوع سرویس)
 @app.post("/cancel_order")
 async def cancel_order(cancel: CancelRequest):
-    # پیدا کردن سفارش فعال با شماره کاربر و مختصات
+    """
+    این endpoint سفارش فعال کاربر را بر اساس شماره تلفن و نوع سرویس پیدا می‌کند
+    و وضعیت آن را به "کنسل شده" تغییر می‌دهد.
+    """
     query = RequestTable.__table__.update().where(
         (RequestTable.user_phone == cancel.user_phone) &
+        (RequestTable.service_type == cancel.service_type) &
         (RequestTable.status == "در انتظار")
     ).values(
         status="کنسل شده"
@@ -150,7 +188,7 @@ async def cancel_order(cancel: CancelRequest):
     else:
         return {"status": "error", "message": "سفارشی پیدا نشد یا قبلاً کنسل شده"}
 
-
+# گرفتن سفارش‌های فعال کاربر (در انتظار) بر اساس شماره تلفن
 @app.get("/user_active_services/{user_phone}")
 async def get_user_active_services(user_phone: str):
     query = RequestTable.__table__.select().where(
