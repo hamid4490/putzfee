@@ -124,20 +124,23 @@ async def get_user_cars(user_phone: str):
     else:
         raise HTTPException(status_code=404, detail="User not found")
 
-# ذخیره/آپدیت لیست ماشین‌های کاربر
 @app.post("/user_cars")
 async def update_user_cars(data: CarListUpdateRequest):
-    # اگر کاربر وجود دارد، car_list را آپدیت کن
-    query = UserTable.__table__.update().where(UserTable.phone == data.user_phone).values(
-        car_list=[car.dict() for car in data.car_list]
-    )
-    result = await database.execute(query)
-    if result:
-        return {"status": "ok", "message": "لیست ماشین‌ها ذخیره شد"}
-    else:
-        # اگر کاربر وجود ندارد، خطا بده
-        raise HTTPException(status_code=404, detail="User not found")
+    query = UserTable.select().where(UserTable.c.phone == data.user_phone)
+    user = await database.fetch_one(query)
 
+    if user:
+        query = UserTable.update().where(UserTable.c.phone == data.user_phone).values(
+            car_list=[car.dict() for car in data.car_list]
+        )
+    else:
+        query = UserTable.insert().values(
+            phone=data.user_phone,
+            car_list=[car.dict() for car in data.car_list]
+        )
+
+    await database.execute(query)
+    return {"status": "ok", "message": "لیست ماشین‌ها ذخیره شد"}
 # --- مدیریت سفارش‌ها ---
 
 # ثبت سفارش جدید
@@ -198,7 +201,7 @@ async def get_user_active_services(user_phone: str):
     result = await database.fetch_all(query)
     return [dict(row) for row in result]
 
-# مدل Pydantic برای ثبت‌نام کاربر
+    # مدل Pydantic برای ثبت‌نام کاربر
 class UserRegisterRequest(BaseModel):
     phone: str
     address: Optional[str] = None
