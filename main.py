@@ -124,23 +124,23 @@ async def get_user_cars(user_phone: str):
     else:
         raise HTTPException(status_code=404, detail="User not found")
 
+# ذخیره/آپدیت لیست ماشین‌های کاربر
 @app.post("/user_cars")
 async def update_user_cars(data: CarListUpdateRequest):
-    query = UserTable.select().where(UserTable.c.phone == data.user_phone)
-    user = await database.fetch_one(query)
+    # بررسی وجود کاربر
+    query_check = UserTable.__table__.select().where(UserTable.phone == data.user_phone)
+    user = await database.fetch_one(query_check)
 
     if user:
-        query = UserTable.update().where(UserTable.c.phone == data.user_phone).values(
+        # بروزرسانی car_list اگر کاربر وجود دارد
+        query_update = UserTable.__table__.update().where(UserTable.phone == data.user_phone).values(
             car_list=[car.dict() for car in data.car_list]
         )
+        await database.execute(query_update)
+        return {"status": "ok", "message": "لیست ماشین‌ها ذخیره شد"}
     else:
-        query = UserTable.insert().values(
-            phone=data.user_phone,
-            car_list=[car.dict() for car in data.car_list]
-        )
-
-    await database.execute(query)
-    return {"status": "ok", "message": "لیست ماشین‌ها ذخیره شد"}
+        # اگر کاربر وجود نداشت، خطا بده
+        raise HTTPException(status_code=404, detail="User not found")
 # --- مدیریت سفارش‌ها ---
 
 # ثبت سفارش جدید
