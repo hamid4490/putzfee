@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field, validator
 import re
 
 class UserCreate(BaseModel):
-    phone: str = Field(..., regex="^09\d{9}$")
+    phone: str = Field(..., pattern="^09\d{9}$")
     password: str = Field(..., min_length=6)
     name: str = ""
     address: str = ""
