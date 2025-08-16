@@ -8,3 +8,6 @@ python-dotenv
 psycopg2-binary
 passlib[bcrypt]
 loguru
+databases[asyncpg]
+bcrypt
+pyjwt
