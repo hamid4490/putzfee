@@ -1,66 +1,37 @@
-# -*- coding: utf-8 -*-  # -*-=اعلان کدینگ | utf-8=پشتیبانی فارسی/آلمانی
-import os  # os=متغیرهای محیطی
-import hashlib  # hashlib=هش (برای سازگاری/رفرش)
-import secrets  # secrets=توکن امن
-from datetime import datetime, timedelta, timezone  # datetime/timedelta/timezone=زمان
-from typing import Optional, List  # typing=نوع‌های کمکی
+# -*- coding: utf-8 -*-
+import os
+import hashlib
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List
 
-import bcrypt  # bcrypt=هش امن پسورد
-import jwt  # jwt=توکن‌های JWT
+import bcrypt
+import jwt
+from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from fastapi import FastAPI, HTTPException, Request, Header  # FastAPI/HTTPException/Request/Header=چارچوب/خطا/درخواست/هدر
-from fastapi.middleware.cors import CORSMiddleware  # CORSMiddleware=CORS
-from pydantic import BaseModel  # BaseModel=مدل‌های Pydantic
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Index, select, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.declarative import declarative_base
+import sqlalchemy
+from databases import Database
+from dotenv import load_dotenv
 
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Index, select, func  # SQLAlchemy=ORM
-from sqlalchemy.dialects.postgresql import JSONB  # JSONB=نوع JSON بهینه
-from sqlalchemy.ext.declarative import declarative_base  # declarative_base=پایه ORM
-import sqlalchemy  # sqlalchemy=انجین
+# ——— پیکربندی محیط (بدون تغییر) ———
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")
+PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
+ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
 
-from databases import Database  # databases=کتابخانه اتصال async
-from dotenv import load_dotenv  # load_dotenv=خواندن .env
+database = Database(DATABASE_URL)
+Base = declarative_base()
 
-from unidecode import unidecode  # unidecode=برای نگاشت به اسلاگ (فقط سرویس)
-
-# ——— پیکربندی محیط ———
-load_dotenv()  # بارگذاری .env
-DATABASE_URL = os.getenv("DATABASE_URL")  # DATABASE_URL=آدرس دیتابیس
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")  # JWT_SECRET=راز JWT
-PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")  # PASSWORD_PEPPER=pepper پسورد
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))  # انقضای access
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))  # انقضای refresh
-BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))  # هزینه bcrypt
-ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")  # دامنه‌های مجاز CORS
-
-database = Database(DATABASE_URL)  # database=اتصال async
-Base = declarative_base()  # Base=پایه ORM
-
-# ——— نرمال‌سازی داده‌های ساختاری ———
-FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")  # FA_DIGITS=نگاشت ارقام فارسی
-AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")  # AR_DIGITS=نگاشت ارقام عربی
-
-SERVICE_MAP = {  # SERVICE_MAP=نگاشت سرویس‌ها به اسلاگ انگلیسی
-    "کارواش": "carwash", "Autowäsche": "carwash", "car wash": "carwash",
-    "شستشوی مبل": "sofa_cleaning", "Sofareinigung": "sofa_cleaning",
-    "نظافت کلی": "general_cleaning", "Allgemeine Reinigung": "general_cleaning",
-    "شستشوی پنجره": "window_cleaning", "Fensterreinigung": "window_cleaning",
-    "نظافت راه‌پله": "stairs_cleaning", "Treppenreinigung": "stairs_cleaning",
-    "سرویس بهداشتی": "bathroom_cleaning", "Badezimmerreinigung": "bathroom_cleaning",
-}
-
-def normalize_digits(s: str) -> str:  # normalize_digits=تبدیل ارقام به انگلیسی
-    if not s: return ""
-    return s.translate(FA_DIGITS).translate(AR_DIGITS)
-
-def map_service_type_to_slug(s: str) -> str:  # map_service_type_to_slug=نگاشت سرویس به اسلاگ
-    if not s: return ""
-    s_norm = s.strip().lower()  # s_norm=نرمال‌سازی اولیه
-    for key, value in SERVICE_MAP.items():  # پیمایش نگاشت
-        if s_norm == key.lower():  # اگر مطابقت دقیق داشت
-            return value  # return=اسلاگ انگلیسی
-    return s_norm.replace(" ", "_")  # fallback=استفاده از خود ورودی نرمال‌شده
-
-# ——— مدل‌های ORM ———
+# ——— مدل‌های ORM (بدون تغییر) ———
 class UserTable(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -92,14 +63,14 @@ class RequestTable(Base):
     car_list = Column(JSONB)
     address = Column(String)
     home_number = Column(String, default="")
-    service_type = Column(String)
+    service_type = Column(String) # کد انگلیسی: carwash
     price = Column(Integer)
     request_datetime = Column(String)
-    status = Column(String)
+    status = Column(String) # کد انگلیسی: PENDING
     driver_name = Column(String)
     driver_phone = Column(String)
     finish_datetime = Column(String)
-    payment_type = Column(String)
+    payment_type = Column(String) # کد انگلیسی: cash
 
 class RefreshTokenTable(Base):
     __tablename__ = "refresh_tokens"
@@ -111,7 +82,7 @@ class RefreshTokenTable(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     __table_args__ = (Index("ix_refresh_token_user_id_expires", "user_id", "expires_at"),)
 
-# ——— مدل‌های Pydantic ———
+# ——— مدل‌های Pydantic (بدون تغییر) ———
 class CarInfo(BaseModel):
     brand: str
     model: str
@@ -127,10 +98,10 @@ class OrderRequest(BaseModel):
     car_list: List[CarInfo]
     address: str
     home_number: Optional[str] = ""
-    service_type: str
+    service_type: str # باید کد انگلیسی باشد
     price: int
     request_datetime: str
-    payment_type: str
+    payment_type: str # باید کد انگلیسی باشد
 
 class CarListUpdateRequest(BaseModel):
     user_phone: str
@@ -138,7 +109,7 @@ class CarListUpdateRequest(BaseModel):
 
 class CancelRequest(BaseModel):
     user_phone: str
-    service_type: str
+    service_type: str # باید کد انگلیسی باشد
 
 class UserRegisterRequest(BaseModel):
     phone: str
@@ -154,7 +125,7 @@ class UserProfileUpdate(BaseModel):
     name: str = ""
     address: str = ""
 
-# ——— توابع امنیت ———
+# ——— توابع امنیت (بدون تغییر) ———
 def bcrypt_hash_password(password: str) -> str:
     salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
     mixed = (password + PASSWORD_PEPPER).encode("utf-8")
@@ -185,7 +156,7 @@ def hash_refresh_token(token: str) -> str:
 def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):
     return {"status": status, "code": code, "message": message, "data": data or {}}
 
-# ——— اپ و CORS ———
+# ——— اپ و CORS (بدون تغییر) ———
 app = FastAPI()
 allow_origins = ["*"] if ALLOW_ORIGINS_ENV.strip() == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]
 app.add_middleware(
@@ -196,7 +167,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ——— چرخه عمر ———
+# ——— چرخه عمر (بدون تغییر) ———
 @app.on_event("startup")
 async def startup():
     engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))
@@ -212,40 +183,35 @@ async def shutdown():
 def read_root():
     return {"message": "Putzfee FastAPI Server is running!"}
 
-# ——— اندپوینت: بررسی وجود کاربر ———
+# ——— اندپوینت‌ها ———
 @app.get("/users/exists")
 async def user_exists(phone: str):
-    phone_norm = normalize_digits(phone)
-    q = select(func.count()).select_from(UserTable).where(UserTable.phone == phone_norm)
+    q = select(func.count()).select_from(UserTable).where(UserTable.phone == phone)
     count = await database.fetch_val(q)
     exists = bool(count and int(count) > 0)
     return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "user exists check", {"exists": exists})
 
-# ——— اندپوینت: ثبت‌نام (ذخیره UTF-8) ———
 @app.post("/register_user")
 async def register_user(user: UserRegisterRequest):
-    phone_norm = normalize_digits(user.phone)
-    q = select(func.count()).select_from(UserTable).where(UserTable.phone == phone_norm)
+    q = select(func.count()).select_from(UserTable).where(UserTable.phone == user.phone)
     count = await database.fetch_val(q)
     if count and int(count) > 0:
         raise HTTPException(status_code=400, detail="User already exists")
 
     password_hash = bcrypt_hash_password(user.password)
     ins = UserTable.__table__.insert().values(
-        phone=phone_norm,
+        phone=user.phone,
         password_hash=password_hash,
         address=(user.address or "").strip(),
         name="",
         car_list=[]
     )
     await database.execute(ins)
-    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": phone_norm})
+    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": user.phone})
 
-# ——— اندپوینت: ورود ———
 @app.post("/login")
 async def login_user(user: UserLoginRequest, request: Request):
-    phone_norm = normalize_digits(user.phone)
-    sel = UserTable.__table__.select().where(UserTable.phone == phone_norm)
+    sel = UserTable.__table__.select().where(UserTable.phone == user.phone)
     db_user = await database.fetch_one(sel)
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -264,10 +230,7 @@ async def login_user(user: UserLoginRequest, request: Request):
     refresh_exp = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
 
     ins_rt = RefreshTokenTable.__table__.insert().values(
-        user_id=db_user["id"],
-        token_hash=refresh_hash,
-        expires_at=refresh_exp,
-        revoked=False
+        user_id=db_user["id"], token_hash=refresh_hash, expires_at=refresh_exp, revoked=False
     )
     await database.execute(ins_rt)
 
@@ -276,44 +239,28 @@ async def login_user(user: UserLoginRequest, request: Request):
     address_val = mapping["address"] if "address" in mapping else ""
 
     return {
-        "status": "ok",
-        "message": "Login successful",
-        "token": access_token,
-        "access_token": access_token,
+        "status": "ok", "message": "Login successful", "token": access_token, "access_token": access_token,
         "refresh_token": refresh_token,
-        "user": {
-            "phone": db_user["phone"],
-            "address": address_val or "",
-            "name": name_val or ""
-        }
+        "user": { "phone": db_user["phone"], "address": address_val or "", "name": name_val or "" }
     }
 
-# ——— اندپوینت: رفرش اکسس‌توکن ———
 @app.post("/auth/refresh")
 async def refresh_access_token(req: dict):
     refresh_token = req.get("refresh_token", "")
-    if not refresh_token:
-        raise HTTPException(status_code=400, detail="refresh_token required")
+    if not refresh_token: raise HTTPException(status_code=400, detail="refresh_token required")
     token_hash = hash_refresh_token(refresh_token)
     now = datetime.now(timezone.utc)
     sel = RefreshTokenTable.__table__.select().where(
-        (RefreshTokenTable.token_hash == token_hash) &
-        (RefreshTokenTable.revoked == False) &
-        (RefreshTokenTable.expires_at > now)
+        (RefreshTokenTable.token_hash == token_hash) & (RefreshTokenTable.revoked == False) & (RefreshTokenTable.expires_at > now)
     )
     rt = await database.fetch_one(sel)
-    if not rt:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-
+    if not rt: raise HTTPException(status_code=401, detail="Invalid refresh token")
     sel_user = UserTable.__table__.select().where(UserTable.id == rt["user_id"])
     db_user = await database.fetch_one(sel_user)
-    if not db_user:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-
+    if not db_user: raise HTTPException(status_code=401, detail="Invalid refresh token")
     new_access = create_access_token(db_user["phone"])
     return unified_response("ok", "TOKEN_REFRESHED", "new access token", {"access_token": new_access})
 
-# ——— اندپوینت: بررسی اعتبار توکن (مسیر + هدر) ———
 @app.get("/verify_token/{token}")
 async def verify_token_path(token: str):
     try:
@@ -337,114 +284,98 @@ async def verify_token_header(authorization: Optional[str] = Header(None)):
     except Exception:
         return {"status": "error", "valid": False, "code": "TOKEN_INVALID"}
 
-# ——— اندپوینت: لیست ماشین‌های کاربر (ذخیره UTF-8) ———
 @app.get("/user_cars/{user_phone}")
 async def get_user_cars(user_phone: str):
-    phone_norm = normalize_digits(user_phone)
-    query = UserTable.__table__.select().where(UserTable.phone == phone_norm)
+    query = UserTable.__table__.select().where(UserTable.phone == user_phone)
     user = await database.fetch_one(query)
-    if user:
-        return user["car_list"] or []
+    if user: return user["car_list"] or []
     raise HTTPException(status_code=404, detail="User not found")
 
 @app.post("/user_cars")
 async def update_user_cars(data: CarListUpdateRequest):
-    phone_norm = normalize_digits(data.user_phone)
-    cars_norm = [
-        {"brand": c.brand.strip(), "model": c.model.strip(), "plate": normalize_digits(c.plate)}
-        for c in data.car_list
-    ]
-    sel = UserTable.__table__.select().where(UserTable.phone == phone_norm)
+    sel = UserTable.__table__.select().where(UserTable.phone == data.user_phone)
     user = await database.fetch_one(sel)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    upd = UserTable.__table__.update().where(UserTable.phone == phone_norm).values(
-        car_list=cars_norm
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+    upd = UserTable.__table__.update().where(UserTable.phone == data.user_phone).values(
+        car_list=[car.dict() for car in data.car_list]
     )
     await database.execute(upd)
     return {"status": "ok", "message": "cars saved"}
 
-# ——— اندپوینت: ثبت سفارش (ذخیره UTF-8 + کدهای انگلیسی) ———
 @app.post("/order")
 async def create_order(order: OrderRequest):
-    phone_norm = normalize_digits(order.user_phone)
-    home_number_norm = normalize_digits(order.home_number or "")
-    service_slug = map_service_type_to_slug(order.service_type)
-
-    cars_norm = [
-        {"brand": c.brand.strip(), "model": c.model.strip(), "plate": normalize_digits(c.plate)}
-        for c in order.car_list
-    ]
-
     ins = RequestTable.__table__.insert().values(
-        user_phone=phone_norm,
+        user_phone=order.user_phone,
         latitude=order.location.latitude,
         longitude=order.location.longitude,
-        car_list=cars_norm,
+        car_list=[car.dict() for car in order.car_list],
         address=order.address.strip(),
-        home_number=home_number_norm,
-        service_type=service_slug,
+        home_number=(order.home_number or "").strip(),
+        service_type=order.service_type, # کد انگلیسی از کلاینت
         price=order.price,
         request_datetime=order.request_datetime,
-        status="PENDING",
-        payment_type=order.payment_type.strip().lower()
+        status="PENDING", # کد انگلیسی ثابت
+        payment_type=order.payment_type.strip().lower() # کد انگلیسی از کلاینت
     )
     await database.execute(ins)
     return {"status": "ok", "message": "request created"}
 
-# ——— اندپوینت: لغو سفارش ———
 @app.post("/cancel_order")
 async def cancel_order(cancel: CancelRequest):
-    phone_norm = normalize_digits(cancel.user_phone)
-    service_slug = map_service_type_to_slug(cancel.service_type)
     upd = RequestTable.__table__.update().where(
-        (RequestTable.user_phone == phone_norm) &
-        (RequestTable.service_type == service_slug) &
-        (RequestTable.status.in_(["PENDING", "در انتظار"]))
+        (RequestTable.user_phone == cancel.user_phone) &
+        (RequestTable.service_type == cancel.service_type) &
+        (RequestTable.status.in_(["PENDING", "ACTIVE"])) # کد انگلیسی
     ).values(status="CANCELED")
     result = await database.execute(upd)
     if result:
         return {"status": "ok", "message": "canceled"}
     raise HTTPException(status_code=404, detail="active order not found")
 
-# ——— اندپوینت: سرویس‌های فعال کاربر ———
 @app.get("/user_active_services/{user_phone}")
 async def get_user_active_services(user_phone: str):
-    phone_norm = normalize_digits(user_phone)
     sel = RequestTable.__table__.select().where(
-        (RequestTable.user_phone == phone_norm) &
-        (RequestTable.status.in_(["PENDING", "ACTIVE", "در انتظار", "فعال"]))
+        (RequestTable.user_phone == user_phone) &
+        (RequestTable.status.in_(["PENDING", "ACTIVE"])) # کد انگلیسی
     )
     result = await database.fetch_all(sel)
     return [dict(row) for row in result]
 
-# ——— اندپوینت: تاریخچه سفارش‌های کاربر ———
 @app.get("/user_orders/{user_phone}")
 async def get_user_orders(user_phone: str):
-    phone_norm = normalize_digits(user_phone)
-    sel = RequestTable.__table__.select().where(RequestTable.phone == phone_norm)
+    sel = RequestTable.__table__.select().where(RequestTable.user_phone == user_phone)
     result = await database.fetch_all(sel)
     return [dict(row) for row in result]
 
-# ——— اندپوینت: به‌روزرسانی پروفایل (ذخیره UTF-8) ———
 @app.post("/user/profile")
 async def update_profile(body: UserProfileUpdate):
-    phone_norm = normalize_digits(body.phone)
-    if not phone_norm:
+    if not body.phone.strip():
         raise HTTPException(status_code=400, detail="phone_required")
-    sel = UserTable.__table__.select().where(UserTable.phone == phone_norm)
+    sel = UserTable.__table__.select().where(UserTable.phone == body.phone)
     user = await database.fetch_one(sel)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     else:
-        upd = UserTable.__table__.update().where(UserTable.phone == phone_norm).values(
+        upd = UserTable.__table__.update().where(UserTable.phone == body.phone).values(
             name=body.name.strip(),
             address=body.address.strip()
         )
         await database.execute(upd)
-    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": phone_norm})
+    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": body.phone})
 
-# ——— اندپوینت: لیست کاربران (دیباگ) ———
+@app.get("/user/profile/{phone}")
+async def get_user_profile(phone: str):
+    sel = UserTable.__table__.select().where(UserTable.phone == phone)
+    db_user = await database.fetch_one(sel)
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    mapping = getattr(db_user, "_mapping", {})
+    name_val = mapping["name"] if "name" in mapping else ""
+    address_val = mapping["address"] if "address" in mapping else ""
+    return unified_response("ok", "PROFILE_FETCHED", "profile data", {
+        "phone": db_user["phone"], "name": name_val or "", "address": address_val or ""
+    })
+
 @app.get("/debug/users")
 async def debug_users():
     rows = await database.fetch_all(UserTable.__table__.select())
