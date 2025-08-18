@@ -11,4 +11,5 @@ loguru
 databases[asyncpg]
 bcrypt
 pyjwt
-Unidecode==1.3.7
+databases[postgresql]
+unidecode 
