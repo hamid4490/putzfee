@@ -1,29 +1,36 @@
-from pydantic import BaseModel, Field  # import=BaseModel/Field برای DTOها
-from typing import List, Optional  # import=List/Optional برای تایپ‌ها
+# فایل: schemas.py
 
-class CarInfo(BaseModel):  # class=مدل ماشین
-    brand: str = Field(..., description="برند")  # brand=برند (اجباری)
-    model: str = Field(..., description="مدل")  # model=مدل (اجباری)
-    plate: str = Field(..., description="پلاک")  # plate=پلاک (اجباری)
+from pydantic import BaseModel, Field, validator
+import re
 
-class OrderCreate(BaseModel):  # class=بدنه ثبت سفارش
-    user_phone: str = Field(..., description="شماره کاربر")  # user_phone=شماره
-    location: dict = Field(..., description="مختصات {latitude,longitude}")  # location=مختصات دیکشنری
-    car_list: List[CarInfo] = Field(default_factory=list)  # car_list=لیست ماشین‌ها
-    address: str = Field(..., description="آدرس")  # address=آدرس
-    home_number: str = Field("", description="پلاک منزل")  # home_number=پلاک منزل (جدید)
-    service_type: str = Field(..., description="نوع سرویس")  # service_type=سرویس
-    price: int = Field(..., description="قیمت")  # price=قیمت
-    request_datetime: str = Field(..., description="زمان بدون میلی‌ثانیه")  # request_datetime=زمان ISO
-    payment_type: str = Field("", description="روش پرداخت")  # payment_type=پرداخت
+class UserCreate(BaseModel):
+    phone: str = Field(..., pattern=r"^09\d{9}$")
+    password: str = Field(..., min_length=6)
+    name: str = ""
+    address: str = ""
 
-class UserProfileUpdate(BaseModel):  # class=بدنه آپدیت پروفایل
-    phone: str = Field(..., description="شماره")  # phone=شماره
-    name: str = Field("", description="نام")  # name=نام
-    address: str = Field("", description="آدرس")  # address=آدرس
+    @validator("phone")
+    def validate_phone(cls, v):
+        if not re.match(r"^09\d{9}$", v):
+            raise ValueError("شماره موبایل معتبر نیست")
+        return v
 
-class ApiResponse(BaseModel):  # class=پاسخ استاندارد
-    status: str  # status=وضعیت متن (ok/error)
-    code: Optional[str] = None  # code=کد ماشین‌خوان
-    message: Optional[str] = None  # message=پیام انسانی
-    data: Optional[dict] = None  # data=داده خروجی
+class CarCreate(BaseModel):
+    brand: str
+    model: str
+    plate: str
+
+    @validator("plate")
+    def validate_plate(cls, v):
+        # نمونه ساده: پلاک باید شامل عدد و حرف باشد
+        if not re.match(r"^[0-9]{2,3}[A-Zآ-ی]{1,2}-[0-9]{3,4}$", v):
+            raise ValueError("فرمت پلاک معتبر نیست")
+        return v
+
+class OrderCreate(BaseModel):
+    user_phone: str
+    car_plate: str
+    service_type: str
+    address: str
+    price: int
+    payment_type: str
