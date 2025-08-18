@@ -41,7 +41,7 @@ class UserTable(Base):
     phone = Column(String, unique=True, index=True)
     password_hash = Column(String)
     address = Column(String)
-    name = Column(String, default="")  # جدید: ستون name (ستون در DB با مایگریشن اضافه شده)
+    name = Column(String, default="")  # ستون جدید
     car_list = Column(JSONB, default=list)
     auth_token = Column(String, nullable=True)
 
@@ -65,7 +65,7 @@ class RequestTable(Base):
     longitude = Column(Float)
     car_list = Column(JSONB)
     address = Column(String)
-    home_number = Column(String, default="")  # جدید: ستون پلاک منزل (ستون در DB با مایگریشن اضافه شده)
+    home_number = Column(String, default="")  # ستون جدید
     service_type = Column(String)
     price = Column(Integer)
     request_datetime = Column(String)
@@ -100,10 +100,10 @@ class OrderRequest(BaseModel):
     location: Location
     car_list: List[CarInfo]
     address: str
-    home_number: Optional[str] = ""   # جدید: دریافت پلاک منزل از کلاینت
+    home_number: Optional[str] = ""  # جدید: پلاک منزل
     service_type: str
     price: int
-    request_datetime: str            # فرمت بدون میلی‌ثانیه طبق کلاینت
+    request_datetime: str            # بدون میلی‌ثانیه
     payment_type: str
 
 class CarListUpdateRequest(BaseModel):
@@ -123,7 +123,7 @@ class UserLoginRequest(BaseModel):
     phone: str
     password: str
 
-class UserProfileUpdate(BaseModel):   # جدید: بدنه ذخیره پروفایل (نام/آدرس)
+class UserProfileUpdate(BaseModel):
     phone: str
     name: str = ""
     address: str = ""
@@ -207,13 +207,13 @@ async def register_user(user: UserRegisterRequest):
         phone=user.phone,
         password_hash=password_hash,
         address=user.address or "",
-        name="",          # جدید: مقدار اولیه خالی (بعداً با پروفایل به‌روزرسانی می‌شود)
+        name="",          # مقدار اولیه خالی
         car_list=[]
     )
     await database.execute(ins)
     return unified_response("ok", "USER_REGISTERED", "registered", {"phone": user.phone})
 
-# ---------- Login ----------
+# ---------- Login (fix for Record.get) ----------
 @app.post("/login")
 async def login_user(user: UserLoginRequest, request: Request):
     sel = UserTable.__table__.select().where(UserTable.phone == user.phone)
@@ -224,7 +224,7 @@ async def login_user(user: UserLoginRequest, request: Request):
     if not verify_password_secure(user.password, db_user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    # ارتقای هش قدیمی
+    # ارتقای هش قدیمی → bcrypt
     if not db_user["password_hash"].startswith("$2"):
         new_hash = bcrypt_hash_password(user.password)
         upd = UserTable.__table__.update().where(UserTable.id == db_user["id"]).values(password_hash=new_hash)
@@ -243,6 +243,10 @@ async def login_user(user: UserLoginRequest, request: Request):
     )
     await database.execute(ins_rt)
 
+    # NOTE: databases.Record متد get ندارد. از mapping داخلی استفاده می‌کنیم تا در نبود ستون name خطا ندهد.
+    name_val = db_user["name"] if ("name" in getattr(db_user, "_mapping", {})) else ""  # مقدار امن name
+    address_val = db_user["address"] if ("address" in getattr(db_user, "_mapping", {})) else ""
+
     return {
         "status": "ok",
         "message": "Login successful",
@@ -251,8 +255,8 @@ async def login_user(user: UserLoginRequest, request: Request):
         "refresh_token": refresh_token,
         "user": {
             "phone": db_user["phone"],
-            "address": db_user["address"] or "",
-            "name": db_user.get("name", "") or ""
+            "address": address_val or "",
+            "name": name_val or ""
         }
     }
 
@@ -326,7 +330,7 @@ async def update_user_cars(data: CarListUpdateRequest):
     await database.execute(upd)
     return {"status": "ok", "message": "cars saved"}
 
-# ---------- Orders ----------
+# ---------- Orders (home_number supported) ----------
 @app.post("/order")
 async def create_order(order: OrderRequest):
     ins = RequestTable.__table__.insert().values(
@@ -335,10 +339,10 @@ async def create_order(order: OrderRequest):
         longitude=order.location.longitude,
         car_list=[car.dict() for car in order.car_list],
         address=order.address,
-        home_number=(order.home_number or ""),  # ذخیره پلاک منزل (جدید)
+        home_number=(order.home_number or ""),  # ذخیره پلاک منزل
         service_type=order.service_type,
         price=order.price,
-        request_datetime=order.request_datetime,  # زمان بدون میلی‌ثانیه
+        request_datetime=order.request_datetime,
         status="در انتظار",
         driver_name="",
         driver_phone="",
@@ -379,7 +383,13 @@ async def get_user_orders(user_phone: str):
 @app.get("/debug/users")
 async def debug_users():
     rows = await database.fetch_all(UserTable.__table__.select())
-    return [{"id": r["id"], "phone": r["phone"], "name": r.get("name", "") or "", "address": r["address"] or ""} for r in rows]
+    out = []
+    for r in rows:
+        # مانند login: Record.get وجود ندارد؛ از mapping استفاده کن
+        name_val = r["name"] if ("name" in getattr(r, "_mapping", {})) else ""
+        address_val = r["address"] if ("address" in getattr(r, "_mapping", {})) else ""
+        out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})
+    return out
 
 # ---------- Profile (NEW) ----------
 @app.post("/user/profile")
