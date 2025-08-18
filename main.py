@@ -3,12 +3,10 @@ import os
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
+from typing import Optional, List
 
 import bcrypt
 import jwt
-
-from typing import Optional, List
-
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,9 +15,11 @@ from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Foreig
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 import sqlalchemy
-
 from databases import Database
 from dotenv import load_dotenv
+
+# NEW: transliteration
+from unidecode import unidecode  # pip install Unidecode
 
 # ---------- Env / Config ----------
 load_dotenv()
@@ -34,6 +34,81 @@ ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
 database = Database(DATABASE_URL)
 Base = declarative_base()
 
+# ---------- Normalize helpers (FA→EN) ----------
+FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
+AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+SERVICE_MAP = {
+    # fa → en-slug
+    "کارواش": "carwash",
+    "شستشوی مبل": "sofa_cleaning",
+    "نظافت کلی": "general_cleaning",
+    "شستشوی پنجره": "window_cleaning",
+    "نظافت راه‌پله": "stairs_cleaning",
+    "سرویس بهداشتی": "bathroom_cleaning",
+    # already english or variants will be normalized to lowercase/underscored
+}
+
+STATUS_MAP = {
+    # fa/en mixed → EN CODE
+    "در انتظار": "PENDING",
+    "pending": "PENDING",
+    "فعال": "ACTIVE",
+    "در حال انجام": "ACTIVE",
+    "active": "ACTIVE",
+    "کنسل شده": "CANCELED",
+    "canceled": "CANCELED",
+    "cancelled": "CANCELED",
+    "انجام شده": "DONE",
+    "done": "DONE",
+    "completed": "DONE",
+}
+
+def normalize_digits(s: str) -> str:
+    if not s:
+        return ""
+    return s.translate(FA_DIGITS).translate(AR_DIGITS)
+
+def to_english_text(s: str) -> str:
+    """Transliterate any non-latin text to latin (best-effort)."""
+    if not s:
+        return ""
+    # Normalize digits first, then transliterate text to latin
+    s = normalize_digits(s)
+    return unidecode(s).strip()
+
+def map_service_type(s: str) -> str:
+    if not s:
+        return ""
+    s1 = to_english_text(s).lower().strip()  # transliterate then lower
+    # try exact map for Persian first
+    if s in SERVICE_MAP:
+        return SERVICE_MAP[s]
+    # normalize common english variants
+    s1 = s1.replace(" ", "_")
+    # map known english labels to our slugs
+    for fa, en in SERVICE_MAP.items():
+        if s1 in (en, en.replace("_", " ")):
+            return en
+    # fallback: keep normalized s1
+    return s1
+
+def map_status_text_to_code(s: str) -> str:
+    if not s:
+        return "PENDING"
+    s1 = s.strip()
+    # exact match against map keys (fa/en)
+    low = s1.lower()
+    if s1 in STATUS_MAP:
+        return STATUS_MAP[s1]
+    if low in STATUS_MAP:
+        return STATUS_MAP[low]
+    # fallback: if already uppercase code keep it
+    up = s1.upper()
+    if up in ("PENDING", "ACTIVE", "CANCELED", "CANCELLED", "DONE"):
+        return "CANCELED" if up == "CANCELLED" else up
+    return "PENDING"
+
 # ---------- ORM Models ----------
 class UserTable(Base):
     __tablename__ = "users"
@@ -41,7 +116,7 @@ class UserTable(Base):
     phone = Column(String, unique=True, index=True)
     password_hash = Column(String)
     address = Column(String)
-    name = Column(String, default="")  # ستون جدید
+    name = Column(String, default="")
     car_list = Column(JSONB, default=list)
     auth_token = Column(String, nullable=True)
 
@@ -65,7 +140,7 @@ class RequestTable(Base):
     longitude = Column(Float)
     car_list = Column(JSONB)
     address = Column(String)
-    home_number = Column(String, default="")  # ستون جدید
+    home_number = Column(String, default="")
     service_type = Column(String)
     price = Column(Integer)
     request_datetime = Column(String)
@@ -100,10 +175,10 @@ class OrderRequest(BaseModel):
     location: Location
     car_list: List[CarInfo]
     address: str
-    home_number: Optional[str] = ""  # جدید: پلاک منزل
+    home_number: Optional[str] = ""
     service_type: str
     price: int
-    request_datetime: str            # بدون میلی‌ثانیه
+    request_datetime: str
     payment_type: str
 
 class CarListUpdateRequest(BaseModel):
@@ -128,7 +203,7 @@ class UserProfileUpdate(BaseModel):
     name: str = ""
     address: str = ""
 
-# ---------- Security Helpers ----------
+# ---------- Security ----------
 def bcrypt_hash_password(password: str) -> str:
     salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
     mixed = (password + PASSWORD_PEPPER).encode("utf-8")
@@ -173,7 +248,7 @@ app.add_middleware(
 # ---------- Lifecycle ----------
 @app.on_event("startup")
 async def startup():
-    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))  # فقط برای create_all
+    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))
     Base.metadata.create_all(engine)
     await database.connect()
 
@@ -189,34 +264,39 @@ def read_root():
 # ---------- Users Exists ----------
 @app.get("/users/exists")
 async def user_exists(phone: str):
-    q = select(func.count()).select_from(UserTable).where(UserTable.phone == phone)
+    phone_norm = normalize_digits(phone)
+    q = select(func.count()).select_from(UserTable).where(UserTable.phone == phone_norm)
     count = await database.fetch_val(q)
     exists = bool(count and int(count) > 0)
     return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "user exists check", {"exists": exists})
 
-# ---------- Register ----------
+# ---------- Register (store EN) ----------
 @app.post("/register_user")
 async def register_user(user: UserRegisterRequest):
-    q = select(func.count()).select_from(UserTable).where(UserTable.phone == user.phone)
+    phone_norm = normalize_digits(user.phone)
+    q = select(func.count()).select_from(UserTable).where(UserTable.phone == phone_norm)
     count = await database.fetch_val(q)
     if count and int(count) > 0:
         raise HTTPException(status_code=400, detail="User already exists")
 
     password_hash = bcrypt_hash_password(user.password)
+    address_en = to_english_text(user.address or "")
+
     ins = UserTable.__table__.insert().values(
-        phone=user.phone,
+        phone=phone_norm,
         password_hash=password_hash,
-        address=user.address or "",
-        name="",          # مقدار اولیه خالی
+        address=address_en,
+        name="",      # نام فعلاً خالی؛ از /user/profile تنظیم می‌شود
         car_list=[]
     )
     await database.execute(ins)
-    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": user.phone})
+    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": phone_norm})
 
-# ---------- Login (fix for Record.get) ----------
+# ---------- Login (fix Record.get + EN) ----------
 @app.post("/login")
 async def login_user(user: UserLoginRequest, request: Request):
-    sel = UserTable.__table__.select().where(UserTable.phone == user.phone)
+    phone_norm = normalize_digits(user.phone)
+    sel = UserTable.__table__.select().where(UserTable.phone == phone_norm)
     db_user = await database.fetch_one(sel)
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -224,7 +304,7 @@ async def login_user(user: UserLoginRequest, request: Request):
     if not verify_password_secure(user.password, db_user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    # ارتقای هش قدیمی → bcrypt
+    # Upgrade hash if legacy
     if not db_user["password_hash"].startswith("$2"):
         new_hash = bcrypt_hash_password(user.password)
         upd = UserTable.__table__.update().where(UserTable.id == db_user["id"]).values(password_hash=new_hash)
@@ -243,9 +323,10 @@ async def login_user(user: UserLoginRequest, request: Request):
     )
     await database.execute(ins_rt)
 
-    # NOTE: databases.Record متد get ندارد. از mapping داخلی استفاده می‌کنیم تا در نبود ستون name خطا ندهد.
-    name_val = db_user["name"] if ("name" in getattr(db_user, "_mapping", {})) else ""  # مقدار امن name
-    address_val = db_user["address"] if ("address" in getattr(db_user, "_mapping", {})) else ""
+    # databases.Record.get وجود ندارد؛ ایمن بخوان
+    mapping = getattr(db_user, "_mapping", {})
+    name_val = mapping["name"] if "name" in mapping else ""
+    address_val = mapping["address"] if "address" in mapping else ""
 
     return {
         "status": "ok",
@@ -285,7 +366,7 @@ async def refresh_access_token(req: dict):
     new_access = create_access_token(db_user["phone"])
     return unified_response("ok", "TOKEN_REFRESHED", "new access token", {"access_token": new_access})
 
-# ---------- Verify Token: path + header ----------
+# ---------- Verify Token (path + header) ----------
 @app.get("/verify_token/{token}")
 async def verify_token_path(token: str):
     try:
@@ -312,7 +393,8 @@ async def verify_token_header(authorization: Optional[str] = Header(None)):
 # ---------- Cars ----------
 @app.get("/user_cars/{user_phone}")
 async def get_user_cars(user_phone: str):
-    query = UserTable.__table__.select().where(UserTable.phone == user_phone)
+    phone_norm = normalize_digits(user_phone)
+    query = UserTable.__table__.select().where(UserTable.phone == phone_norm)
     user = await database.fetch_one(query)
     if user:
         return user["car_list"] or []
@@ -320,45 +402,62 @@ async def get_user_cars(user_phone: str):
 
 @app.post("/user_cars")
 async def update_user_cars(data: CarListUpdateRequest):
-    sel = UserTable.__table__.select().where(UserTable.phone == data.user_phone)
+    phone_norm = normalize_digits(data.user_phone)
+    # transliterate each car brand/model/plate to english
+    cars_en = [{"brand": to_english_text(c.brand), "model": to_english_text(c.model), "plate": to_english_text(c.plate)} for c in data.car_list]
+    sel = UserTable.__table__.select().where(UserTable.phone == phone_norm)
     user = await database.fetch_one(sel)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    upd = UserTable.__table__.update().where(UserTable.phone == data.user_phone).values(
-        car_list=[car.dict() for car in data.car_list]
+    upd = UserTable.__table__.update().where(UserTable.phone == phone_norm).values(
+        car_list=cars_en
     )
     await database.execute(upd)
     return {"status": "ok", "message": "cars saved"}
 
-# ---------- Orders (home_number supported) ----------
+# ---------- Orders (store EN) ----------
 @app.post("/order")
 async def create_order(order: OrderRequest):
+    phone_norm = normalize_digits(order.user_phone)
+    addr_en = to_english_text(order.address)
+    home_en = to_english_text(order.home_number or "")
+    service_en = map_service_type(order.service_type)
+    # normalize cars to english
+    cars_en = [{"brand": to_english_text(c.brand), "model": to_english_text(c.model), "plate": to_english_text(c.plate)} for c in order.car_list]
+
     ins = RequestTable.__table__.insert().values(
-        user_phone=order.user_phone,
+        user_phone=phone_norm,
         latitude=order.location.latitude,
         longitude=order.location.longitude,
-        car_list=[car.dict() for car in order.car_list],
-        address=order.address,
-        home_number=(order.home_number or ""),  # ذخیره پلاک منزل
-        service_type=order.service_type,
+        car_list=cars_en,
+        address=addr_en,
+        home_number=home_en,
+        service_type=service_en,
         price=order.price,
         request_datetime=order.request_datetime,
-        status="در انتظار",
+        status="PENDING",           # کُد انگلیسی
         driver_name="",
         driver_phone="",
         finish_datetime="",
-        payment_type=order.payment_type
+        payment_type=to_english_text(order.payment_type)
     )
     await database.execute(ins)
     return {"status": "ok", "message": "request created"}
 
 @app.post("/cancel_order")
 async def cancel_order(cancel: CancelRequest):
+    phone_norm = normalize_digits(cancel.user_phone)
+    service_en = map_service_type(cancel.service_type)
+    # وضعیت را فقط از PENDING به CANCELED تغییر بده
     upd = RequestTable.__table__.update().where(
-        (RequestTable.user_phone == cancel.user_phone) &
-        (RequestTable.service_type == cancel.service_type) &
-        (RequestTable.status == "در انتظار")
-    ).values(status="کنسل شده")
+        ((RequestTable.user_phone == phone_norm) &
+         (RequestTable.service_type == service_en) &
+         (RequestTable.status == "PENDING"))  # کُد انگلیسی
+        |
+        ((RequestTable.user_phone == phone_norm) &
+         (RequestTable.service_type == service_en) &
+         (RequestTable.status == "در انتظار"))  # سازگاری با داده‌های قدیمی
+    ).values(status="CANCELED")
     result = await database.execute(upd)
     if result:
         return {"status": "ok", "message": "canceled"}
@@ -366,16 +465,19 @@ async def cancel_order(cancel: CancelRequest):
 
 @app.get("/user_active_services/{user_phone}")
 async def get_user_active_services(user_phone: str):
+    phone_norm = normalize_digits(user_phone)
     sel = RequestTable.__table__.select().where(
-        (RequestTable.user_phone == user_phone) &
-        (RequestTable.status == "در انتظار")
+        ((RequestTable.user_phone == phone_norm) & (RequestTable.status == "PENDING"))
+        |
+        ((RequestTable.user_phone == phone_norm) & (RequestTable.status == "در انتظار"))  # سازگاری داده قدیمی
     )
     result = await database.fetch_all(sel)
     return [dict(row) for row in result]
 
 @app.get("/user_orders/{user_phone}")
 async def get_user_orders(user_phone: str):
-    sel = RequestTable.__table__.select().where(RequestTable.user_phone == user_phone)
+    phone_norm = normalize_digits(user_phone)
+    sel = RequestTable.__table__.select().where(RequestTable.user_phone == phone_norm)
     result = await database.fetch_all(sel)
     return [dict(row) for row in result]
 
@@ -385,32 +487,35 @@ async def debug_users():
     rows = await database.fetch_all(UserTable.__table__.select())
     out = []
     for r in rows:
-        # مانند login: Record.get وجود ندارد؛ از mapping استفاده کن
-        name_val = r["name"] if ("name" in getattr(r, "_mapping", {})) else ""
-        address_val = r["address"] if ("address" in getattr(r, "_mapping", {})) else ""
+        mapping = getattr(r, "_mapping", {})
+        name_val = mapping["name"] if "name" in mapping else ""
+        address_val = mapping["address"] if "address" in mapping else ""
         out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})
     return out
 
-# ---------- Profile (NEW) ----------
+# ---------- Profile (store EN) ----------
 @app.post("/user/profile")
 async def update_profile(body: UserProfileUpdate):
-    if not body.phone.strip():
+    phone_norm = normalize_digits(body.phone)
+    name_en = to_english_text(body.name)
+    address_en = to_english_text(body.address)
+    if not phone_norm:
         raise HTTPException(status_code=400, detail="phone_required")
-    sel = UserTable.__table__.select().where(UserTable.phone == body.phone)
+    sel = UserTable.__table__.select().where(UserTable.phone == phone_norm)
     user = await database.fetch_one(sel)
     if user is None:
         ins = UserTable.__table__.insert().values(
-            phone=body.phone.strip(),
+            phone=phone_norm,
             password_hash="",
-            address=(body.address or "").strip(),
-            name=(body.name or "").strip(),
+            address=address_en,
+            name=name_en,
             car_list=[]
         )
         await database.execute(ins)
     else:
-        upd = UserTable.__table__.update().where(UserTable.phone == body.phone).values(
-            name=(body.name or "").strip(),
-            address=(body.address or "").strip()
+        upd = UserTable.__table__.update().where(UserTable.phone == phone_norm).values(
+            name=name_en,
+            address=address_en
         )
         await database.execute(upd)
-    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": body.phone})
+    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": phone_norm})
