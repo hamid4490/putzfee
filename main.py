@@ -1,398 +1,406 @@
-# -*- coding: utf-8 -*-  # -*-=اعلان کدینگ فایل | utf-8=پشتیبانی از متن فارسی
-import os  # os=دسترسی به متغیرهای محیطی و مسیرها
-import hashlib  # hashlib=توابع هش (برای سازگاری قدیمی یا هش رفرش‌توکن)
-import secrets  # secrets=ساخت توکن‌های تصادفی امن
-from datetime import datetime, timedelta, timezone  # datetime/timedelta/timezone=کار با زمان و انقضاء
+# -*- coding: utf-8 -*-
+import os
+import hashlib
+import secrets
+from datetime import datetime, timedelta, timezone
 
-import bcrypt  # bcrypt=هش امن پسوردها
-import jwt  # jwt=کتابخانه JWT برای ساخت/اعتبارسنجی توکن
+import bcrypt
+import jwt
 
-from typing import Optional, List  # typing=نوع‌های کمکی (Optional/List)
+from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Request  # FastAPI/HTTPException/Request=چارچوب وب/اعلان خطا/دسترسی به درخواست
-from fastapi.middleware.cors import CORSMiddleware  # CORSMiddleware=میان‌افزار CORS
+from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from pydantic import BaseModel  # BaseModel=مدل‌های Pydantic برای بدنه/پاسخ
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Index, select, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.declarative import declarative_base
+import sqlalchemy
 
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Index, select, func  # SQLAlchemy=ORM/DDL
-from sqlalchemy.dialects.postgresql import JSONB  # JSONB=نوع JSON مخصوص PostgreSQL
-from sqlalchemy.ext.declarative import declarative_base  # declarative_base=پایه مدل‌های ORM
-import sqlalchemy  # sqlalchemy=کتابخانه ORM/Engine
+from databases import Database
+from dotenv import load_dotenv
 
-from databases import Database  # databases=کتابخانه اتصال async به دیتابیس
+# ---------- Env / Config ----------
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")
+PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
+ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
 
-from dotenv import load_dotenv  # load_dotenv=بارگذاری متغیرهای .env
+database = Database(DATABASE_URL)
+Base = declarative_base()
 
-# ——— پیکربندی عمومی ———
-load_dotenv()  # load_dotenv=خواندن متغیرهای محیطی از فایل .env (در صورت وجود)
-DATABASE_URL = os.getenv("DATABASE_URL")  # DATABASE_URL=آدرس دیتابیس (postgresql+asyncpg://...)
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")  # JWT_SECRET=راز امضاء JWT (پیش‌فرض تغییر کند)
-PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")  # PASSWORD_PEPPER=pepper برای سخت‌تر کردن هش
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))  # زمان انقضاء access_token به دقیقه
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))  # زمان انقضاء refresh_token به روز
-BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))  # هزینه bcrypt (دورهای هش)
-ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")  # ALLOW_ORIGINS=دامنه‌های مجاز CORS (کاما جدا)
+# ---------- ORM Models ----------
+class UserTable(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    address = Column(String)
+    name = Column(String, default="")  # جدید: ستون name (ستون در DB با مایگریشن اضافه شده)
+    car_list = Column(JSONB, default=list)
+    auth_token = Column(String, nullable=True)
 
-database = Database(DATABASE_URL)  # database=اتصال async به دیتابیس با libraries/databases
-Base = declarative_base()  # Base=پایه تعریف مدل‌های ORM
+class DriverTable(Base):
+    __tablename__ = "drivers"
+    id = Column(Integer, primary_key=True, index=True)
+    first_name = Column(String)
+    last_name = Column(String)
+    photo_url = Column(String)
+    id_card_number = Column(String)
+    phone = Column(String, unique=True)
+    phone_verified = Column(Boolean, default=False)
+    is_online = Column(Boolean, default=False)
+    status = Column(String, default="فعال")
 
-# ——— مدل‌های ORM (جداول) ———
-class UserTable(Base):  # UserTable=تعریف جدول کاربران
-    __tablename__ = "users"  # __tablename__=نام جدول "users"
-    id = Column(Integer, primary_key=True, index=True)  # id=کلید اصلی + ایندکس
-    phone = Column(String, unique=True, index=True)  # phone=شماره موبایل (یکتا + ایندکس)
-    password_hash = Column(String)  # password_hash=هش پسورد (bcrypt یا قدیمی)
-    address = Column(String)  # address=آدرس کاربر (متن کوتاه)
-    name = Column(String, default="")  # name=نام کاربر (جدید) | default="" برای سازگاری
-    car_list = Column(JSONB, default=list)  # car_list=لیست ماشین‌ها به صورت JSONB
-    auth_token = Column(String, nullable=True)  # auth_token=سازگاری قدیمی (در صورت عدم نیاز قابل حذف)
+class RequestTable(Base):
+    __tablename__ = "requests"
+    id = Column(Integer, primary_key=True, index=True)
+    user_phone = Column(String)
+    latitude = Column(Float)
+    longitude = Column(Float)
+    car_list = Column(JSONB)
+    address = Column(String)
+    home_number = Column(String, default="")  # جدید: ستون پلاک منزل (ستون در DB با مایگریشن اضافه شده)
+    service_type = Column(String)
+    price = Column(Integer)
+    request_datetime = Column(String)
+    status = Column(String)
+    driver_name = Column(String)
+    driver_phone = Column(String)
+    finish_datetime = Column(String)
+    payment_type = Column(String)
 
-class DriverTable(Base):  # DriverTable=جدول راننده‌ها
-    __tablename__ = "drivers"  # نام جدول
-    id = Column(Integer, primary_key=True, index=True)  # id=کلید اصلی + ایندکس
-    first_name = Column(String)  # first_name=نام
-    last_name = Column(String)  # last_name=نام خانوادگی
-    photo_url = Column(String)  # photo_url=آدرس عکس
-    id_card_number = Column(String)  # id_card_number=کد ملی
-    phone = Column(String, unique=True)  # phone=شماره موبایل (یکتا)
-    phone_verified = Column(Boolean, default=False)  # phone_verified=تأیید شماره؟
-    is_online = Column(Boolean, default=False)  # is_online=وضعیت آنلاین
-    status = Column(String, default="فعال")  # status=وضعیت راننده
+class RefreshTokenTable(Base):
+    __tablename__ = "refresh_tokens"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    token_hash = Column(String, unique=True, index=True)
+    expires_at = Column(DateTime(timezone=True), index=True)
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (Index("ix_refresh_token_user_id_expires", "user_id", "expires_at"),)
 
-class RequestTable(Base):  # RequestTable=جدول سفارش/درخواست‌ها
-    __tablename__ = "requests"  # نام جدول
-    id = Column(Integer, primary_key=True, index=True)  # id=کلید اصلی + ایندکس
-    user_phone = Column(String)  # user_phone=شماره کاربر
-    latitude = Column(Float)  # latitude=عرض جغرافیایی
-    longitude = Column(Float)  # longitude=طول جغرافیایی
-    car_list = Column(JSONB)  # car_list=لیست ماشین‌ها (JSONB)
-    address = Column(String)  # address=آدرس
-    home_number = Column(String, default="")  # home_number=پلاک/شماره واحد (جدید)
-    service_type = Column(String)  # service_type=نوع سرویس
-    price = Column(Integer)  # price=قیمت
-    request_datetime = Column(String)  # request_datetime=زمان درخواست (رشته ISO - بدون میلی‌ثانیه)
-    status = Column(String)  # status=وضعیت جاری سفارش
-    driver_name = Column(String)  # driver_name=نام راننده
-    driver_phone = Column(String)  # driver_phone=تلفن راننده
-    finish_datetime = Column(String)  # finish_datetime=زمان پایان
-    payment_type = Column(String)  # payment_type=روش پرداخت
+# ---------- Pydantic Schemas ----------
+class CarInfo(BaseModel):
+    brand: str
+    model: str
+    plate: str
 
-class RefreshTokenTable(Base):  # RefreshTokenTable=جدول رفرش‌توکن‌ها
-    __tablename__ = "refresh_tokens"  # نام جدول
-    id = Column(Integer, primary_key=True, index=True)  # id=کلید اصلی + ایندکس
-    user_id = Column(Integer, ForeignKey("users.id"), index=True)  # user_id=ارجاع به کاربر
-    token_hash = Column(String, unique=True, index=True)  # token_hash=هش رفرش‌توکن (یکتا+ایندکس)
-    expires_at = Column(DateTime(timezone=True), index=True)  # expires_at=زمان انقضاء
-    revoked = Column(Boolean, default=False)  # revoked=ابطال شده؟
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # created_at=زمان ایجاد
-    __table_args__ = (Index("ix_refresh_token_user_id_expires", "user_id", "expires_at"),)  # __table_args__=ایندکس ترکیبی روی user_id+expires
+class Location(BaseModel):
+    latitude: float
+    longitude: float
 
-# ——— مدل‌های Pydantic (ورودی/خروجی) ———
-class CarInfo(BaseModel):  # CarInfo=مدل ماشین برای بدنه درخواست‌ها
-    brand: str  # brand=برند
-    model: str  # model=مدل
-    plate: str  # plate=پلاک
+class OrderRequest(BaseModel):
+    user_phone: str
+    location: Location
+    car_list: List[CarInfo]
+    address: str
+    home_number: Optional[str] = ""   # جدید: دریافت پلاک منزل از کلاینت
+    service_type: str
+    price: int
+    request_datetime: str            # فرمت بدون میلی‌ثانیه طبق کلاینت
+    payment_type: str
 
-class Location(BaseModel):  # Location=مختصات جغرافیایی
-    latitude: float  # latitude=عرض
-    longitude: float  # longitude=طول
+class CarListUpdateRequest(BaseModel):
+    user_phone: str
+    car_list: List[CarInfo]
 
-class OrderRequest(BaseModel):  # OrderRequest=بدنه ایجاد سفارش (کلاینت → سرور)
-    user_phone: str  # user_phone=شماره کاربر
-    location: Location  # location=مختصات {latitude,longitude}
-    car_list: List[CarInfo]  # car_list=لیست ماشین‌ها
-    address: str  # address=آدرس
-    home_number: Optional[str] = ""  # home_number=پلاک منزل (افزوده شد)
-    service_type: str  # service_type=نوع سرویس
-    price: int  # price=قیمت
-    request_datetime: str  # request_datetime=زمان ISO بدون میلی‌ثانیه
-    payment_type: str  # payment_type=روش پرداخت
+class CancelRequest(BaseModel):
+    user_phone: str
+    service_type: str
 
-class CarListUpdateRequest(BaseModel):  # CarListUpdateRequest=بدنه ذخیره لیست ماشین‌ها
-    user_phone: str  # user_phone=شماره کاربر
-    car_list: List[CarInfo]  # car_list=لیست ماشین‌ها
+class UserRegisterRequest(BaseModel):
+    phone: str
+    password: str
+    address: Optional[str] = None
 
-class CancelRequest(BaseModel):  # CancelRequest=بدنه لغو سفارش
-    user_phone: str  # user_phone=شماره کاربر
-    service_type: str  # service_type=نوع سرویس
+class UserLoginRequest(BaseModel):
+    phone: str
+    password: str
 
-class UserRegisterRequest(BaseModel):  # UserRegisterRequest=بدنه ثبت‌نام
-    phone: str  # phone=شماره
-    password: str  # password=پسورد
-    address: Optional[str] = None  # address=آدرس (اختیاری)
+class UserProfileUpdate(BaseModel):   # جدید: بدنه ذخیره پروفایل (نام/آدرس)
+    phone: str
+    name: str = ""
+    address: str = ""
 
-class UserLoginRequest(BaseModel):  # UserLoginRequest=بدنه ورود
-    phone: str  # phone=شماره
-    password: str  # password=پسورد
+# ---------- Security Helpers ----------
+def bcrypt_hash_password(password: str) -> str:
+    salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
+    mixed = (password + PASSWORD_PEPPER).encode("utf-8")
+    return bcrypt.hashpw(mixed, salt).decode("utf-8")
 
-class UserProfileUpdate(BaseModel):  # UserProfileUpdate=بدنه به‌روزرسانی پروفایل (جدید)
-    phone: str  # phone=شماره کاربر
-    name: str = ""  # name=نام (پیش‌فرض خالی)
-    address: str = ""  # address=آدرس (پیش‌فرض خالی)
+def verify_password_secure(password: str, stored_hash: str) -> bool:
+    try:
+        if stored_hash.startswith("$2"):
+            mixed = (password + PASSWORD_PEPPER).encode("utf-8")
+            return bcrypt.checkpw(mixed, stored_hash.encode("utf-8"))
+        old = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return old == stored_hash
+    except Exception:
+        return False
 
-# ——— توابع امنیت/توکن ———
-def bcrypt_hash_password(password: str) -> str:  # bcrypt_hash_password=تولید هش bcrypt برای پسورد
-    salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)  # salt=ساخت نمک با هزینه تعیین‌شده
-    mixed = (password + PASSWORD_PEPPER).encode("utf-8")  # mixed=ترکیب پسورد با pepper و تبدیل به بایت
-    return bcrypt.hashpw(mixed, salt).decode("utf-8")  # return=هش bcrypt به صورت رشته
+def create_access_token(phone: str) -> str:
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": phone, "type": "access", "exp": exp}
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def verify_password_secure(password: str, stored_hash: str) -> bool:  # verify_password_secure=اعتبارسنجی پسورد
-    try:  # try=ایمن در برابر خطا
-        if stored_hash.startswith("$2"):  # اگر هش از نوع bcrypt است
-            mixed = (password + PASSWORD_PEPPER).encode("utf-8")  # mixed=پسورد+pepper
-            return bcrypt.checkpw(mixed, stored_hash.encode("utf-8"))  # return=نتیجه بررسی bcrypt
-        old = hashlib.sha256(password.encode("utf-8")).hexdigest()  # old=هش قدیمی SHA-256
-        return old == stored_hash  # return=بررسی برابر بودن با هش قدیمی
-    except Exception:  # except=در هر خطا
-        return False  # return=false (نامعتبر)
+def create_refresh_token() -> str:
+    return secrets.token_urlsafe(48)
 
-def create_access_token(phone: str) -> str:  # create_access_token=ساخت JWT دسترسی
-    now = datetime.now(timezone.utc)  # now=زمان فعلی (UTC)
-    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)  # exp=زمان انقضاء
-    payload = {"sub": phone, "type": "access", "exp": exp}  # payload=اطلاعات JWT
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")  # return=JWT امضاءشده
+def hash_refresh_token(token: str) -> str:
+    return hashlib.sha256((token + PASSWORD_PEPPER).encode("utf-8")).hexdigest()
 
-def create_refresh_token() -> str:  # create_refresh_token=ساخت رفرش‌توکن تصادفی
-    return secrets.token_urlsafe(48)  # return=رشته امن تصادفی
+def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):
+    return {"status": status, "code": code, "message": message, "data": data or {}}
 
-def hash_refresh_token(token: str) -> str:  # hash_refresh_token=هش رفرش‌توکن جهت ذخیره
-    return hashlib.sha256((token + PASSWORD_PEPPER).encode("utf-8")).hexdigest()  # return=هش SHA-256
+# ---------- App & CORS ----------
+app = FastAPI()
+allow_origins = ["*"] if ALLOW_ORIGINS_ENV.strip() == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):  # unified_response=پاسخ استاندارد یکپارچه
-    return {"status": status, "code": code, "message": message, "data": data or {}}  # return=دیکشنری استاندارد پاسخ
+# ---------- Lifecycle ----------
+@app.on_event("startup")
+async def startup():
+    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))  # فقط برای create_all
+    Base.metadata.create_all(engine)
+    await database.connect()
 
-# ——— اپ و CORS ———
-app = FastAPI()  # app=نمونه FastAPI
-allow_origins = ["*"] if ALLOW_ORIGINS_ENV.strip() == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]  # allow_origins=لیست دامنه‌های مجاز CORS
-app.add_middleware(  # add_middleware=افزودن میان‌افزار CORS
-    CORSMiddleware,  # CORSMiddleware=کلاس میان‌افزار
-    allow_origins=allow_origins,  # allow_origins=دامنه‌ها
-    allow_credentials=True,  # allow_credentials=اجازه ارسال کوکی/اعتبارنامه
-    allow_methods=["*"],  # allow_methods=اجازه همه متدها
-    allow_headers=["*"],  # allow_headers=اجازه همه هدرها
-)  # پایان add_middleware
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
 
-# ——— چرخه عمر اپ ———
-@app.on_event("startup")  # @on_event=اجرای کد هنگام شروع اپ
-async def startup():  # startup=تابع شروع
-    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))  # engine=انجین sync برای create_all (تبدیل +asyncpg)
-    Base.metadata.create_all(engine)  # create_all=ایجاد جداول در صورت عدم وجود (ستون‌های جدید در DB موجود نیاز به مایگریشن دارند)
-    await database.connect()  # اتصال async به دیتابیس
+# ---------- Health ----------
+@app.get("/")
+def read_root():
+    return {"message": "Putzfee FastAPI Server is running!"}
 
-@app.on_event("shutdown")  # @on_event=اجرای کد هنگام خاموشی اپ
-async def shutdown():  # shutdown=تابع پایان
-    await database.disconnect()  # قطع اتصال دیتابیس
+# ---------- Users Exists ----------
+@app.get("/users/exists")
+async def user_exists(phone: str):
+    q = select(func.count()).select_from(UserTable).where(UserTable.phone == phone)
+    count = await database.fetch_val(q)
+    exists = bool(count and int(count) > 0)
+    return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "user exists check", {"exists": exists})
 
-# ——— روت سلامت ———
-@app.get("/")  # GET=مسیر ریشه
-def read_root():  # read_root=هندلر سلامت
-    return {"message": "Putzfee FastAPI Server is running!"}  # return=پیام ساده سلامت
+# ---------- Register ----------
+@app.post("/register_user")
+async def register_user(user: UserRegisterRequest):
+    q = select(func.count()).select_from(UserTable).where(UserTable.phone == user.phone)
+    count = await database.fetch_val(q)
+    if count and int(count) > 0:
+        raise HTTPException(status_code=400, detail="User already exists")
 
-# ——— اندپوینت: بررسی وجود کاربر ———
-@app.get("/users/exists")  # GET=/users/exists
-async def user_exists(phone: str):  # user_exists=بررسی وجود با phone (Query)
-    q = select(func.count()).select_from(UserTable).where(UserTable.phone == phone)  # q=SELECT COUNT(*) FROM users WHERE phone=...
-    count = await database.fetch_val(q)  # count=دریافت مقدار شمارش
-    exists = bool(count and int(count) > 0)  # exists=تبدیل به بولین
-    return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "user exists check", {"exists": exists})  # return=پاسخ استاندارد
+    password_hash = bcrypt_hash_password(user.password)
+    ins = UserTable.__table__.insert().values(
+        phone=user.phone,
+        password_hash=password_hash,
+        address=user.address or "",
+        name="",          # جدید: مقدار اولیه خالی (بعداً با پروفایل به‌روزرسانی می‌شود)
+        car_list=[]
+    )
+    await database.execute(ins)
+    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": user.phone})
 
-# ——— اندپوینت: ثبت‌نام کاربر ———
-@app.post("/register_user")  # POST=/register_user
-async def register_user(user: UserRegisterRequest):  # register_user=هندلر ثبت‌نام
-    q = select(func.count()).select_from(UserTable).where(UserTable.phone == user.phone)  # q=چک وجود شماره
-    count = await database.fetch_val(q)  # count=خواندن شمارش
-    if count and int(count) > 0:  # اگر قبلاً وجود دارد
-        raise HTTPException(status_code=400, detail="User already exists")  # raise=خطای 400
+# ---------- Login ----------
+@app.post("/login")
+async def login_user(user: UserLoginRequest, request: Request):
+    sel = UserTable.__table__.select().where(UserTable.phone == user.phone)
+    db_user = await database.fetch_one(sel)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    password_hash = bcrypt_hash_password(user.password)  # password_hash=هش bcrypt پسورد
-    ins = UserTable.__table__.insert().values(  # ins=INSERT به جدول users
-        phone=user.phone,  # phone=شماره
-        password_hash=password_hash,  # password_hash=هش
-        address=user.address or "",  # address=آدرس یا خالی
-        name="",  # name=نام (ابتدا خالی؛ بعداً با پروفایل به‌روزرسانی می‌شود)
-        car_list=[]  # car_list=لیست ماشین‌ها (خالی)
-    )  # پایان values
-    await database.execute(ins)  # اجرای INSERT
-    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": user.phone})  # return=پاسخ استاندارد
+    if not verify_password_secure(user.password, db_user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid password")
 
-# ——— اندپوینت: ورود کاربر ———
-@app.post("/login")  # POST=/login
-async def login_user(user: UserLoginRequest, request: Request):  # login_user=هندلر ورود
-    sel = UserTable.__table__.select().where(UserTable.phone == user.phone)  # sel=SELECT کاربر با phone
-    db_user = await database.fetch_one(sel)  # db_user=رکورد کاربر
-    if not db_user:  # اگر کاربری با این شماره نیست
-        raise HTTPException(status_code=404, detail="User not found")  # 404=کاربر یافت نشد
+    # ارتقای هش قدیمی
+    if not db_user["password_hash"].startswith("$2"):
+        new_hash = bcrypt_hash_password(user.password)
+        upd = UserTable.__table__.update().where(UserTable.id == db_user["id"]).values(password_hash=new_hash)
+        await database.execute(upd)
 
-    if not verify_password_secure(user.password, db_user["password_hash"]):  # اگر پسورد نادرست است
-        raise HTTPException(status_code=401, detail="Invalid password")  # 401=پسورد اشتباه
+    access_token = create_access_token(db_user["phone"])
+    refresh_token = create_refresh_token()
+    refresh_hash = hash_refresh_token(refresh_token)
+    refresh_exp = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
 
-    if not db_user["password_hash"].startswith("$2"):  # اگر هش قدیمی (SHA-256) است
-        new_hash = bcrypt_hash_password(user.password)  # new_hash=هش bcrypt جدید
-        upd = UserTable.__table__.update().where(UserTable.id == db_user["id"]).values(password_hash=new_hash)  # upd=UPDATE users
-        await database.execute(upd)  # اجرای UPDATE
+    ins_rt = RefreshTokenTable.__table__.insert().values(
+        user_id=db_user["id"],
+        token_hash=refresh_hash,
+        expires_at=refresh_exp,
+        revoked=False
+    )
+    await database.execute(ins_rt)
 
-    access_token = create_access_token(db_user["phone"])  # access_token=ساخت JWT دسترسی
-    refresh_token = create_refresh_token()  # refresh_token=ساخت رفرش‌توکن تصادفی
-    refresh_hash = hash_refresh_token(refresh_token)  # refresh_hash=هش رفرش‌توکن
-    refresh_exp = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)  # refresh_exp=انقضاء
-
-    ins_rt = RefreshTokenTable.__table__.insert().values(  # ins_rt=INSERT به refresh_tokens
-        user_id=db_user["id"],  # user_id=شناسه کاربر
-        token_hash=refresh_hash,  # token_hash=هش
-        expires_at=refresh_exp,  # expires_at=زمان انقضاء
-        revoked=False  # revoked=ابطال نشده
-    )  # پایان INSERT
-    await database.execute(ins_rt)  # اجرای INSERT
-
-    return {  # return=پاسخ ورود (سازگار با کلاینت)
-        "status": "ok",  # status=موفق
-        "message": "Login successful",  # message=پیام متنی
-        "token": access_token,  # token=اکسس برای سازگاری
-        "access_token": access_token,  # access_token=توکن دسترسی
-        "refresh_token": refresh_token,  # refresh_token=توکن رفرش
-        "user": {  # user=اطلاعات کاربر
-            "phone": db_user["phone"],  # phone=شماره
-            "address": db_user["address"] or "",  # address=آدرس
-            "name": db_user.get("name", "") or ""  # name=نام (جدید؛ اگر ستون تازه اضافه شده باشد ممکن است None برگردد)
+    return {
+        "status": "ok",
+        "message": "Login successful",
+        "token": access_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "user": {
+            "phone": db_user["phone"],
+            "address": db_user["address"] or "",
+            "name": db_user.get("name", "") or ""
         }
-    }  # پایان پاسخ
+    }
 
-# ——— اندپوینت: رفرش اکسس‌توکن ———
-@app.post("/auth/refresh")  # POST=/auth/refresh
-async def refresh_access_token(req: dict):  # refresh_access_token=هندلر رفرش اکسس‌توکن
-    refresh_token = req.get("refresh_token", "")  # refresh_token=خواندن از بدنه
-    if not refresh_token:  # اگر خالی است
-        raise HTTPException(status_code=400, detail="refresh_token required")  # 400=درخواست ناقص
+# ---------- Refresh Access Token ----------
+@app.post("/auth/refresh")
+async def refresh_access_token(req: dict):
+    refresh_token = req.get("refresh_token", "")
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="refresh_token required")
+    token_hash = hash_refresh_token(refresh_token)
+    now = datetime.now(timezone.utc)
+    sel = RefreshTokenTable.__table__.select().where(
+        (RefreshTokenTable.token_hash == token_hash) &
+        (RefreshTokenTable.revoked == False) &
+        (RefreshTokenTable.expires_at > now)
+    )
+    rt = await database.fetch_one(sel)
+    if not rt:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-    token_hash = hash_refresh_token(refresh_token)  # token_hash=هش رفرش‌توکن
-    now = datetime.now(timezone.utc)  # now=زمان فعلی
+    sel_user = UserTable.__table__.select().where(UserTable.id == rt["user_id"])
+    db_user = await database.fetch_one(sel_user)
+    if not db_user:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-    sel = RefreshTokenTable.__table__.select().where(  # sel=SELECT رفرش‌توکن معتبر
-        (RefreshTokenTable.token_hash == token_hash) &  # شرط=هش برابر
-        (RefreshTokenTable.revoked == False) &  # شرط=ابطال نشده
-        (RefreshTokenTable.expires_at > now)  # شرط=منقضی نشده
-    )  # پایان WHERE
-    rt = await database.fetch_one(sel)  # rt=نتیجه
-    if not rt:  # اگر یافت نشد
-        raise HTTPException(status_code=401, detail="Invalid refresh token")  # 401=رفرش نامعتبر
+    new_access = create_access_token(db_user["phone"])
+    return unified_response("ok", "TOKEN_REFRESHED", "new access token", {"access_token": new_access})
 
-    sel_user = UserTable.__table__.select().where(UserTable.id == rt["user_id"])  # sel_user=SELECT کاربر
-    db_user = await database.fetch_one(sel_user)  # db_user=رکورد کاربر
-    if not db_user:  # اگر کاربر یافت نشد
-        raise HTTPException(status_code=401, detail="Invalid refresh token")  # 401=نامعتبر
+# ---------- Verify Token: path + header ----------
+@app.get("/verify_token/{token}")
+async def verify_token_path(token: str):
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return {"status": "ok", "valid": True}
+    except jwt.ExpiredSignatureError:
+        return {"status": "error", "valid": False, "code": "TOKEN_EXPIRED"}
+    except Exception:
+        return {"status": "error", "valid": False, "code": "TOKEN_INVALID"}
 
-    new_access = create_access_token(db_user["phone"])  # new_access=ساخت اکسس‌توکن جدید
-    return unified_response("ok", "TOKEN_REFRESHED", "new access token", {"access_token": new_access})  # return=پاسخ استاندارد
+@app.get("/verify_token")
+async def verify_token_header(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return {"status": "error", "valid": False, "code": "NO_AUTH_HEADER"}
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return {"status": "ok", "valid": True}
+    except jwt.ExpiredSignatureError:
+        return {"status": "error", "valid": False, "code": "TOKEN_EXPIRED"}
+    except Exception:
+        return {"status": "error", "valid": False, "code": "TOKEN_INVALID"}
 
-# ——— اندپوینت: بررسی اعتبار توکن (سازگار قدیمی) ———
-@app.get("/verify_token/{token}")  # GET=/verify_token/{token}
-async def verify_token(token: str):  # verify_token=اعتبارسنجی با پارامتر مسیر
-    try:  # try=دیکد JWT
-        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])  # decode=اعتبارسنجی امضاء/انقضاء
-        return {"status": "ok", "valid": True}  # return=معتبر
-    except jwt.ExpiredSignatureError:  # except=منقضی
-        return {"status": "error", "valid": False, "code": "TOKEN_EXPIRED"}  # return=منقضی
-    except Exception:  # except=سایر خطاها
-        return {"status": "error", "valid": False, "code": "TOKEN_INVALID"}  # return=نامعتبر
+# ---------- Cars ----------
+@app.get("/user_cars/{user_phone}")
+async def get_user_cars(user_phone: str):
+    query = UserTable.__table__.select().where(UserTable.phone == user_phone)
+    user = await database.fetch_one(query)
+    if user:
+        return user["car_list"] or []
+    raise HTTPException(status_code=404, detail="User not found")
 
-# ——— اندپوینت: لیست ماشین‌های کاربر ———
-@app.get("/user_cars/{user_phone}")  # GET=/user_cars/{user_phone}
-async def get_user_cars(user_phone: str):  # get_user_cars=هندلر خواندن ماشین‌ها
-    query = UserTable.__table__.select().where(UserTable.phone == user_phone)  # query=SELECT کاربر
-    user = await database.fetch_one(query)  # user=رکورد
-    if user:  # اگر یافت شد
-        return user["car_list"] or []  # return=لیست ماشین‌ها (یا لیست خالی)
-    raise HTTPException(status_code=404, detail="User not found")  # 404=کاربر نیست
-
-@app.post("/user_cars")  # POST=/user_cars
-async def update_user_cars(data: CarListUpdateRequest):  # update_user_cars=ذخیره کل لیست ماشین‌ها
-    sel = UserTable.__table__.select().where(UserTable.phone == data.user_phone)  # sel=SELECT کاربر
-    user = await database.fetch_one(sel)  # user=رکورد
-    if not user:  # اگر کاربر یافت نشد
-        raise HTTPException(status_code=404, detail="User not found")  # 404=خطا
+@app.post("/user_cars")
+async def update_user_cars(data: CarListUpdateRequest):
+    sel = UserTable.__table__.select().where(UserTable.phone == data.user_phone)
+    user = await database.fetch_one(sel)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     upd = UserTable.__table__.update().where(UserTable.phone == data.user_phone).values(
-        car_list=[car.dict() for car in data.car_list]  # values=تنظیم car_list به JSON
-    )  # پایان UPDATE
-    await database.execute(upd)  # اجرای UPDATE
-    return {"status": "ok", "message": "cars saved"}  # return=پاسخ موفق
+        car_list=[car.dict() for car in data.car_list]
+    )
+    await database.execute(upd)
+    return {"status": "ok", "message": "cars saved"}
 
-# ——— اندپوینت: ثبت سفارش (افزوده شدن home_number) ———
-@app.post("/order")  # POST=/order
-async def create_order(order: OrderRequest):  # create_order=ثبت سفارش جدید
-    ins = RequestTable.__table__.insert().values(  # ins=INSERT به جدول requests
-        user_phone=order.user_phone,  # user_phone=شماره کاربر
-        latitude=order.location.latitude,  # latitude=عرض
-        longitude=order.location.longitude,  # longitude=طول
-        car_list=[car.dict() for car in order.car_list],  # car_list=تبدیل لیست ماشین‌ها به dict
-        address=order.address,  # address=آدرس
-        home_number=(order.home_number or ""),  # home_number=پلاک منزل (جدید)
-        service_type=order.service_type,  # service_type=نوع سرویس
-        price=order.price,  # price=قیمت
-        request_datetime=order.request_datetime,  # request_datetime=زمان (بدون میلی‌ثانیه - همان مقدار ورودی)
-        status="در انتظار",  # status=وضعیت اولیه
-        driver_name="",  # driver_name=خالی
-        driver_phone="",  # driver_phone=خالی
-        finish_datetime="",  # finish_datetime=خالی
-        payment_type=order.payment_type  # payment_type=روش پرداخت
-    )  # پایان INSERT values
-    await database.execute(ins)  # اجرای INSERT
-    return {"status": "ok", "message": "request created"}  # return=پاسخ ساده موفق
+# ---------- Orders ----------
+@app.post("/order")
+async def create_order(order: OrderRequest):
+    ins = RequestTable.__table__.insert().values(
+        user_phone=order.user_phone,
+        latitude=order.location.latitude,
+        longitude=order.location.longitude,
+        car_list=[car.dict() for car in order.car_list],
+        address=order.address,
+        home_number=(order.home_number or ""),  # ذخیره پلاک منزل (جدید)
+        service_type=order.service_type,
+        price=order.price,
+        request_datetime=order.request_datetime,  # زمان بدون میلی‌ثانیه
+        status="در انتظار",
+        driver_name="",
+        driver_phone="",
+        finish_datetime="",
+        payment_type=order.payment_type
+    )
+    await database.execute(ins)
+    return {"status": "ok", "message": "request created"}
 
-# ——— اندپوینت: لغو سفارش ———
-@app.post("/cancel_order")  # POST=/cancel_order
-async def cancel_order(cancel: CancelRequest):  # cancel_order=لغو سفارش «در انتظار» کاربر/سرویس
+@app.post("/cancel_order")
+async def cancel_order(cancel: CancelRequest):
     upd = RequestTable.__table__.update().where(
-        (RequestTable.user_phone == cancel.user_phone) &  # شرط=شماره کاربر
-        (RequestTable.service_type == cancel.service_type) &  # شرط=نوع سرویس
-        (RequestTable.status == "در انتظار")  # شرط=فقط سفارش‌های «در انتظار»
-    ).values(status="کنسل شده")  # values=تغییر وضعیت به «کنسل شده»
-    result = await database.execute(upd)  # result=اجرای UPDATE
-    if result:  # اگر ردیفی تغییر کرد
-        return {"status": "ok", "message": "canceled"}  # return=موفق
-    raise HTTPException(status_code=404, detail="active order not found")  # 404=هیچ سفارش فعالی پیدا نشد
+        (RequestTable.user_phone == cancel.user_phone) &
+        (RequestTable.service_type == cancel.service_type) &
+        (RequestTable.status == "در انتظار")
+    ).values(status="کنسل شده")
+    result = await database.execute(upd)
+    if result:
+        return {"status": "ok", "message": "canceled"}
+    raise HTTPException(status_code=404, detail="active order not found")
 
-# ——— اندپوینت: سرویس‌های فعال کاربر ———
-@app.get("/user_active_services/{user_phone}")  # GET=/user_active_services/{user_phone}
-async def get_user_active_services(user_phone: str):  # get_user_active_services=خواندن سفارش‌های «در انتظار»
+@app.get("/user_active_services/{user_phone}")
+async def get_user_active_services(user_phone: str):
     sel = RequestTable.__table__.select().where(
-        (RequestTable.user_phone == user_phone) &  # شرط=شماره کاربر
-        (RequestTable.status == "در انتظار")  # شرط=در انتظار
-    )  # پایان WHERE
-    result = await database.fetch_all(sel)  # result=خواندن لیست
-    return [dict(row) for row in result]  # return=لیست dict از سفارش‌ها
+        (RequestTable.user_phone == user_phone) &
+        (RequestTable.status == "در انتظار")
+    )
+    result = await database.fetch_all(sel)
+    return [dict(row) for row in result]
 
-# ——— اندپوینت: تاریخچه سفارش‌های کاربر ———
-@app.get("/user_orders/{user_phone}")  # GET=/user_orders/{user_phone}
-async def get_user_orders(user_phone: str):  # get_user_orders=لیست همه سفارش‌ها
-    sel = RequestTable.__table__.select().where(RequestTable.user_phone == user_phone)  # sel=SELECT بر اساس شماره
-    result = await database.fetch_all(sel)  # result=خواندن همه
-    return [dict(row) for row in result]  # return=لیست dict سفارش‌ها
+@app.get("/user_orders/{user_phone}")
+async def get_user_orders(user_phone: str):
+    sel = RequestTable.__table__.select().where(RequestTable.user_phone == user_phone)
+    result = await database.fetch_all(sel)
+    return [dict(row) for row in result]
 
-# ——— اندپوینت: لیست کاربران (دیباگ) ———
-@app.get("/debug/users")  # GET=/debug/users
-async def debug_users():  # debug_users=صرفاً برای تست/دیباگ
-    rows = await database.fetch_all(UserTable.__table__.select())  # rows=خواندن همه کاربران
-    return [{"id": r["id"], "phone": r["phone"], "name": r.get("name", ""), "address": r["address"]} for r in rows]  # return=لیست ساده کاربران (با name)
-# ——— اندپوینت: به‌روزرسانی پروفایل (جدید) ———
-@app.post("/user/profile")  # POST=/user/profile
-async def update_profile(body: UserProfileUpdate):  # update_profile=ذخیره نام/آدرس کاربر
-    if not body.phone.strip():  # اگر شماره خالی است
-        raise HTTPException(status_code=400, detail="phone_required")  # خطای 400
-    sel = UserTable.__table__.select().where(UserTable.phone == body.phone)  # sel=SELECT کاربر با phone
-    user = await database.fetch_one(sel)  # user=رکورد کاربر
-    if user is None:  # اگر کاربر موجود نیست
-        ins = UserTable.__table__.insert().values(  # ins=INSERT کاربر جدید
-            phone=body.phone.strip(),  # phone=شماره
-            password_hash="",  # password_hash=خالی (در صورت داشتن ثبت‌نام با پسورد، تکمیل می‌شود)
-            address=(body.address or "").strip(),  # address=آدرس (trim)
-            name=(body.name or "").strip(),  # name=نام (trim)
-            car_list=[]  # car_list=لیست خالی
-        )  # پایان INSERT
-        await database.execute(ins)  # اجرای INSERT
-    else:  # در غیر این صورت (کاربر موجود)
-        upd = UserTable.__table__.update().where(UserTable.phone == body.phone).values(  # upd=UPDATE
-            name=(body.name or "").strip(),  # name=نام
-            address=(body.address or "").strip()  # address=آدرس
-        )  # پایان UPDATE
-        await database.execute(upd)  # اجرای UPDATE
-    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": body.phone})  # return=پاسخ استاندارد
+# ---------- Debug ----------
+@app.get("/debug/users")
+async def debug_users():
+    rows = await database.fetch_all(UserTable.__table__.select())
+    return [{"id": r["id"], "phone": r["phone"], "name": r.get("name", "") or "", "address": r["address"] or ""} for r in rows]
+
+# ---------- Profile (NEW) ----------
+@app.post("/user/profile")
+async def update_profile(body: UserProfileUpdate):
+    if not body.phone.strip():
+        raise HTTPException(status_code=400, detail="phone_required")
+    sel = UserTable.__table__.select().where(UserTable.phone == body.phone)
+    user = await database.fetch_one(sel)
+    if user is None:
+        ins = UserTable.__table__.insert().values(
+            phone=body.phone.strip(),
+            password_hash="",
+            address=(body.address or "").strip(),
+            name=(body.name or "").strip(),
+            car_list=[]
+        )
+        await database.execute(ins)
+    else:
+        upd = UserTable.__table__.update().where(UserTable.phone == body.phone).values(
+            name=(body.name or "").strip(),
+            address=(body.address or "").strip()
+        )
+        await database.execute(upd)
+    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": body.phone})
