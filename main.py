@@ -40,7 +40,7 @@ class UserTable(Base):  # کلاس جدول کاربران
     address = Column(String)  # address=آدرس
     name = Column(String, default="")  # name=نام
     car_list = Column(JSONB, default=list)  # car_list=لیست ماشین‌ها (JSON)
-    auth_token = Column(String, nullable=True)  # auth_token=رزرو (فعلاً استفاده نمی‌شود)
+    
 
 class DriverTable(Base):  # کلاس جدول راننده‌ها
     __tablename__ = "drivers"  # نام جدول
@@ -392,3 +392,4 @@ async def debug_users():  # تابع
         address_val = mapping["address"] if "address" in mapping else ""  # address
         out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})  # افزودن ردیف
     return out  # خروجی
+
