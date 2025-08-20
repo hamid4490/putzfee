@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-  # -*-=اعلان کدینگ فایل | utf-8=یونیکد
+# -*- coding: utf-8 -*-  # اعلان کدینگ فایل | utf-8=یونیکد
 import os  # os=کتابخانه سیستم‌عامل
 import hashlib  # hashlib=هش
 import secrets  # secrets=توکن امن
@@ -20,33 +20,33 @@ from dotenv import load_dotenv  # load_dotenv=خواندن .env
 
 # ——— پیکربندی محیط ———
 load_dotenv()  # بارگذاری متغیرها از .env
-DATABASE_URL = os.getenv("DATABASE_URL")  # DATABASE_URL=آدرس پایگاه‌داده
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")  # JWT_SECRET=کلید JWT (پیش‌فرض توسعه)
-PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")  # PASSWORD_PEPPER=pepper برای پسورد
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))  # مدت اعتبار access_token (دقیقه)
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))  # مدت اعتبار refresh_token (روز)
-BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))  # تعداد راند bcrypt
-ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")  # لیست دامنه‌های مجاز CORS (CSV یا "*")
+DATABASE_URL = os.getenv("DATABASE_URL")  # آدرس پایگاه‌داده
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")  # کلید JWT (پیش‌فرض توسعه)
+PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")  # pepper برای پسورد
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))  # عمر access_token (دقیقه)
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))  # عمر refresh_token (روز)
+BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))  # هزینه bcrypt
+ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")  # دامنه‌های مجاز CORS (CSV یا "*")
 
-# ——— Rate limit / Lockout پیکربندی ———
-LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "300"))  # پنجره تلاش (ثانیه) | پیش‌فرض=۵ دقیقه
-LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))  # سقف تلاش ناموفق در پنجره | پیش‌فرض=۵
-LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "900"))  # زمان قفل (ثانیه) | پیش‌فرض=۱۵ دقیقه
+# ——— Rate limit / Lockout ———
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "300"))  # پنجره تلاش‌ها (۵ دقیقه)
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))  # سقف تلاش ناموفق
+LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "900"))  # مدت قفل (۱۵ دقیقه)
 
-database = Database(DATABASE_URL)  # database=نمونه اتصال دیتابیس
-Base = declarative_base()  # Base=پایه ORM
+database = Database(DATABASE_URL)  # نمونه اتصال دیتابیس
+Base = declarative_base()  # پایه ORM
 
 # ——— مدل‌های ORM ———
-class UserTable(Base):  # UserTable=جدول کاربران
-    __tablename__ = "users"  # __tablename__=نام جدول
-    id = Column(Integer, primary_key=True, index=True)  # id=کلید اصلی
-    phone = Column(String, unique=True, index=True)  # phone=شماره یکتا
-    password_hash = Column(String)  # password_hash=هش پسورد
-    address = Column(String)  # address=آدرس
-    name = Column(String, default="")  # name=نام
-    car_list = Column(JSONB, default=list)  # car_list=لیست ماشین‌ها به‌صورت JSON
+class UserTable(Base):  # جدول کاربران
+    __tablename__ = "users"  # نام جدول
+    id = Column(Integer, primary_key=True, index=True)  # کلید
+    phone = Column(String, unique=True, index=True)  # شماره یکتا
+    password_hash = Column(String)  # هش پسورد
+    address = Column(String)  # آدرس
+    name = Column(String, default="")  # نام
+    car_list = Column(JSONB, default=list)  # لیست ماشین‌ها (JSON)
 
-class DriverTable(Base):  # DriverTable=جدول راننده‌ها
+class DriverTable(Base):  # جدول راننده‌ها
     __tablename__ = "drivers"  # نام جدول
     id = Column(Integer, primary_key=True, index=True)
     first_name = Column(String)
@@ -58,335 +58,339 @@ class DriverTable(Base):  # DriverTable=جدول راننده‌ها
     is_online = Column(Boolean, default=False)
     status = Column(String, default="فعال")
 
-class RequestTable(Base):  # RequestTable=جدول سفارش‌ها
+class RequestTable(Base):  # جدول سفارش‌ها
     __tablename__ = "requests"  # نام جدول
-    id = Column(Integer, primary_key=True, index=True)  # id=کلید
-    user_phone = Column(String)  # user_phone=شماره کاربر
-    latitude = Column(Float)  # latitude=عرض
-    longitude = Column(Float)  # longitude=طول
-    car_list = Column(JSONB)  # car_list=لیست ماشین‌ها
-    address = Column(String)  # address=آدرس
-    home_number = Column(String, default="")  # home_number=پلاک خانه
-    service_type = Column(String)  # service_type=کد سرویس انگلیسی
-    price = Column(Integer)  # price=قیمت
-    request_datetime = Column(String)  # request_datetime=زمان ثبت
-    status = Column(String)  # status=کد وضعیت انگلیسی
-    driver_name = Column(String)  # driver_name=نام راننده
-    driver_phone = Column(String)  # driver_phone=شماره راننده
-    finish_datetime = Column(String)  # finish_datetime=زمان پایان
-    payment_type = Column(String)  # payment_type=کد پرداخت انگلیسی
+    id = Column(Integer, primary_key=True, index=True)
+    user_phone = Column(String)
+    latitude = Column(Float)
+    longitude = Column(Float)
+    car_list = Column(JSONB)
+    address = Column(String)
+    home_number = Column(String, default="")
+    service_type = Column(String)
+    price = Column(Integer)
+    request_datetime = Column(String)
+    status = Column(String)
+    driver_name = Column(String)
+    driver_phone = Column(String)
+    finish_datetime = Column(String)
+    payment_type = Column(String)
 
-class RefreshTokenTable(Base):  # RefreshTokenTable=جدول رفرش‌توکن‌ها
+class RefreshTokenTable(Base):  # جدول رفرش‌توکن‌ها
     __tablename__ = "refresh_tokens"  # نام جدول
-    id = Column(Integer, primary_key=True, index=True)  # id=کلید
-    user_id = Column(Integer, ForeignKey("users.id"), index=True)  # user_id=ارجاع به users
-    token_hash = Column(String, unique=True, index=True)  # token_hash=هش رفرش‌توکن
-    expires_at = Column(DateTime(timezone=True), index=True)  # expires_at=انقضا
-    revoked = Column(Boolean, default=False)  # revoked=باطل شده؟
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # created_at=زمان ایجاد
-    __table_args__ = (Index("ix_refresh_token_user_id_expires", "user_id", "expires_at"),)  # ایندکس ترکیبی
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    token_hash = Column(String, unique=True, index=True)
+    expires_at = Column(DateTime(timezone=True), index=True)
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (Index("ix_refresh_token_user_id_expires", "user_id", "expires_at"),)
 
-class LoginAttemptTable(Base):  # LoginAttemptTable=جدول تلاش‌های ورود (برای Rate limit/Lockout)
+class LoginAttemptTable(Base):  # جدول تلاش‌های ورود (Rate limit)
     __tablename__ = "login_attempts"  # نام جدول
-    id = Column(Integer, primary_key=True, index=True)  # id=کلید
-    phone = Column(String, index=True)  # phone=شماره کاربر
-    ip = Column(String, index=True)  # ip=آی‌پی کلاینت
-    attempt_count = Column(Integer, default=0)  # attempt_count=تعداد تلاش ناموفق در پنجره
-    window_start = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # window_start=شروع پنجره
-    locked_until = Column(DateTime(timezone=True), nullable=True)  # locked_until=تا این زمان قفل است
-    last_attempt_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # last_attempt_at=آخرین تلاش
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # created_at=ایجاد
-    __table_args__ = (Index("ix_login_attempt_phone_ip", "phone", "ip"),)  # ایندکس روی phone+ip
+    id = Column(Integer, primary_key=True, index=True)  # کلید
+    phone = Column(String, index=True)  # شماره کاربر
+    ip = Column(String, index=True)  # آی‌پی
+    attempt_count = Column(Integer, default=0)  # تعداد تلاش‌ها
+    window_start = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # شروع پنجره
+    locked_until = Column(DateTime(timezone=True), nullable=True)  # تا این زمان قفل
+    last_attempt_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # آخرین تلاش
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # ایجاد
+    __table_args__ = (Index("ix_login_attempt_phone_ip", "phone", "ip"),)  # ایندکس phone+ip
 
 # ——— مدل‌های Pydantic ———
-class CarInfo(BaseModel):  # CarInfo=مدل ماشین
-    brand: str  # brand=برند
-    model: str  # model=مدل
-    plate: str  # plate=پلاک
+class CarInfo(BaseModel):  # مدل ماشین
+    brand: str  # برند
+    model: str  # مدل
+    plate: str  # پلاک
 
-class Location(BaseModel):  # Location=مدل موقعیت
-    latitude: float  # latitude=عرض
-    longitude: float  # longitude=طول
+class Location(BaseModel):  # مدل موقعیت
+    latitude: float  # عرض
+    longitude: float  # طول
 
-class OrderRequest(BaseModel):  # OrderRequest=مدل ثبت سفارش
-    user_phone: str  # user_phone=شماره کاربر
-    location: Location  # location=موقعیت
-    car_list: List[CarInfo]  # car_list=لیست ماشین‌ها
-    address: str  # address=آدرس
-    home_number: Optional[str] = ""  # home_number=پلاک
-    service_type: str  # service_type=کد سرویس انگلیسی
-    price: int  # price=قیمت
-    request_datetime: str  # request_datetime=زمان ثبت
-    payment_type: str  # payment_type=کد پرداخت انگلیسی
+class OrderRequest(BaseModel):  # مدل ثبت سفارش
+    user_phone: str  # شماره کاربر
+    location: Location  # موقعیت
+    car_list: List[CarInfo]  # لیست ماشین‌ها
+    address: str  # آدرس
+    home_number: Optional[str] = ""  # پلاک
+    service_type: str  # کد سرویس انگلیسی
+    price: int  # قیمت
+    request_datetime: str  # زمان ثبت
+    payment_type: str  # کد پرداخت انگلیسی
 
-class CarListUpdateRequest(BaseModel):  # CarListUpdateRequest=به‌روزرسانی ماشین‌ها
-    user_phone: str  # user_phone=شماره کاربر
-    car_list: List[CarInfo]  # car_list=لیست ماشین‌ها
+class CarListUpdateRequest(BaseModel):  # مدل به‌روزرسانی ماشین‌ها
+    user_phone: str  # شماره کاربر
+    car_list: List[CarInfo]  # لیست ماشین‌ها
 
-class CancelRequest(BaseModel):  # CancelRequest=لغو سفارش
-    user_phone: str  # user_phone=شماره کاربر
-    service_type: str  # service_type=کد سرویس انگلیسی
+class CancelRequest(BaseModel):  # مدل لغو سفارش
+    user_phone: str  # شماره کاربر
+    service_type: str  # کد سرویس انگلیسی
 
-class UserRegisterRequest(BaseModel):  # UserRegisterRequest=ثبت‌نام کاربر
-    phone: str  # phone=شماره
-    password: str  # password=پسورد
-    address: Optional[str] = None  # address=آدرس اختیاری
+class UserRegisterRequest(BaseModel):  # مدل ثبت‌نام کاربر
+    phone: str  # شماره
+    password: str  # پسورد
+    address: Optional[str] = None  # آدرس اختیاری
 
-class UserLoginRequest(BaseModel):  # UserLoginRequest=ورود
-    phone: str  # phone=شماره
-    password: str  # password=پسورد
+class UserLoginRequest(BaseModel):  # مدل ورود
+    phone: str  # شماره
+    password: str  # پسورد
 
-class UserProfileUpdate(BaseModel):  # UserProfileUpdate=ویرایش پروفایل
-    phone: str  # phone=شماره
-    name: str = ""  # name=نام
-    address: str = ""  # address=آدرس
+class UserProfileUpdate(BaseModel):  # مدل ویرایش پروفایل
+    phone: str  # شماره
+    name: str = ""  # نام
+    address: str = ""  # آدرس
 
 # ——— توابع امنیت ———
-def bcrypt_hash_password(password: str) -> str:  # bcrypt_hash_password=هش کردن پسورد با bcrypt+pepper
-    salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)  # salt=تولید نمک
-    mixed = (password + PASSWORD_PEPPER).encode("utf-8")  # mixed=ترکیب پسورد+pepper
-    return bcrypt.hashpw(mixed, salt).decode("utf-8")  # خروجی=هش رشته‌ای
+def bcrypt_hash_password(password: str) -> str:  # هش bcrypt+pepper
+    salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)  # تولید نمک
+    mixed = (password + PASSWORD_PEPPER).encode("utf-8")  # ترکیب پسورد+pepper
+    return bcrypt.hashpw(mixed, salt).decode("utf-8")  # خروجی هش
 
-def verify_password_secure(password: str, stored_hash: str) -> bool:  # verify_password_secure=بررسی پسورد
-    try:  # try=محافظت از خطا
-        if stored_hash.startswith("$2"):  # اگر=فرمت bcrypt
-            mixed = (password + PASSWORD_PEPPER).encode("utf-8")  # mixed=پسورد+pepper
-            return bcrypt.checkpw(mixed, stored_hash.encode("utf-8"))  # check=مقایسه bcrypt
-        old = hashlib.sha256(password.encode("utf-8")).hexdigest()  # old=سازگاری sha256 قدیمی
-        return old == stored_hash  # return=برابر بودن
-    except Exception:  # Exception=هر خطا
-        return False  # return=false
+def verify_password_secure(password: str, stored_hash: str) -> bool:  # بررسی پسورد
+    try:
+        if stored_hash.startswith("$2"):  # bcrypt؟
+            mixed = (password + PASSWORD_PEPPER).encode("utf-8")  # ترکیب ورودی
+            return bcrypt.checkpw(mixed, stored_hash.encode("utf-8"))  # بررسی bcrypt
+        old = hashlib.sha256(password.encode("utf-8")).hexdigest()  # سازگاری sha256 قدیمی
+        return old == stored_hash  # مقایسه
+    except Exception:
+        return False  # هر خطا → نامعتبر
 
-def create_access_token(phone: str) -> str:  # create_access_token=ساخت access_token کوتاه‌عمر
-    now = datetime.now(timezone.utc)  # now=اکنون
-    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)  # exp=انقضا
-    payload = {"sub": phone, "type": "access", "exp": exp}  # payload=اطلاعات توکن
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")  # encode=JWT
+def create_access_token(phone: str) -> str:  # ساخت access_token
+    now = datetime.now(timezone.utc)  # اکنون
+    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)  # انقضا
+    payload = {"sub": phone, "type": "access", "exp": exp}  # payload=اطلاعات
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")  # امضا
 
-def create_refresh_token() -> str:  # create_refresh_token=ساخت رفرش‌توکن
-    return secrets.token_urlsafe(48)  # return=توکن امن
+def create_refresh_token() -> str:  # ساخت رفرش‌توکن
+    return secrets.token_urlsafe(48)  # توکن امن
 
-def hash_refresh_token(token: str) -> str:  # hash_refresh_token=هش رفرش‌توکن
-    return hashlib.sha256((token + PASSWORD_PEPPER).encode("utf-8")).hexdigest()  # return=sha256(توکن+pepper)
+def hash_refresh_token(token: str) -> str:  # هش رفرش‌توکن
+    return hashlib.sha256((token + PASSWORD_PEPPER).encode("utf-8")).hexdigest()  # sha256(توکن+pepper)
 
-def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):  # unified_response=پاسخ یکدست
-    return {"status": status, "code": code, "message": message, "data": data or {}}  # return=دیکشنری استاندارد
+def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):  # پاسخ یکدست
+    return {"status": status, "code": code, "message": message, "data": data or {}}  # دیکشنری استاندارد
 
 # ——— ابزارها ———
-def get_client_ip(request: Request) -> str:  # get_client_ip=گرفتن IP واقعی کلاینت
-    xff = request.headers.get("x-forwarded-for", "")  # xff=هدر X-Forwarded-For
-    if xff:  # اگر=هدر موجود
-        return xff.split(",")[0].strip()  # return=اولین IP (اصلی)
-    return request.client.host or "unknown"  # return=IP مستقیم یا unknown
+def get_client_ip(request: Request) -> str:  # گرفتن IP واقعی
+    xff = request.headers.get("x-forwarded-for", "")  # X-Forwarded-For=زنجیره آی‌پی‌ها
+    if xff:
+        return xff.split(",")[0].strip()  # اولین IP=کلاینت واقعی
+    return request.client.host or "unknown"  # در غیر این صورت از اتصال
 
 # ——— اپ و CORS ———
-app = FastAPI()  # app=نمونه FastAPI
-allow_origins = ["*"] if ALLOW_ORIGINS_ENV.strip() == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]  # allow_origins=دامنه‌های مجاز
-app.add_middleware(  # add_middleware=افزودن CORS
+app = FastAPI()  # نمونه FastAPI
+allow_origins = ["*"] if ALLOW_ORIGINS_ENV.strip() == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]  # لیست مبداها
+app.add_middleware(  # افزودن CORS
     CORSMiddleware,
-    allow_origins=allow_origins,  # allow_origins=فهرست مبداها (در Production: فقط دامنه‌های مجاز)
-    allow_credentials=True,  # allow_credentials=اجازه کوکی/اعتبارنامه
-    allow_methods=["*"],  # allow_methods=همه متدها
-    allow_headers=["*"],  # allow_headers=همه هدرها
+    allow_origins=allow_origins,  # دامنه‌های مجاز
+    allow_credentials=True,  # اجازه کوکی
+    allow_methods=["*"],  # همه متدها
+    allow_headers=["*"],  # همه هدرها
 )
 
 # ——— چرخه عمر ———
-@app.on_event("startup")  # startup=رویداد شروع
-async def startup():  # startup=تابع async شروع
-    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))  # engine=Engine sync برای create_all
-    Base.metadata.create_all(engine)  # create_all=ساخت جداول
+@app.on_event("startup")  # شروع
+async def startup():
+    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))  # Engine sync برای create_all
+    Base.metadata.create_all(engine)  # ساخت جداول
     await database.connect()  # اتصال دیتابیس
 
-@app.on_event("shutdown")  # shutdown=رویداد پایان
-async def shutdown():  # shutdown=تابع async پایان
-    await database.disconnect()  # قطع اتصال دیتابیس
+@app.on_event("shutdown")  # پایان
+async def shutdown():
+    await database.disconnect()  # قطع اتصال
 
 # ——— روت سلامت ———
-@app.get("/")  # GET /
-def read_root():  # read_root=هندلر
+@app.get("/")
+def read_root():
     return {"message": "Putzfee FastAPI Server is running!"}  # پیام سلامت
 
 # ——— اندپوینت‌ها ———
-@app.get("/users/exists")  # GET وجود کاربر
-async def user_exists(phone: str):  # user_exists=بررسی وجود کاربر
-    q = select(func.count()).select_from(UserTable).where(UserTable.phone == phone)  # q=کوئری شمارش
-    count = await database.fetch_val(q)  # count=نتیجه
-    exists = bool(count and int(count) > 0)  # exists=بولی وجود
-    return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "user exists check", {"exists": exists})  # پاسخ یکدست
+@app.get("/users/exists")
+async def user_exists(phone: str):
+    q = select(func.count()).select_from(UserTable).where(UserTable.phone == phone)  # شمارش کاربر
+    count = await database.fetch_val(q)  # نتیجه
+    exists = bool(count and int(count) > 0)  # بولی
+    return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "user exists check", {"exists": exists})  # پاسخ
 
-@app.post("/register_user")  # POST ثبت‌نام
-async def register_user(user: UserRegisterRequest):  # register_user=هندلر ثبت‌نام
-    q = select(func.count()).select_from(UserTable).where(UserTable.phone == user.phone)  # q=بررسی تکراری بودن
-    count = await database.fetch_val(q)  # count=نتیجه
-    if count and int(count) > 0:  # اگر=وجود دارد
-        raise HTTPException(status_code=400, detail="User already exists")  # 400=کاربر قبلاً وجود دارد
+@app.post("/register_user")
+async def register_user(user: UserRegisterRequest):
+    q = select(func.count()).select_from(UserTable).where(UserTable.phone == user.phone)  # بررسی تکراری
+    count = await database.fetch_val(q)  # نتیجه
+    if count and int(count) > 0:
+        raise HTTPException(status_code=400, detail="User already exists")  # کاربر موجود
+    password_hash = bcrypt_hash_password(user.password)  # هش پسورد
+    ins = UserTable.__table__.insert().values(
+        phone=user.phone, password_hash=password_hash, address=(user.address or "").strip(), name="", car_list=[]
+    )  # درج کاربر
+    await database.execute(ins)  # اجرا
+    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": user.phone})  # پاسخ
 
-    password_hash = bcrypt_hash_password(user.password)  # password_hash=هش پسورد
-    ins = UserTable.__table__.insert().values(  # ins=کوئری درج
-        phone=user.phone,
-        password_hash=password_hash,
-        address=(user.address or "").strip(),
-        name="",
-        car_list=[]
-    )
-    await database.execute(ins)  # execute=اجرای درج
-    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": user.phone})  # پاسخ یکدست
+@app.post("/login")
+async def login_user(user: UserLoginRequest, request: Request):
+    client_ip = get_client_ip(request)  # آی‌پی کلاینت
+    now = datetime.now(timezone.utc)  # اکنون
 
-@app.post("/login")  # POST ورود
-async def login_user(user: UserLoginRequest, request: Request):  # login_user=هندلر ورود
-    client_ip = get_client_ip(request)  # client_ip=IP کلاینت
-    now = datetime.now(timezone.utc)  # now=اکنون
-
-    # — Rate limit / Lockout: بررسی قفل —
-    sel_attempt = LoginAttemptTable.__table__.select().where(and_(LoginAttemptTable.phone == user.phone, LoginAttemptTable.ip == client_ip))  # sel_attempt=انتخاب رکورد تلاش
-    attempt_row = await database.fetch_one(sel_attempt)  # attempt_row=نتیجه
-    if attempt_row and attempt_row["locked_until"] and attempt_row["locked_until"] > now:  # اگر=قفل است
-        retry_after = int((attempt_row["locked_until"] - now).total_seconds())  # retry_after=زمان باقی‌مانده
-        raise HTTPException(status_code=429, detail=f"RATE_LIMITED:{retry_after}")  # 429=محدودیت نرخ (بازگشت زمان باقی‌مانده)
+    # — قفل فعال؟ —
+    sel_attempt = LoginAttemptTable.__table__.select().where(and_(LoginAttemptTable.phone == user.phone, LoginAttemptTable.ip == client_ip))  # انتخاب رکورد تلاش
+    attempt_row = await database.fetch_one(sel_attempt)  # دریافت رکورد
+    if attempt_row and attempt_row["locked_until"] and attempt_row["locked_until"] > now:  # اگر قفل است
+        retry_after = int((attempt_row["locked_until"] - now).total_seconds())  # ثانیه باقیمانده
+        raise HTTPException(status_code=429, detail={"code": "RATE_LIMITED", "lock_remaining": retry_after, "window_seconds": LOGIN_WINDOW_SECONDS})  # 429 با جزئیات
 
     # — یافتن کاربر —
-    sel_user = UserTable.__table__.select().where(UserTable.phone == user.phone)  # sel_user=انتخاب کاربر
-    db_user = await database.fetch_one(sel_user)  # db_user=کاربر
-    if not db_user:  # اگر=کاربر نیست
-        # ثبت تلاش ناموفق + قفل احتمالی
-        await _register_login_failure(user.phone, client_ip)  # ثبت تلاش ناموفق
-        raise HTTPException(status_code=404, detail="User not found")  # 404
+    sel_user = UserTable.__table__.select().where(UserTable.phone == user.phone)  # انتخاب کاربر
+    db_user = await database.fetch_one(sel_user)  # اجرا
+    if not db_user:
+        # ثبت تلاش ناموفق برای شماره/آی‌پی (عدد باقیمانده را هم برگردانیم)
+        await _register_login_failure(user.phone, client_ip)  # ثبت ناموفق
+        updated = await database.fetch_one(LoginAttemptTable.__table__.select().where(and_(LoginAttemptTable.phone == user.phone, LoginAttemptTable.ip == client_ip)))  # رکورد به‌روز
+        remaining = 0  # تعداد باقیمانده
+        lock_remaining = 0  # زمان قفل باقیمانده
+        if updated:
+            remaining = max(0, LOGIN_MAX_ATTEMPTS - int(updated["attempt_count"] or 0))  # محاسبه باقیمانده
+            if updated["locked_until"] and updated["locked_until"] > now:
+                lock_remaining = int((updated["locked_until"] - now).total_seconds())  # ثانیه قفل
+        raise HTTPException(status_code=404, detail={"code": "USER_NOT_FOUND", "remaining_attempts": remaining, "lock_remaining": lock_remaining, "window_seconds": LOGIN_WINDOW_SECONDS})  # 404 با جزئیات
 
     # — بررسی پسورد —
-    if not verify_password_secure(user.password, db_user["password_hash"]):  # اگر=پسورد نادرست
-        await _register_login_failure(user.phone, client_ip)  # ثبت تلاش ناموفق
-        raise HTTPException(status_code=401, detail="Invalid password")  # 401
+    if not verify_password_secure(user.password, db_user["password_hash"]):  # پسورد اشتباه
+        await _register_login_failure(user.phone, client_ip)  # ثبت ناموفق
+        updated = await database.fetch_one(LoginAttemptTable.__table__.select().where(and_(LoginAttemptTable.phone == user.phone, LoginAttemptTable.ip == client_ip)))  # رکورد به‌روز
+        remaining = 0  # باقیمانده
+        lock_remaining = 0  # زمان قفل
+        if updated:
+            remaining = max(0, LOGIN_MAX_ATTEMPTS - int(updated["attempt_count"] or 0))  # محاسبه باقیمانده
+            if updated["locked_until"] and updated["locked_until"] > now:
+                lock_remaining = int((updated["locked_until"] - now).total_seconds())  # ثانیه قفل
+        raise HTTPException(status_code=401, detail={"code": "WRONG_PASSWORD", "remaining_attempts": remaining, "lock_remaining": lock_remaining, "window_seconds": LOGIN_WINDOW_SECONDS})  # 401 با جزئیات
 
-    # — پاک‌سازی شمارنده تلاش بعد از موفقیت —
+    # — موفقیت: ریست شمارنده —
     await _register_login_success(user.phone, client_ip)  # ریست تلاش‌ها
 
-    # — ارتقای هش قدیمی به bcrypt در صورت نیاز —
-    if not db_user["password_hash"].startswith("$2"):  # اگر=هش قدیمی
-        new_hash = bcrypt_hash_password(user.password)  # new_hash=هش جدید
-        upd = UserTable.__table__.update().where(UserTable.id == db_user["id"]).values(password_hash=new_hash)  # upd=آپدیت
+    # — ارتقای هش قدیمی (در صورت نیاز) —
+    if not db_user["password_hash"].startswith("$2"):
+        new_hash = bcrypt_hash_password(user.password)  # هش جدید
+        upd = UserTable.__table__.update().where(UserTable.id == db_user["id"]).values(password_hash=new_hash)  # آپدیت
         await database.execute(upd)  # اجرا
 
     # — ساخت توکن‌ها —
-    access_token = create_access_token(db_user["phone"])  # access_token=JWT دسترسی
-    refresh_token = create_refresh_token()  # refresh_token=توکن تجدید
-    refresh_hash = hash_refresh_token(refresh_token)  # refresh_hash=هش رفرش
-    refresh_exp = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)  # refresh_exp=انقضا
-
-    ins_rt = RefreshTokenTable.__table__.insert().values(  # درج رفرش‌توکن
-        user_id=db_user["id"], token_hash=refresh_hash, expires_at=refresh_exp, revoked=False
-    )
+    access_token = create_access_token(db_user["phone"])  # access_token
+    refresh_token = create_refresh_token()  # refresh_token
+    refresh_hash = hash_refresh_token(refresh_token)  # هش رفرش
+    refresh_exp = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)  # انقضا رفرش
+    ins_rt = RefreshTokenTable.__table__.insert().values(user_id=db_user["id"], token_hash=refresh_hash, expires_at=refresh_exp, revoked=False)  # درج رفرش
     await database.execute(ins_rt)  # اجرا
 
-    mapping = getattr(db_user, "_mapping", {})  # mapping=سازگاری
-    name_val = mapping["name"] if "name" in mapping else ""  # name_val=نام
-    address_val = mapping["address"] if "address" in mapping else ""  # address_val=آدرس
+    mapping = getattr(db_user, "_mapping", {})  # سازگاری
+    name_val = mapping["name"] if "name" in mapping else ""  # نام
+    address_val = mapping["address"] if "address" in mapping else ""  # آدرس
 
-    return {  # return=پاسخ ورود (سازگار با کلاینت فعلی)
+    return {  # پاسخ ورود (سازگار با کلاینت)
         "status": "ok", "message": "Login successful", "token": access_token, "access_token": access_token,
         "refresh_token": refresh_token,
         "user": {"phone": db_user["phone"], "address": address_val or "", "name": name_val or ""}
     }
 
-async def _register_login_failure(phone: str, ip: str):  # _register_login_failure=ثبت تلاش ناموفق
-    now = datetime.now(timezone.utc)  # now=اکنون
-    sel = LoginAttemptTable.__table__.select().where(and_(LoginAttemptTable.phone == phone, LoginAttemptTable.ip == ip))  # sel=انتخاب رکورد
-    row = await database.fetch_one(sel)  # row=نتیجه
-    if row is None:  # اگر=رکورد نیست
-        ins = LoginAttemptTable.__table__.insert().values(  # ins=درج رکورد جدید
+async def _register_login_failure(phone: str, ip: str):  # ثبت تلاش ناموفق
+    now = datetime.now(timezone.utc)  # اکنون
+    sel = LoginAttemptTable.__table__.select().where(and_(LoginAttemptTable.phone == phone, LoginAttemptTable.ip == ip))  # انتخاب رکورد
+    row = await database.fetch_one(sel)  # نتیجه
+    if row is None:  # اگر رکورد نیست
+        ins = LoginAttemptTable.__table__.insert().values(  # درج جدید
             phone=phone, ip=ip, attempt_count=1, window_start=now, locked_until=None, last_attempt_at=now
         )
         await database.execute(ins)  # اجرا
-        return  # return=پایان
-    # اگر پنجره منقضی شده → ریست شمارنده
-    window_start = row["window_start"] or now  # window_start=شروع پنجره
-    within_window = (now - window_start).total_seconds() <= LOGIN_WINDOW_SECONDS  # within_window=داخل پنجره؟
-    new_count = (row["attempt_count"] + 1) if within_window else 1  # new_count=شمارنده جدید
-    new_window_start = window_start if within_window else now  # new_window_start=شروع جدید در صورت خروج از پنجره
-    locked_until = row["locked_until"]  # locked_until=وضعیت قفل
-    # اگر سقف رد شد → قفل
-    if new_count >= LOGIN_MAX_ATTEMPTS:  # اگر=شمارنده >= سقف
-        locked_until = now + timedelta(seconds=LOGIN_LOCK_SECONDS)  # locked_until=تنظیم قفل
-    upd = LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == row["id"]).values(  # upd=آپدیت رکورد
+        return  # پایان
+    window_start = row["window_start"] or now  # شروع پنجره
+    within_window = (now - window_start).total_seconds() <= LOGIN_WINDOW_SECONDS  # داخل پنجره؟
+    new_count = (row["attempt_count"] + 1) if within_window else 1  # شمارنده جدید
+    new_window_start = window_start if within_window else now  # شروع جدید (اگر خارج پنجره)
+    locked_until = row["locked_until"]  # وضعیت قفل
+    if new_count >= LOGIN_MAX_ATTEMPTS:  # اگر سقف رد شد
+        locked_until = now + timedelta(seconds=LOGIN_LOCK_SECONDS)  # قفل ۱۵ دقیقه‌ای
+    upd = LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == row["id"]).values(  # آپدیت رکورد
         attempt_count=new_count, window_start=new_window_start, locked_until=locked_until, last_attempt_at=now
     )
     await database.execute(upd)  # اجرا
 
-async def _register_login_success(phone: str, ip: str):  # _register_login_success=ریست تلاش‌ها پس از موفقیت
-    sel = LoginAttemptTable.__table__.select().where(and_(LoginAttemptTable.phone == phone, LoginAttemptTable.ip == ip))  # sel=انتخاب رکورد
-    row = await database.fetch_one(sel)  # row=نتیجه
-    if row:  # اگر=وجود دارد
-        upd = LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == row["id"]).values(  # upd=آپدیت ریست
+async def _register_login_success(phone: str, ip: str):  # ریست تلاش‌ها بعد موفقیت
+    sel = LoginAttemptTable.__table__.select().where(and_(LoginAttemptTable.phone == phone, LoginAttemptTable.ip == ip))  # انتخاب رکورد
+    row = await database.fetch_one(sel)  # نتیجه
+    if row:
+        upd = LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == row["id"]).values(  # ریست شمارنده/قفل
             attempt_count=0, window_start=datetime.now(timezone.utc), locked_until=None
         )
         await database.execute(upd)  # اجرا
 
-@app.post("/auth/refresh")  # POST=رفرش access_token
-async def refresh_access_token(req: dict):  # refresh_access_token=هندلر رفرش
-    refresh_token = req.get("refresh_token", "")  # refresh_token=خواندن از بدنه
-    if not refresh_token:  # اگر=خالی
-        raise HTTPException(status_code=400, detail="refresh_token required")  # 400
-    token_hash = hash_refresh_token(refresh_token)  # token_hash=هش
-    now = datetime.now(timezone.utc)  # اکنون
-    sel = RefreshTokenTable.__table__.select().where(  # sel=انتخاب رفرش معتبر
+@app.post("/auth/refresh")
+async def refresh_access_token(req: dict):
+    refresh_token = req.get("refresh_token", "")
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="refresh_token required")
+    token_hash = hash_refresh_token(refresh_token)
+    now = datetime.now(timezone.utc)
+    sel = RefreshTokenTable.__table__.select().where(
         (RefreshTokenTable.token_hash == token_hash) & (RefreshTokenTable.revoked == False) & (RefreshTokenTable.expires_at > now)
     )
-    rt = await database.fetch_one(sel)  # rt=نتیجه
-    if not rt:  # اگر=یافت نشد
-        raise HTTPException(status_code=401, detail="Invalid refresh token")  # 401
-    sel_user = UserTable.__table__.select().where(UserTable.id == rt["user_id"])  # sel_user=انتخاب کاربر
-    db_user = await database.fetch_one(sel_user)  # db_user=کاربر
-    if not db_user:  # اگر=کاربر نیست
-        raise HTTPException(status_code=401, detail="Invalid refresh token")  # 401
-    new_access = create_access_token(db_user["phone"])  # new_access=توکن جدید
-    return unified_response("ok", "TOKEN_REFRESHED", "new access token", {"access_token": new_access})  # پاسخ یکدست
+    rt = await database.fetch_one(sel)
+    if not rt:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    sel_user = UserTable.__table__.select().where(UserTable.id == rt["user_id"])
+    db_user = await database.fetch_one(sel_user)
+    if not db_user:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    new_access = create_access_token(db_user["phone"])
+    return unified_response("ok", "TOKEN_REFRESHED", "new access token", {"access_token": new_access})
 
-@app.get("/verify_token/{token}")  # GET=بررسی توکن از مسیر
-async def verify_token_path(token: str):  # verify_token_path=هندلر
+@app.get("/verify_token/{token}")
+async def verify_token_path(token: str):
     try:
-        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])  # decode=بررسی امضا/انقضا
-        return {"status": "ok", "valid": True}  # معتبر
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return {"status": "ok", "valid": True}
     except jwt.ExpiredSignatureError:
-        return {"status": "error", "valid": False, "code": "TOKEN_EXPIRED"}  # منقضی
+        return {"status": "error", "valid": False, "code": "TOKEN_EXPIRED"}
     except Exception:
-        return {"status": "error", "valid": False, "code": "TOKEN_INVALID"}  # نامعتبر
+        return {"status": "error", "valid": False, "code": "TOKEN_INVALID"}
 
-@app.get("/verify_token")  # GET=بررسی توکن از هدر Authorization
-async def verify_token_header(authorization: Optional[str] = Header(None)):  # authorization=هدر
-    if not authorization or not authorization.lower().startswith("bearer "):  # نبود هدر صحیح
-        return {"status": "error", "valid": False, "code": "NO_AUTH_HEADER"}  # خطا
-    token = authorization.split(" ", 1)[1].strip()  # token=جداکردن
+@app.get("/verify_token")
+async def verify_token_header(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return {"status": "error", "valid": False, "code": "NO_AUTH_HEADER"}
+    token = authorization.split(" ", 1)[1].strip()
     try:
-        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])  # decode=بررسی
-        return {"status": "ok", "valid": True}  # معتبر
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return {"status": "ok", "valid": True}
     except jwt.ExpiredSignatureError:
-        return {"status": "error", "valid": False, "code": "TOKEN_EXPIRED"}  # منقضی
+        return {"status": "error", "valid": False, "code": "TOKEN_EXPIRED"}
     except Exception:
-        return {"status": "error", "valid": False, "code": "TOKEN_INVALID"}  # نامعتبر
+        return {"status": "error", "valid": False, "code": "TOKEN_INVALID"}
 
-@app.get("/user_cars/{user_phone}")  # GET=لیست ماشین‌های کاربر
-async def get_user_cars(user_phone: str):  # get_user_cars=هندلر
-    query = UserTable.__table__.select().where(UserTable.phone == user_phone)  # query=انتخاب کاربر
-    user = await database.fetch_one(query)  # user=نتیجه
-    if not user:  # اگر=کاربر نیست
-        raise HTTPException(status_code=404, detail="User not found")  # 404
-    items = user["car_list"] or []  # items=لیست ماشین‌ها (خالی اگر نبود)
-    return unified_response("ok", "USER_CARS", "user cars", {"items": items})  # پاسخ یکدست با data.items
+@app.get("/user_cars/{user_phone}")
+async def get_user_cars(user_phone: str):
+    query = UserTable.__table__.select().where(UserTable.phone == user_phone)
+    user = await database.fetch_one(query)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    items = user["car_list"] or []
+    return unified_response("ok", "USER_CARS", "user cars", {"items": items})
 
-@app.post("/user_cars")  # POST=به‌روزرسانی لیست ماشین‌ها
-async def update_user_cars(data: CarListUpdateRequest):  # update_user_cars=هندلر
-    sel = UserTable.__table__.select().where(UserTable.phone == data.user_phone)  # sel=انتخاب کاربر
-    user = await database.fetch_one(sel)  # user=نتیجه
-    if not user:  # اگر=کاربر نیست
-        raise HTTPException(status_code=404, detail="User not found")  # 404
-    upd = UserTable.__table__.update().where(UserTable.phone == data.user_phone).values(  # upd=آپدیت
-        car_list=[car.dict() for car in data.car_list]  # car_list=نگاشت Pydantic→dict
+@app.post("/user_cars")
+async def update_user_cars(data: CarListUpdateRequest):
+    sel = UserTable.__table__.select().where(UserTable.phone == data.user_phone)
+    user = await database.fetch_one(sel)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    upd = UserTable.__table__.update().where(UserTable.phone == data.user_phone).values(
+        car_list=[car.dict() for car in data.car_list]
     )
-    await database.execute(upd)  # اجرا
-    return unified_response("ok", "CARS_SAVED", "cars saved", {"count": len(data.car_list)})  # پاسخ یکدست
+    await database.execute(upd)
+    return unified_response("ok", "CARS_SAVED", "cars saved", {"count": len(data.car_list)})
 
-@app.post("/order")  # POST=ثبت سفارش
-async def create_order(order: OrderRequest):  # create_order=هندلر
-    ins = RequestTable.__table__.insert().values(  # ins=درج سفارش
+@app.post("/order")
+async def create_order(order: OrderRequest):
+    ins = RequestTable.__table__.insert().values(
         user_phone=order.user_phone,
         latitude=order.location.latitude,
         longitude=order.location.longitude,
@@ -399,11 +403,11 @@ async def create_order(order: OrderRequest):  # create_order=هندلر
         status="PENDING",
         payment_type=order.payment_type.strip().lower()
     )
-    await database.execute(ins)  # اجرا
-    return unified_response("ok", "REQUEST_CREATED", "request created", {})  # پاسخ یکدست
+    await database.execute(ins)
+    return unified_response("ok", "REQUEST_CREATED", "request created", {})
 
-@app.post("/cancel_order")  # POST=لغو سفارش
-async def cancel_order(cancel: CancelRequest):  # cancel_order=هندلر
+@app.post("/cancel_order")
+async def cancel_order(cancel: CancelRequest):
     upd = (
         RequestTable.__table__.update()
         .where(
@@ -414,63 +418,63 @@ async def cancel_order(cancel: CancelRequest):  # cancel_order=هندلر
         .values(status="CANCELED")
         .returning(RequestTable.id)
     )
-    rows = await database.fetch_all(upd)  # rows=لیست ردیف‌های تغییر یافته
-    if rows and len(rows) > 0:  # اگر=حداقل یک ردیف آپدیت شد
-        return unified_response("ok", "ORDER_CANCELED", "canceled", {"count": len(rows)})  # پاسخ موفق
-    raise HTTPException(status_code=404, detail="active order not found")  # نبود سفارش فعال
+    rows = await database.fetch_all(upd)
+    if rows and len(rows) > 0:
+        return unified_response("ok", "ORDER_CANCELED", "canceled", {"count": len(rows)})
+    raise HTTPException(status_code=404, detail="active order not found")
 
-@app.get("/user_active_services/{user_phone}")  # GET=سفارش‌های فعال کاربر
-async def get_user_active_services(user_phone: str):  # get_user_active_services=هندلر
+@app.get("/user_active_services/{user_phone}")
+async def get_user_active_services(user_phone: str):
     sel = RequestTable.__table__.select().where(
         (RequestTable.user_phone == user_phone) &
         (RequestTable.status.in_(["PENDING", "ACTIVE"]))
     )
-    result = await database.fetch_all(sel)  # result=نتیجه
-    items = [dict(row) for row in result]  # items=تبدیل به dict
-    return unified_response("ok", "USER_ACTIVE_SERVICES", "active services", {"items": items})  # پاسخ یکدست
+    result = await database.fetch_all(sel)
+    items = [dict(row) for row in result]
+    return unified_response("ok", "USER_ACTIVE_SERVICES", "active services", {"items": items})
 
-@app.get("/user_orders/{user_phone}")  # GET=همه سفارش‌های کاربر
-async def get_user_orders(user_phone: str):  # get_user_orders=هندلر
-    sel = RequestTable.__table__.select().where(RequestTable.user_phone == user_phone)  # sel=انتخاب همه سفارش‌ها
-    result = await database.fetch_all(sel)  # result=نتیجه
-    items = [dict(row) for row in result]  # items=تبدیل به dict
-    return unified_response("ok", "USER_ORDERS", "orders list", {"items": items})  # پاسخ یکدست
+@app.get("/user_orders/{user_phone}")
+async def get_user_orders(user_phone: str):
+    sel = RequestTable.__table__.select().where(RequestTable.user_phone == user_phone)
+    result = await database.fetch_all(sel)
+    items = [dict(row) for row in result]
+    return unified_response("ok", "USER_ORDERS", "orders list", {"items": items})
 
-@app.post("/user/profile")  # POST=ویرایش پروفایل
-async def update_profile(body: UserProfileUpdate):  # update_profile=هندلر
-    if not body.phone.strip():  # اگر=شماره خالی
-        raise HTTPException(status_code=400, detail="phone_required")  # 400
-    sel = UserTable.__table__.select().where(UserTable.phone == body.phone)  # sel=انتخاب کاربر
-    user = await database.fetch_one(sel)  # user=نتیجه
-    if user is None:  # اگر=کاربر نیست
-        raise HTTPException(status_code=404, detail="User not found")  # 404
-    upd = UserTable.__table__.update().where(UserTable.phone == body.phone).values(  # upd=آپدیت
+@app.post("/user/profile")
+async def update_profile(body: UserProfileUpdate):
+    if not body.phone.strip():
+        raise HTTPException(status_code=400, detail="phone_required")
+    sel = UserTable.__table__.select().where(UserTable.phone == body.phone)
+    user = await database.fetch_one(sel)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    upd = UserTable.__table__.update().where(UserTable.phone == body.phone).values(
         name=body.name.strip(),
         address=body.address.strip()
     )
-    await database.execute(upd)  # اجرا
-    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": body.phone})  # پاسخ یکدست
+    await database.execute(upd)
+    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": body.phone})
 
-@app.get("/user/profile/{phone}")  # GET=گرفتن پروفایل
-async def get_user_profile(phone: str):  # get_user_profile=هندلر
-    sel = UserTable.__table__.select().where(UserTable.phone == phone)  # sel=انتخاب کاربر
-    db_user = await database.fetch_one(sel)  # db_user=نتیجه
-    if db_user is None:  # اگر=کاربر نیست
-        raise HTTPException(status_code=404, detail="User not found")  # 404
-    mapping = getattr(db_user, "_mapping", {})  # mapping=سازگاری
-    name_val = mapping["name"] if "name" in mapping else ""  # name=نام
-    address_val = mapping["address"] if "address" in mapping else ""  # address=آدرس
-    return unified_response("ok", "PROFILE_FETCHED", "profile data", {  # پاسخ یکدست
+@app.get("/user/profile/{phone}")
+async def get_user_profile(phone: str):
+    sel = UserTable.__table__.select().where(UserTable.phone == phone)
+    db_user = await database.fetch_one(sel)
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    mapping = getattr(db_user, "_mapping", {})
+    name_val = mapping["name"] if "name" in mapping else ""
+    address_val = mapping["address"] if "address" in mapping else ""
+    return unified_response("ok", "PROFILE_FETCHED", "profile data", {
         "phone": db_user["phone"], "name": name_val or "", "address": address_val or ""
     })
 
-@app.get("/debug/users")  # GET=دیباگ کاربران
-async def debug_users():  # debug_users=هندلر
-    rows = await database.fetch_all(UserTable.__table__.select())  # rows=همه کاربران
-    out = []  # out=لیست خروجی
-    for r in rows:  # حلقه روی نتایج
-        mapping = getattr(r, "_mapping", {})  # mapping=سازگاری
-        name_val = mapping["name"] if "name" in mapping else ""  # name
-        address_val = mapping["address"] if "address" in mapping else ""  # address
-        out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})  # افزودن به خروجی
-    return out  # return=خروجی خام (برای دیباگ)
+@app.get("/debug/users")
+async def debug_users():
+    rows = await database.fetch_all(UserTable.__table__.select())
+    out = []
+    for r in rows:
+        mapping = getattr(r, "_mapping", {})
+        name_val = mapping["name"] if "name" in mapping else ""
+        address_val = mapping["address"] if "address" in mapping else ""
+        out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})
+    return out
