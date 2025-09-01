@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 
 from sqlalchemy import (
-    Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Index, select, func, and_, UniqueConstraint
+    Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Index, select, func, and_, UniqueConstraint, text
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
@@ -374,3 +374,4 @@ async def _register_login_success(phone: str, ip: str):
         await database.execute(upd)
 
 # ... بقیه اندپوینت‌ها و کدهای زمان‌بندی و پروفایل و ... طبق توضیحات قبلی
+
