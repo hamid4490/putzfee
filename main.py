@@ -73,7 +73,7 @@ class RequestTable(Base):  # مدل=سفارش‌ها
     service_type = Column(String, index=True)  # service_type=نوع سرویس
     price = Column(Integer)  # price=قیمت
     request_datetime = Column(String)  # request_datetime=زمان ثبت
-    status = Column(String)  # status=PENDING/WAITING/ASSIGNED/IN_PROGRESS/STARTED/FINISH/CANCELED
+    status = Column(String)  # status=NEW/WAITING/ASSIGNED/IN_PROGRESS/STARTED/FINISH/CANCELED
     driver_name = Column(String)  # driver_name=نام سرویس‌گیرنده
     driver_phone = Column(String)  # driver_phone=شماره سرویس‌گیرنده
     finish_datetime = Column(String)  # finish_datetime=زمان پایان
@@ -494,7 +494,7 @@ async def create_order(order: OrderRequest):  # تابع=ایجاد سفارش
         service_type=order.service_type,  # نوع سرویس
         price=order.price,  # قیمت
         request_datetime=order.request_datetime,  # زمان ثبت
-        status="PENDING",  # وضعیت اولیه
+        status="NEW",  # وضعیت اولیه
         payment_type=order.payment_type.strip().lower(),  # نوع پرداخت
         service_place=order.service_place.strip().lower()  # محل سرویس
     ).returning(RequestTable.id)  # بازگردانی id
@@ -509,7 +509,7 @@ async def cancel_order(cancel: CancelRequest):  # تابع=لغو
         .where(
             (RequestTable.user_phone == cancel.user_phone) &
             (RequestTable.service_type == cancel.service_type) &
-            (RequestTable.status.in_(["PENDING", "WAITING", "ASSIGNED", "IN_PROGRESS"]))  # وضعیت‌های قابل لغو
+            (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS"]))  # وضعیت‌های قابل لغو
         )
         .values(status="CANCELED", scheduled_start=None)  # مقداردهی لغو
         .returning(RequestTable.id)  # بازگردانی id
@@ -523,7 +523,7 @@ async def cancel_order(cancel: CancelRequest):  # تابع=لغو
 async def get_user_active_services(user_phone: str):  # تابع=خواندن سفارش‌های فعال
     sel = RequestTable.__table__.select().where(
         (RequestTable.user_phone == user_phone) &
-        (RequestTable.status.in_(["PENDING", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]))  # وضعیت‌های فعال
+        (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]))  # وضعیت‌های فعال
     )
     result = await database.fetch_all(sel)  # اجرا
     items = [dict(r) for r in result]  # دیکشنری
@@ -719,4 +719,5 @@ async def debug_users():  # تابع=لیست ساده کاربران
         address_val = mapping["address"] if "address" in mapping else ""  # آدرس
         out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})  # افزودن به خروجی
     return out  # بازگشت لیست
+
 
