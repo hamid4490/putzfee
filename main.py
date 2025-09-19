@@ -240,14 +240,41 @@ def get_client_ip(request: Request) -> str:  # تابع=گرفتن IP کلاین
         return xff.split(",")[0].strip()  # بازگشت اولین IP
     return request.client.host or "unknown"  # بازگشت IP مستقیم یا unknown
 
-def parse_iso(ts: str) -> datetime:  # تابع=پارس ISO به datetime آگاه به منطقه
-    try:  # try
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))  # جایگزینی Z با +00:00 و پارس
-    except Exception:  # خطا
-        raise HTTPException(status_code=400, detail=f"invalid datetime: {ts}")  # ارسال خطا 400
-    if dt.tzinfo is None:  # اگر tz ندارد
-        dt = dt.replace(tzinfo=timezone.utc)  # تنظیم UTC
-    return dt.astimezone(timezone.utc)  # بازگشت به UTC
+def parse_iso(ts: str) -> datetime:  # تابع=پارس رشته ISO به datetime «محلی بدون شیفت»
+    """
+    ورودی‌های قابل قبول:
+    - 2025-09-09T10:00             (بدون ثانیه/زون)
+    - 2025-09-09T10:00:00          (بدون زون)
+    - 2025-09-09T10:00:00Z         (با Z)
+    - 2025-09-09T10:00:00+03:30    (با offset)
+    خروجی: datetime با tzinfo=UTC اما بدون اعمال هیچ شیفتی (همان اعداد محلی ذخیره می‌شوند)
+    """
+    try:  # try=پارس ورودی
+        raw = ts.strip()  # raw=پاکسازی فاصله‌ها
+        if "T" not in raw:  # اگر=فرمت نادرست
+            raise ValueError("no T in ISO")
+        date_part, time_part = raw.split("T", 1)  # جداکردن تاریخ/زمان
+        time_part = time_part.replace("Z", "")  # حذف Z در انتها
+
+        # حذف offset (مثل +03:30 یا -04:00) بدون تغییر اعداد ساعت/دقیقه
+        for sign in ["+", "-"]:  # حلقه=علامت‌های offset
+            idx = time_part.find(sign)  # idx=محل علامت
+            if idx > 0:  # اگر=offset وجود دارد
+                time_part = time_part[:idx]  # بریدن بخش offset
+                break  # خروج از حلقه
+
+        # تکمیل ثانیه درصورت نبود
+        if time_part.count(":") == 1:  # اگر=فقط HH:MM
+            time_part = f"{time_part}:00"  # افزودن :00 ثانیه
+
+        y, m, d = map(int, date_part.split("-"))  # پارس تاریخ
+        hh, mm, ss = map(int, time_part.split(":"))  # پارس زمان
+
+        # ساخت datetime با tzinfo=UTC «بدون astimezone» → اعداد همان محلی باقی می‌مانند
+        dt = datetime(y, m, d, hh, mm, ss, tzinfo=timezone.utc)  # dt=شیء datetime با UTC اما بدون شیفت
+        return dt  # بازگشت=همان اعداد محلی
+    except Exception:  # خطا در پارس
+        raise HTTPException(status_code=400, detail=f"invalid datetime: {ts}")  # برگرداندن خطا 400
 
 async def provider_is_free(provider_phone: str, start: datetime, end: datetime) -> bool:  # تابع=بررسی خالی بودن بازه
     q = AppointmentTable.__table__.select().where(  # q=انتخاب رزروهای BOOKED متداخل
@@ -692,3 +719,4 @@ async def debug_users():  # تابع=لیست ساده کاربران
         address_val = mapping["address"] if "address" in mapping else ""  # آدرس
         out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})  # افزودن به خروجی
     return out  # بازگشت لیست
+
