@@ -252,25 +252,18 @@ def parse_iso(ts: str) -> datetime:  # تابع=پارس رشته ISO به datet
     try:  # try=پارس ورودی
         raw = ts.strip()  # raw=پاکسازی فاصله‌ها
         if "T" not in raw:  # اگر=فرمت نادرست
-            raise ValueError("no T in ISO")
+            raise ValueError("no T in ISO")  # خطا=عدم وجود T
         date_part, time_part = raw.split("T", 1)  # جداکردن تاریخ/زمان
         time_part = time_part.replace("Z", "")  # حذف Z در انتها
-
-        # حذف offset (مثل +03:30 یا -04:00) بدون تغییر اعداد ساعت/دقیقه
         for sign in ["+", "-"]:  # حلقه=علامت‌های offset
             idx = time_part.find(sign)  # idx=محل علامت
             if idx > 0:  # اگر=offset وجود دارد
                 time_part = time_part[:idx]  # بریدن بخش offset
                 break  # خروج از حلقه
-
-        # تکمیل ثانیه درصورت نبود
         if time_part.count(":") == 1:  # اگر=فقط HH:MM
             time_part = f"{time_part}:00"  # افزودن :00 ثانیه
-
         y, m, d = map(int, date_part.split("-"))  # پارس تاریخ
         hh, mm, ss = map(int, time_part.split(":"))  # پارس زمان
-
-        # ساخت datetime با tzinfo=UTC «بدون astimezone» → اعداد همان محلی باقی می‌مانند
         dt = datetime(y, m, d, hh, mm, ss, tzinfo=timezone.utc)  # dt=شیء datetime با UTC اما بدون شیفت
         return dt  # بازگشت=همان اعداد محلی
     except Exception:  # خطا در پارس
@@ -282,7 +275,7 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime) 
         (AppointmentTable.status == "BOOKED") &
         (AppointmentTable.start_time < end) &
         (AppointmentTable.end_time > start)
-    )
+    )  # پایان شرط‌ها
     rows = await database.fetch_all(q)  # اجرا
     return len(rows) == 0  # True=آزاد است
 
@@ -567,6 +560,55 @@ async def get_free_hours(
 
     return unified_response("ok", "FREE_HOURS", "free hourly slots", {"items": results})  # پاسخ
 
+@app.get("/busy_slots")  # مسیر=ساعات مشغول (پیشنهادشده یا رزروشده) برای جلوگیری از تداخل
+async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optional[int] = None):  # تابع=گرفتن اسلات‌های مشغول
+    """
+    خروجی: لیست شروع‌های ساعتی که یا در schedule_slots (PROPOSED/ACCEPTED) وجود دارند یا در appointments (BOOKED) هستند.  # توضیح=تعریف
+    exclude_order_id: حذف اسلات‌های مربوط به همین سفارش از نتایج busy (برای نمایش به خود سفارش)  # توضیح=استثناء
+    provider_phone: وقتی 'any' باشد، همه را درنظر می‌گیرد؛ در غیر این صورت فیلتر بر اساس provider_phone  # توضیح=فیلتر ارائه‌دهنده
+    """
+    try:  # try=پارس تاریخ
+        d = datetime.fromisoformat(date).date()  # d=تاریخ
+    except Exception:  # خطا
+        raise HTTPException(status_code=400, detail="invalid date; expected YYYY-MM-DD")  # خطا تاریخ
+
+    day_start = datetime(d.year, d.month, d.day, 0, 0, tzinfo=timezone.utc)  # day_start=شروع روز (UTC)
+    day_end = day_start + timedelta(days=1)  # day_end=پایان روز (UTC+1 روز)
+
+    # --- اسلات‌های پیشنهادی (PROPOSED/ACCEPTED) ---
+    sel_sched = ScheduleSlotTable.__table__.select().where(  # sel_sched=انتخاب اسلات‌های پیشنهادی/پذیرفته
+        (ScheduleSlotTable.slot_start >= day_start) &
+        (ScheduleSlotTable.slot_start < day_end) &
+        (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))
+    )  # پایان where
+    if provider_phone.strip().lower() != "any":  # فیلتر=وقتی provider مشخص است
+        sel_sched = sel_sched.where(ScheduleSlotTable.provider_phone == provider_phone)  # شرط=provider_phone
+    if exclude_order_id is not None:  # فیلتر=حذف اسلات‌های سفارش جاری
+        sel_sched = sel_sched.where(ScheduleSlotTable.request_id != exclude_order_id)  # شرط=عدم برابری request_id
+
+    rows_sched = await database.fetch_all(sel_sched)  # اجرا=واکشی اسلات‌ها
+
+    # --- رزروهای قطعی (BOOKED) ---
+    sel_app = AppointmentTable.__table__.select().where(  # sel_app=انتخاب رزروهای قطعی
+        (AppointmentTable.start_time >= day_start) &
+        (AppointmentTable.start_time < day_end) &
+        (AppointmentTable.status == "BOOKED")
+    )  # پایان where
+    if provider_phone.strip().lower() != "any":  # فیلتر=وقتی provider مشخص است
+        sel_app = sel_app.where(AppointmentTable.provider_phone == provider_phone)  # شرط=provider_phone
+
+    rows_app = await database.fetch_all(sel_app)  # اجرا=واکشی رزروها
+
+    # --- تجمیع خروجی ---
+    busy: set[str] = set()  # busy=مجموعه زمان‌های مشغول
+    for r in rows_sched:  # حلقه=روی اسلات‌های پیشنهادی/پذیرفته
+        busy.add(r["slot_start"].isoformat())  # افزودن=slot_start به صورت ISO
+    for r in rows_app:  # حلقه=روی رزروهای BOOKED
+        busy.add(r["start_time"].isoformat())  # افزودن=start_time به صورت ISO
+
+    items = sorted(busy)  # items=مرتب‌سازی رشته‌ای
+    return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": items})  # پاسخ=لیست مشغول
+
 @app.post("/order/{order_id}/propose_slots")  # مسیر=پیشنهاد اسلات‌ها (مدیر)
 async def propose_slots(order_id: int, body: ProposedSlotsRequest):  # تابع=ثبت اسلات‌های پیشنهادی
     req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == order_id))  # یافتن سفارش
@@ -719,5 +761,3 @@ async def debug_users():  # تابع=لیست ساده کاربران
         address_val = mapping["address"] if "address" in mapping else ""  # آدرس
         out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})  # افزودن به خروجی
     return out  # بازگشت لیست
-
-
