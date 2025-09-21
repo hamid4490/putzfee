@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-  # کدینگ فایل=یونیکد
-# FastAPI server (orders + hourly scheduling + DB notifications)  # توضیح=سرور سفارش/زمان‌بندی با اعلان‌های ذخیره‌شده در DB
+# FastAPI server (orders + hourly scheduling + DB notifications + FCM push)  # توضیح=سرور سفارش/زمان‌بندی با اعلان‌های DB و پوش
 
 import os  # ماژول=سیستم/مسیر
 import hashlib  # ماژول=هش امن
@@ -21,6 +21,7 @@ from sqlalchemy.ext.declarative import declarative_base  # declarative_base=پا
 import sqlalchemy  # sqlalchemy=پکیج اصلی ORM/SQL
 from databases import Database  # databases=اتصال async به DB
 from dotenv import load_dotenv  # load_dotenv=خواندن .env
+import httpx  # httpx=کلاینت HTTP async برای FCM
 
 # -------------------- Config --------------------
 load_dotenv()  # بارگذاری متغیرهای محیطی از .env
@@ -35,6 +36,8 @@ ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")  # مبداهای مجاز C
 LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "300"))  # پنجره شمارش تلاش ورود (ثانیه)
 LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))  # حداکثر تلاش ورود
 LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "900"))  # مدت قفل پس از اتمام تلاش (ثانیه)
+
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "")  # کلید سرور FCM برای ارسال پوش
 
 database = Database(DATABASE_URL)  # نمونه اتصال async DB
 Base = declarative_base()  # پایه مدل‌های ORM
@@ -139,6 +142,17 @@ class NotificationTable(Base):  # مدل=اعلان‌ها (ذخیره در DB)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)  # created_at=زمان ایجاد
     __table_args__ = (Index("ix_notifs_user_read_created", "user_phone", "read", "created_at"),)  # ایندکس مرکب
 
+class DeviceTokenTable(Base):  # مدل=توکن‌های پوش دستگاه
+    __tablename__ = "device_tokens"  # نام جدول
+    id = Column(Integer, primary_key=True, index=True)  # id=کلید اصلی
+    token = Column(String, unique=True, index=True)  # token=توکن FCM یکتا
+    role = Column(String, index=True)  # role=نقش گیرنده (manager/user)
+    platform = Column(String, default="android", index=True)  # platform=اندروید/…
+    user_phone = Column(String, nullable=True)  # user_phone=شماره کاربر (اختیاری)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # created_at=زمان ایجاد
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # updated_at=آخرین به‌روزرسانی
+    __table_args__ = (Index("ix_tokens_role_platform", "role", "platform"),)  # ایندکس مرکب
+
 # -------------------- Pydantic models --------------------
 class CarInfo(BaseModel):  # مدل=ماشین ساده
     brand: str  # برند
@@ -202,6 +216,12 @@ class PriceBody(BaseModel):  # مدل=ثبت قیمت/توافق
     price: int  # قیمت
     agree: bool  # توافق؟
 
+class PushRegister(BaseModel):  # مدل=ثبت توکن پوش
+    role: str  # نقش
+    token: str  # توکن
+    platform: str = "android"  # پلتفرم
+    user_phone: Optional[str] = None  # شماره کاربر (اختیاری)
+
 # -------------------- Security helpers --------------------
 def bcrypt_hash_password(password: str) -> str:  # تابع=هش رمز با bcrypt+pepper
     salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)  # تولید نمک bcrypt
@@ -243,10 +263,10 @@ def get_client_ip(request: Request) -> str:  # تابع=گرفتن IP کلاین
 def parse_iso(ts: str) -> datetime:  # تابع=پارس رشته ISO به datetime «محلی بدون شیفت»
     """
     ورودی‌های قابل قبول:
-    - 2025-09-09T10:00             (بدون ثانیه/زون)
-    - 2025-09-09T10:00:00          (بدون زون)
-    - 2025-09-09T10:00:00Z         (با Z)
-    - 2025-09-09T10:00:00+03:30    (با offset)
+    - 2025-09-09T10:00
+    - 2025-09-09T10:00:00
+    - 2025-09-09T10:00:00Z
+    - 2025-09-09T10:00:00+03:30
     خروجی: datetime با tzinfo=UTC اما بدون اعمال هیچ شیفتی (همان اعداد محلی ذخیره می‌شوند)
     """
     try:  # try=پارس ورودی
@@ -290,6 +310,50 @@ async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = 
     )  # پایان values
     await database.execute(ins)  # اجرا=درج
 
+# -------------------- Push helpers (FCM) --------------------
+async def get_manager_tokens() -> List[str]:  # تابع=گرفتن توکن‌های نقش مدیر
+    sel = DeviceTokenTable.__table__.select().where(  # sel=انتخاب ردیف‌های نقش مدیر/اندروید
+        (DeviceTokenTable.role == "manager") & (DeviceTokenTable.platform == "android")
+    )  # پایان where
+    rows = await database.fetch_all(sel)  # اجرا
+    tokens = []  # لیست توکن‌ها
+    seen = set()  # مجموعه=حذف تکراری
+    for r in rows:  # حلقه روی ردیف‌ها
+        t = r["token"]  # t=توکن
+        if t and t not in seen:  # اگر=نو و غیرخالی
+            seen.add(t)  # ثبت در مجموعه
+            tokens.append(t)  # افزودن به لیست
+    return tokens  # بازگشت لیست
+
+async def send_push_to_tokens(tokens: List[str], title: str, body: str, data: Optional[dict] = None):  # تابع=ارسال پوش به لیست توکن
+    if not FCM_SERVER_KEY or not tokens:  # اگر=کلید FCM یا لیست خالی
+        return  # خروج
+    url = "https://fcm.googleapis.com/fcm/send"  # url=آدرس legacy FCM
+    headers = {  # headers=هدرهای درخواست
+        "Authorization": f"key={FCM_SERVER_KEY}",  # Authorization=کلید سرور
+        "Content-Type": "application/json"  # Content-Type=JSON
+    }  # پایان headers
+    async with httpx.AsyncClient(timeout=10.0) as client:  # AsyncClient=کلاینت HTTP async
+        for t in tokens:  # حلقه روی توکن‌ها
+            payload = {  # payload=بدنه ارسال
+                "to": t,  # to=توکن مقصد
+                "priority": "high",  # priority=اولویت بالا
+                "notification": {  # notification=بخش نمایش اعلان توسط سیستم
+                    "title": title,  # title=عنوان
+                    "body": body,  # body=متن
+                    "android_channel_id": "putz_manager_general"  # android_channel_id=شناسه کانال
+                },  # پایان notification
+                "data": data or {}  # data=داده‌های الحاقی (برای رفتار اپ)
+            }  # پایان payload
+            try:  # try=ارسال
+                await client.post(url, headers=headers, json=payload)  # ارسال=POST به FCM
+            except Exception:  # خطا
+                pass  # نادیده گرفتن خطا برای تک توکن
+
+async def send_push_to_managers(title: str, body: str, data: Optional[dict] = None):  # تابع=ارسال پوش به مدیران
+    tokens = await get_manager_tokens()  # tokens=خواندن توکن‌های مدیر
+    await send_push_to_tokens(tokens, title, body, data)  # ارسال=فراخوانی ارسال به لیست
+
 # -------------------- App & CORS --------------------
 app = FastAPI()  # نمونه برنامه FastAPI
 allow_origins = ["*"] if ALLOW_ORIGINS_ENV.strip() == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]  # لیست مبداها
@@ -319,6 +383,24 @@ async def shutdown():  # تابع=خاموشی
 @app.get("/")  # مسیر=ریشه
 def read_root():  # تابع=سلامتی
     return {"message": "Putzfee FastAPI Server is running!"}  # پاسخ=وضعیت OK
+
+# -------------------- Push endpoints --------------------
+@app.post("/push/register")  # مسیر=ثبت توکن پوش دستگاه
+async def register_push_token(body: PushRegister, request: Request):  # تابع=ثبت/به‌روزرسانی توکن
+    now = datetime.now(timezone.utc)  # now=اکنون UTC
+    sel = DeviceTokenTable.__table__.select().where(DeviceTokenTable.token == body.token)  # sel=یافتن توکن
+    row = await database.fetch_one(sel)  # row=نتیجه
+    if row is None:  # اگر=وجود ندارد
+        ins = DeviceTokenTable.__table__.insert().values(  # ins=درج رکورد جدید
+            token=body.token, role=body.role, platform=body.platform, user_phone=body.user_phone, created_at=now, updated_at=now
+        )  # پایان values
+        await database.execute(ins)  # اجرا
+    else:  # اگر=وجود دارد
+        upd = DeviceTokenTable.__table__.update().where(DeviceTokenTable.id == row["id"]).values(  # upd=به‌روزرسانی
+            role=body.role, platform=body.platform, user_phone=body.user_phone or row["user_phone"], updated_at=now
+        )  # پایان values
+        await database.execute(upd)  # اجرا
+    return unified_response("ok", "TOKEN_REGISTERED", "registered", {"role": body.role})  # پاسخ
 
 # -------------------- Auth/User --------------------
 @app.get("/users/exists")  # مسیر=بررسی وجود کاربر
@@ -493,6 +575,13 @@ async def create_order(order: OrderRequest):  # تابع=ایجاد سفارش
     ).returning(RequestTable.id)  # بازگردانی id
     row = await database.fetch_one(ins)  # اجرا
     new_id = row[0] if isinstance(row, (tuple, list)) else (row["id"] if row else None)  # استخراج id
+
+    # پوش نوتیفیکیشن به مدیران: "درخواست جدید"
+    try:  # try=محافظ خطا
+        await send_push_to_managers("درخواست جدید", "درخواست جدید ثبت شد.", {"type": "new_request", "order_id": str(new_id)})  # ارسال پوش
+    except Exception:  # خطا
+        pass  # نادیده گرفتن
+
     return unified_response("ok", "REQUEST_CREATED", "request created", {"id": new_id})  # پاسخ
 
 @app.post("/cancel_order")  # مسیر=لغو سفارش
@@ -685,6 +774,12 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest):  # تابع=ت�
     await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(
         scheduled_start=start, status="ASSIGNED", driver_phone=provider_phone
     ))  # وضعیت=ASSIGNED (کاربر زمان را انتخاب کرد)
+
+    # پوش نوتیفیکیشن به مدیران: "تأیید زمان"
+    try:  # try=محافظ خطا
+        await send_push_to_managers("تأیید زمان", "کاربر زمان را تأیید کرد.", {"type": "time_confirm", "order_id": str(order_id)})  # ارسال پوش
+    except Exception:  # خطا
+        pass  # نادیده گرفتن
 
     return unified_response("ok", "SLOT_CONFIRMED", "slot confirmed", {"start": start.isoformat(), "end": end.isoformat()})  # پاسخ
 
