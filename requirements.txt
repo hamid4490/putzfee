@@ -13,3 +13,4 @@ bcrypt
 pyjwt
 databases[postgresql]
 unidecode 
+httpx==0.27.2
