@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-  # کدینگ فایل=یونیکد
-# FastAPI server (orders + hourly scheduling + DB notifications + FCM push + AdminKey)  # توضیح=سرور با کلید ادمین
+# FastAPI server (orders + hourly scheduling + DB notifications + FCM push + AdminKey + execution_time)  # توضیح=سرور با کلید ادمین و زمان اجرای کار
 
 import os  # ماژول=سیستم
 import hashlib  # ماژول=هش
@@ -80,8 +80,9 @@ class RequestTable(Base):  # مدل=سفارش‌ها
     driver_phone = Column(String)  # شماره سرویس‌گیرنده
     finish_datetime = Column(String)  # زمان پایان
     payment_type = Column(String)  # نوع پرداخت
-    scheduled_start = Column(DateTime(timezone=True), nullable=True)  # شروع قطعی
+    scheduled_start = Column(DateTime(timezone=True), nullable=True)  # شروع قطعی (بازدید/اولیه)
     service_place = Column(String, default="client")  # محل سرویس
+    execution_start = Column(DateTime(timezone=True), nullable=True)  # زمان اجرای کار (جدید)
 
 class RefreshTokenTable(Base):  # مدل=رفرش‌توکن‌ها
     __tablename__ = "refresh_tokens"  # جدول
@@ -214,6 +215,7 @@ class ConfirmSlotRequest(BaseModel):  # مدل=تأیید اسلات
 class PriceBody(BaseModel):  # مدل=ثبت قیمت/توافق
     price: int  # قیمت
     agree: bool  # توافق؟
+    exec_time: Optional[str] = None  # exec_time=زمان اجرای کار (ISO یک‌ساعته؛ اختیاری)
 
 class PushRegister(BaseModel):  # مدل=ثبت توکن پوش
     role: str  # نقش
@@ -358,6 +360,7 @@ async def startup():  # تابع=راه‌اندازی
     with engine.begin() as conn:  # تراکنش
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS scheduled_start TIMESTAMPTZ NULL;"))  # تضمین ستون
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS service_place TEXT DEFAULT 'client';"))  # تضمین ستون
+        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS execution_start TIMESTAMPTZ NULL;"))  # تضمین ستون execution_start
     await database.connect()  # اتصال DB
 
 @app.on_event("shutdown")  # رویداد=پایان
@@ -549,7 +552,7 @@ async def create_order(order: OrderRequest):  # تابع=ایجاد سفارش
 
 @app.post("/cancel_order")  # مسیر=لغو سفارش
 async def cancel_order(cancel: CancelRequest):  # تابع=لغو
-    upd = (RequestTable.__table__.update().where((RequestTable.user_phone == cancel.user_phone) & (RequestTable.service_type == cancel.service_type) & (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS"]))).values(status="CANCELED", scheduled_start=None).returning(RequestTable.id))  # آپدیت
+    upd = (RequestTable.__table__.update().where((RequestTable.user_phone == cancel.user_phone) & (RequestTable.service_type == cancel.service_type) & (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]))).values(status="CANCELED", scheduled_start=None).returning(RequestTable.id))  # آپدیت
     rows = await database.fetch_all(upd)  # اجرا
     if rows and len(rows) > 0:  # وجود حداقل یک رکورد
         try:  # try
@@ -595,13 +598,15 @@ async def get_free_hours(provider_phone: str, date: str, work_start: int = 8, wo
     if not (0 <= work_start < 24 and 0 <= work_end <= 24 and work_start < work_end):  # اعتبارسنجی ساعت
         raise HTTPException(status_code=400, detail="invalid work hours")  # خطا
     provider = provider_phone.strip()  # تمیز
+    if not provider or provider.lower() == "any":  # اعتبارسنجی شماره سرویس‌گیرنده
+        raise HTTPException(status_code=400, detail="invalid provider_phone")  # خطا
     day_start = datetime(d.year, d.month, d.day, work_start, 0, tzinfo=timezone.utc)  # شروع روز
     day_end = datetime(d.year, d.month, d.day, work_end, 0, tzinfo=timezone.utc)  # پایان روز
     results: List[str] = []  # خروجی
     cur = day_start  # زمان جاری
     while cur + timedelta(hours=1) <= day_end and len(results) < limit:  # حلقه تولید اسلات
         s, e = cur, cur + timedelta(hours=1)  # بازه
-        if provider.lower() == "any" or await provider_is_free(provider, s, e):  # آزاد یا any
+        if await provider_is_free(provider, s, e):  # آزاد بودن provider
             results.append(s.isoformat())  # افزودن
         cur = cur + timedelta(hours=1)  # بعدی
     return unified_response("ok", "FREE_HOURS", "free hourly slots", {"items": results})  # پاسخ
@@ -612,17 +617,16 @@ async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optio
         d = datetime.fromisoformat(date).date()  # تاریخ
     except Exception:  # خطا
         raise HTTPException(status_code=400, detail="invalid date; expected YYYY-MM-DD")  # خطا
+    provider = provider_phone.strip()  # provider=شماره سرویس‌گیرنده
+    if not provider or provider.lower() == "any":  # اعتبارسنجی provider
+        raise HTTPException(status_code=400, detail="invalid provider_phone")  # خطا
     day_start = datetime(d.year, d.month, d.day, 0, 0, tzinfo=timezone.utc)  # شروع
     day_end = day_start + timedelta(days=1)  # پایان
-    sel_sched = ScheduleSlotTable.__table__.select().where((ScheduleSlotTable.slot_start >= day_start) & (ScheduleSlotTable.slot_start < day_end) & (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])))  # انتخاب
-    if provider_phone.strip().lower() != "any":  # فیلتر provider
-        sel_sched = sel_sched.where(ScheduleSlotTable.provider_phone == provider_phone)  # شرط provider
+    sel_sched = ScheduleSlotTable.__table__.select().where((ScheduleSlotTable.slot_start >= day_start) & (ScheduleSlotTable.slot_start < day_end) & (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) & (ScheduleSlotTable.provider_phone == provider))  # انتخاب فقط همین provider
     if exclude_order_id is not None:  # حذف سفارش جاری
         sel_sched = sel_sched.where(ScheduleSlotTable.request_id != exclude_order_id)  # شرط
     rows_sched = await database.fetch_all(sel_sched)  # اجرا
-    sel_app = AppointmentTable.__table__.select().where((AppointmentTable.start_time >= day_start) & (AppointmentTable.start_time < day_end) & (AppointmentTable.status == "BOOKED"))  # رزرو قطعی
-    if provider_phone.strip().lower() != "any":  # فیلتر provider
-        sel_app = sel_app.where(AppointmentTable.provider_phone == provider_phone)  # شرط
+    sel_app = AppointmentTable.__table__.select().where((AppointmentTable.start_time >= day_start) & (AppointmentTable.start_time < day_end) & (AppointmentTable.status == "BOOKED") & (AppointmentTable.provider_phone == provider))  # رزرو قطعی همان provider
     rows_app = await database.fetch_all(sel_app)  # اجرا
     busy: set[str] = set()  # مجموعه busy
     for r in rows_sched:  # حلقه اسلات‌ها
@@ -714,9 +718,31 @@ async def admin_set_price_and_status(order_id: int, body: PriceBody, request: Re
     req = await database.fetch_one(sel)  # اجرا
     if not req:  # نبود
         raise HTTPException(status_code=404, detail="order not found")  # خطا
+
     new_status = "IN_PROGRESS" if body.agree else "CANCELED"  # وضعیت جدید
-    await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(price=body.price, status=new_status))  # آپدیت
-    return unified_response("ok", "PRICE_SET", "price and status updated", {"order_id": order_id, "price": body.price, "status": new_status})  # پاسخ
+    values = {"price": body.price, "status": new_status}  # values=مقادیر آپدیت پایه
+
+    # — زمان اجرای کار (اختیاری) —
+    exec_iso = (body.exec_time or "").strip()  # exec_iso=رشته ISO
+    if body.agree and exec_iso:  # نیاز به زمان اجرا
+        start = parse_iso(exec_iso)  # start=پارس ISO
+        end = start + timedelta(hours=1)  # end=یک ساعت بعد
+        provider_phone = (req["driver_phone"] or "").strip()  # provider_phone=شماره سرویس‌گیرنده
+        if not provider_phone:  # نبود شماره سرویس‌گیرنده
+            raise HTTPException(status_code=400, detail="driver_phone required for execution")  # خطا
+        free = await provider_is_free(provider_phone, start, end)  # free=آزاد بودن بازه
+        if not free:  # مشغول
+            raise HTTPException(status_code=409, detail="execution slot busy")  # خطا
+        await database.execute(AppointmentTable.__table__.insert().values(provider_phone=provider_phone, request_id=order_id, start_time=start, end_time=end, status="BOOKED", created_at=datetime.now(timezone.utc)))  # درج نوبت اجرا
+        values["execution_start"] = start  # ثبت execution_start در سفارش
+        try:  # try
+            await notify_user(req["user_phone"], "زمان اجرای کار", "زمان اجرای کار تعیین شد.", data={"order_id": order_id, "start": start.isoformat()})  # اعلان کاربر
+        except Exception:  # خطا
+            pass  # نادیده
+
+    await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(**values))  # آپدیت سفارش
+    resp = {"order_id": order_id, "price": body.price, "status": new_status, "execution_start": values.get("execution_start").isoformat() if values.get("execution_start") else None}  # resp=خروجی
+    return unified_response("ok", "PRICE_SET", "price and status updated", resp)  # پاسخ
 
 @app.post("/order/{order_id}/start")  # مسیر=شروع
 async def start_order(order_id: int, request: Request):  # تابع=شروع
