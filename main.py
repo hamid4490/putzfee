@@ -598,6 +598,27 @@ async def cancel_order(cancel: CancelRequest):  # تابع=لغو
     )
     rows = await database.fetch_all(upd)  # اجرا
     if rows and len(rows) > 0:  # اگر حداقل یک رکورد
+        try:  # try=ارسال پوش برای هر سفارش لغوشده
+            for r in rows:  # حلقه=روی ردیف‌ها
+                # استخراج id با سازگاری RowMapping/tuple
+                oid = None  # oid=شناسه سفارش
+                mapping = getattr(r, "_mapping", None)  # mapping=RowMapping
+                if mapping and "id" in mapping:  # اگر=کلید id
+                    oid = mapping["id"]  # oid=از mapping
+                elif isinstance(r, (tuple, list)) and len(r) > 0:  # elif=تاپل/لیست
+                    oid = r[0]  # oid=اولین مقدار
+                else:  # else=به صورت dict
+                    try:
+                        oid = r["id"]  # oid=از dict
+                    except Exception:
+                        oid = None  # oid=None در خطا
+                await send_push_to_managers(  # ارسال پوش به مدیران
+                    "لغو درخواست",  # عنوان=لغو درخواست
+                    "کاربر سفارش را لغو کرد.",  # متن=لغو توسط کاربر
+                    {"type": "order_canceled", "order_id": str(oid) if oid is not None else ""}  # data=نوع/شناسه
+                )  # پایان ارسال
+        except Exception:  # خطا
+            pass  # نادیده گرفتن
         return unified_response("ok", "ORDER_CANCELED", "canceled", {"count": len(rows)})  # پاسخ
     raise HTTPException(status_code=404, detail="active order not found")  # خطا
 
@@ -788,9 +809,17 @@ async def reject_all_and_cancel(order_id: int):  # تابع=رد و کنسل
     await database.execute(ScheduleSlotTable.__table__.update().where(
         (ScheduleSlotTable.request_id == order_id) & (ScheduleSlotTable.status == "PROPOSED")
     ).values(status="REJECTED"))  # رد همه اسلات‌های پیشنهادی
-    await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(status="CANCELED", scheduled_start=None))  # کنسل سفارش
-    return unified_response("ok", "ORDER_CANCELED", "order canceled after rejecting proposals", {})  # پاسخ
-
+    upd = RequestTable.__table__.update().where(RequestTable.id == order_id).values(status="CANCELED", scheduled_start=None).returning(RequestTable.id)  # آپدیت=کنسل سفارش با returning id
+    rows = await database.fetch_all(upd)  # اجرا
+    try:  # try=ارسال پوش اطلاع‌رسانی به مدیران
+        await send_push_to_managers(  # ارسال پوش
+            "لغو درخواست",  # عنوان=لغو درخواست
+            "کاربر سفارش را لغو کرد.",  # متن=لغو توسط کاربر
+            {"type": "order_canceled", "order_id": str(order_id)}  # data=نوع/شناسه
+        )  # پایان ارسال
+    except Exception:  # خطا
+        pass  # نادیده گرفتن
+    return unified_response("ok", "ORDER_CANCELED", "order canceled after rejecting proposals", {"id": order_id})  # پاسخ
 # -------------------- Admin/Workflow --------------------
 @app.post("/admin/order/{order_id}/price")  # مسیر=ثبت قیمت و وضعیت بعدی
 async def admin_set_price_and_status(order_id: int, body: PriceBody):  # تابع=ثبت قیمت/وضعیت
@@ -856,3 +885,4 @@ async def debug_users():  # تابع=لیست ساده کاربران
         address_val = mapping["address"] if "address" in mapping else ""  # آدرس
         out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})  # افزودن به خروجی
     return out  # بازگشت لیست
+
