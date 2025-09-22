@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-  # کدینگ فایل=یونیکد
-# FastAPI server (orders + hourly scheduling + DB notifications + FCM push + AdminKey + execution_time)  # توضیح=سرور با کلید ادمین و زمان اجرای کار
+# FastAPI server (orders + hourly scheduling + DB notifications + FCM push + AdminKey + execution_time + user push)  # توضیح=سرور با پوش به مدیر و کاربر
 
 import os  # ماژول=سیستم
 import hashlib  # ماژول=هش
@@ -215,7 +215,7 @@ class ConfirmSlotRequest(BaseModel):  # مدل=تأیید اسلات
 class PriceBody(BaseModel):  # مدل=ثبت قیمت/توافق
     price: int  # قیمت
     agree: bool  # توافق؟
-    exec_time: Optional[str] = None  # exec_time=زمان اجرای کار (ISO یک‌ساعته؛ اختیاری)
+    exec_time: Optional[str] = None  # exec_time=زمان اجرای کار (ISO)
 
 class PushRegister(BaseModel):  # مدل=ثبت توکن پوش
     role: str  # نقش
@@ -298,7 +298,7 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime) 
     rows = await database.fetch_all(q)  # اجرا
     return len(rows) == 0  # True=آزاد
 
-async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None):  # تابع=ثبت اعلان
+async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None):  # تابع=ثبت اعلان DB
     ins = NotificationTable.__table__.insert().values(  # درج اعلان
         user_phone=phone, title=title, body=body, data=(data or {}), read=False, created_at=datetime.now(timezone.utc)
     )  # پایان values
@@ -317,6 +317,20 @@ async def get_manager_tokens() -> List[str]:  # تابع=توکن‌های مد�
         if t and t not in seen:  # غیرخالی و تکراری نبودن
             seen.add(t)  # افزودن به مجموعه
             tokens.append(t)  # افزودن به لیست
+    return tokens  # بازگشت
+
+async def get_user_tokens(phone: str) -> List[str]:  # تابع=توکن‌های کاربر
+    sel = DeviceTokenTable.__table__.select().where(  # انتخاب نقش=client و شماره کاربر
+        (DeviceTokenTable.role == "client") & (DeviceTokenTable.user_phone == phone)
+    )  # پایان where
+    rows = await database.fetch_all(sel)  # اجرا
+    tokens = []  # لیست خروجی
+    seen = set()  # حذف تکراری
+    for r in rows:  # حلقه
+        t = r["token"]  # توکن
+        if t and t not in seen:  # غیرخالی و یکتا
+            seen.add(t)  # افزودن
+            tokens.append(t)  # افزودن
     return tokens  # بازگشت
 
 async def send_push_to_tokens(tokens: List[str], title: str, body: str, data: Optional[dict] = None):  # تابع=ارسال پوش
@@ -339,6 +353,10 @@ async def send_push_to_tokens(tokens: List[str], title: str, body: str, data: Op
 
 async def send_push_to_managers(title: str, body: str, data: Optional[dict] = None):  # تابع=ارسال پوش مدیران
     tokens = await get_manager_tokens()  # گرفتن توکن‌ها
+    await send_push_to_tokens(tokens, title, body, data)  # ارسال
+
+async def send_push_to_user(phone: str, title: str, body: str, data: Optional[dict] = None):  # تابع=ارسال پوش کاربر
+    tokens = await get_user_tokens(phone)  # گرفتن توکن‌های کاربر
     await send_push_to_tokens(tokens, title, body, data)  # ارسال
 
 # -------------------- App & CORS --------------------
@@ -545,7 +563,7 @@ async def create_order(order: OrderRequest):  # تابع=ایجاد سفارش
     row = await database.fetch_one(ins)  # اجرا
     new_id = row[0] if isinstance(row, (tuple, list)) else (row["id"] if row else None)  # استخراج id
     try:  # try
-        await send_push_to_managers("درخواست جدید", "درخواست جدید ثبت شد.", {"type": "new_request", "order_id": str(new_id)})  # پوش
+        await send_push_to_managers("درخواست جدید", "درخواست جدید ثبت شد.", {"type": "new_request", "order_id": str(new_id)})  # پوش مدیر
     except Exception:  # خطا
         pass  # نادیده
     return unified_response("ok", "REQUEST_CREATED", "request created", {"id": new_id})  # پاسخ
@@ -563,12 +581,7 @@ async def cancel_order(cancel: CancelRequest):  # تابع=لغو
                     oid = mapping["id"]  # شناسه
                 elif isinstance(r, (tuple, list)) and len(r) > 0:  # تاپل/لیست
                     oid = r[0]  # شناسه
-                else:  # dict
-                    try:
-                        oid = r["id"]  # شناسه
-                    except Exception:
-                        oid = None  # None
-                await send_push_to_managers("لغو درخواست", "کاربر سفارش را لغو کرد.", {"type": "order_canceled", "order_id": str(oid) if oid is not None else ""})  # پوش
+                await send_push_to_managers("لغو درخواست", "کاربر سفارش را لغو کرد.", {"type": "order_canceled", "order_id": str(oid) if oid is not None else ""})  # پوش مدیر
         except Exception:  # خطا
             pass  # نادیده
         return unified_response("ok", "ORDER_CANCELED", "canceled", {"count": len(rows)})  # پاسخ
@@ -626,7 +639,7 @@ async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optio
     if exclude_order_id is not None:  # حذف سفارش جاری
         sel_sched = sel_sched.where(ScheduleSlotTable.request_id != exclude_order_id)  # شرط
     rows_sched = await database.fetch_all(sel_sched)  # اجرا
-    sel_app = AppointmentTable.__table__.select().where((AppointmentTable.start_time >= day_start) & (AppointmentTable.start_time < day_end) & (AppointmentTable.status == "BOOKED") & (AppointmentTable.provider_phone == provider))  # رزرو قطعی همان provider
+    sel_app = AppointmentTable.__table__.select().where((AppointmentTable.start_time >= day_start) & (AppointmentTable.start_time < day_end) & (AppointmentTable.status == "BOOKED") & (AppointmentTable.provider_phone == provider))  # رزرو قطعی همان provider (بازدید/اجرا)
     rows_app = await database.fetch_all(sel_app)  # اجرا
     busy: set[str] = set()  # مجموعه busy
     for r in rows_sched:  # حلقه اسلات‌ها
@@ -655,7 +668,8 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
     if accepted:  # وجود اسلات
         await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(status="WAITING", driver_phone=provider, scheduled_start=None))  # وضعیت WAITING
         try:  # try
-            await notify_user(req["user_phone"], "زمان‌بندی", "لطفاً یکی از زمان‌های پیشنهادی را انتخاب کنید.", data={"order_id": order_id, "slots": accepted})  # اعلان
+            await notify_user(req["user_phone"], "زمان‌بندی بازدید", "لطفاً یکی از زمان‌های پیشنهادی را انتخاب کنید.", data={"type": "visit_slots", "order_id": order_id, "slots": accepted})  # اعلان DB
+            await send_push_to_user(req["user_phone"], "زمان‌بندی بازدید", "لطفاً یکی از زمان‌های پیشنهادی را انتخاب کنید.", data={"type": "visit_slots", "order_id": order_id})  # پوش کاربر
         except Exception:  # خطا
             pass  # نادیده
     return unified_response("ok", "SLOTS_PROPOSED", "slots proposed", {"accepted": accepted})  # پاسخ
@@ -685,7 +699,7 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest):  # تابع=ت�
     await database.execute(AppointmentTable.__table__.insert().values(provider_phone=provider_phone, request_id=order_id, start_time=start, end_time=end, status="BOOKED", created_at=datetime.now(timezone.utc)))  # درج نوبت
     await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(scheduled_start=start, status="ASSIGNED", driver_phone=provider_phone))  # به‌روزرسانی سفارش
     try:  # try
-        await send_push_to_managers("تأیید زمان", "کاربر زمان را تأیید کرد.", {"type": "time_confirm", "order_id": str(order_id)})  # پوش
+        await send_push_to_managers("تأیید زمان بازدید", "کاربر زمان بازدید را تأیید کرد.", {"type": "time_confirm", "order_id": str(order_id)})  # پوش مدیر
     except Exception:  # خطا
         pass  # نادیده
     return unified_response("ok", "SLOT_CONFIRMED", "slot confirmed", {"start": start.isoformat(), "end": end.isoformat()})  # پاسخ
@@ -696,7 +710,7 @@ async def reject_all_and_cancel(order_id: int):  # تابع=رد+کنسل
     upd = RequestTable.__table__.update().where(RequestTable.id == order_id).values(status="CANCELED", scheduled_start=None).returning(RequestTable.id)  # آپدیت سفارش
     await database.fetch_all(upd)  # اجرا
     try:  # try
-        await send_push_to_managers("لغو درخواست", "کاربر سفارش را لغو کرد.", {"type": "order_canceled", "order_id": str(order_id)})  # پوش
+        await send_push_to_managers("لغو درخواست", "کاربر سفارش را لغو کرد.", {"type": "order_canceled", "order_id": str(order_id)})  # پوش مدیر
     except Exception:  # خطا
         pass  # نادیده
     return unified_response("ok", "ORDER_CANCELED", "order canceled after rejecting proposals", {"id": order_id})  # پاسخ
@@ -722,21 +736,27 @@ async def admin_set_price_and_status(order_id: int, body: PriceBody, request: Re
     new_status = "IN_PROGRESS" if body.agree else "CANCELED"  # وضعیت جدید
     values = {"price": body.price, "status": new_status}  # values=مقادیر آپدیت پایه
 
-    # — زمان اجرای کار (اختیاری) —
     exec_iso = (body.exec_time or "").strip()  # exec_iso=رشته ISO
-    if body.agree and exec_iso:  # نیاز به زمان اجرا
+    if body.agree and exec_iso:  # ثبت زمان اجرا
         start = parse_iso(exec_iso)  # start=پارس ISO
         end = start + timedelta(hours=1)  # end=یک ساعت بعد
         provider_phone = (req["driver_phone"] or "").strip()  # provider_phone=شماره سرویس‌گیرنده
-        if not provider_phone:  # نبود شماره سرویس‌گیرنده
+        if not provider_phone:  # نبود provider
             raise HTTPException(status_code=400, detail="driver_phone required for execution")  # خطا
         free = await provider_is_free(provider_phone, start, end)  # free=آزاد بودن بازه
         if not free:  # مشغول
             raise HTTPException(status_code=409, detail="execution slot busy")  # خطا
-        await database.execute(AppointmentTable.__table__.insert().values(provider_phone=provider_phone, request_id=order_id, start_time=start, end_time=end, status="BOOKED", created_at=datetime.now(timezone.utc)))  # درج نوبت اجرا
-        values["execution_start"] = start  # ثبت execution_start در سفارش
+        await database.execute(AppointmentTable.__table__.insert().values(provider_phone=provider_phone, request_id=order_id, start_time=start, end_time=end, status="BOOKED", created_at=datetime.now(timezone.utc)))  # رزرو اجرا
+        values["execution_start"] = start  # ثبت execution_start
         try:  # try
-            await notify_user(req["user_phone"], "زمان اجرای کار", "زمان اجرای کار تعیین شد.", data={"order_id": order_id, "start": start.isoformat()})  # اعلان کاربر
+            await notify_user(req["user_phone"], "تعیین قیمت و زمان اجرا", "قیمت و زمان اجرای کار تعیین شد.", data={"type": "execution_time", "order_id": order_id, "start": start.isoformat(), "price": body.price})  # اعلان DB
+            await send_push_to_user(req["user_phone"], "تعیین قیمت و زمان اجرا", "قیمت و زمان اجرای کار تعیین شد.", data={"type": "execution_time", "order_id": order_id})  # پوش کاربر
+        except Exception:  # خطا
+            pass  # نادیده
+    elif body.agree:  # فقط قیمت بدون زمان اجرا
+        try:  # try
+            await notify_user(req["user_phone"], "تعیین قیمت", "قیمت سرویس تعیین شد.", data={"type": "price_set", "order_id": order_id, "price": body.price})  # اعلان DB
+            await send_push_to_user(req["user_phone"], "تعیین قیمت", "قیمت سرویس تعیین شد.", data={"type": "price_set", "order_id": order_id})  # پوش کاربر
         except Exception:  # خطا
             pass  # نادیده
 
@@ -763,6 +783,11 @@ async def finish_order(order_id: int, request: Request):  # تابع=پایان
         raise HTTPException(status_code=404, detail="order not found")  # خطا
     now_iso = datetime.now(timezone.utc).isoformat()  # زمان ISO
     await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(status="FINISH", finish_datetime=now_iso))  # آپدیت
+    try:  # try
+        await notify_user(req["user_phone"], "اتمام کار", "کار با موفقیت به پایان رسید.", data={"type": "work_finished", "order_id": order_id})  # اعلان DB
+        await send_push_to_user(req["user_phone"], "اتمام کار", "کار با موفقیت به پایان رسید.", data={"type": "work_finished", "order_id": order_id})  # پوش کاربر
+    except Exception:  # خطا
+        pass  # نادیده
     return unified_response("ok", "ORDER_FINISHED", "order finished", {"order_id": order_id, "status": "FINISH"})  # پاسخ
 
 # -------------------- Profile --------------------
@@ -788,7 +813,7 @@ async def get_user_profile(phone: str):  # تابع=خواندن
     address_val = mapping["address"] if "address" in mapping else ""  # آدرس
     return unified_response("ok", "PROFILE_FETCHED", "profile data", {"phone": db_user["phone"], "name": name_val or "", "address": address_val or ""})  # پاسخ
 
-@app.get("/debug/users")  # مسیر=دیباگ کاربران (باقی گذاشته شده برای سازگاری)
+@app.get("/debug/users")  # مسیر=دیباگ کاربران
 async def debug_users():  # تابع=لیست کاربران
     rows = await database.fetch_all(UserTable.__table__.select())  # انتخاب همه
     out = []  # خروجی
