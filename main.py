@@ -333,7 +333,7 @@ async def get_user_tokens(phone: str) -> List[str]:  # تابع=توکن‌ها�
             tokens.append(t)  # افزودن
     return tokens  # بازگشت
 
-async def send_push_to_tokens(tokens: List[str], title: str, body: str, data: Optional[dict] = None):  # تابع=ارسال پوش
+async def send_push_to_tokens(tokens: List[str], title: str, body: str, data: Optional[dict] = None, channel_id: str = "order_status_channel"):  # تابع=ارسال پوش (به‌همراه channel_id)
     if not FCM_SERVER_KEY or not tokens:  # عدم کلید یا لیست خالی
         return  # خروج
     url = "https://fcm.googleapis.com/fcm/send"  # آدرس legacy
@@ -341,10 +341,10 @@ async def send_push_to_tokens(tokens: List[str], title: str, body: str, data: Op
     async with httpx.AsyncClient(timeout=10.0) as client:  # کلاینت
         for t in tokens:  # حلقه
             payload = {  # بدنه
-                "to": t,
-                "priority": "high",
-                "notification": {"title": title, "body": body, "android_channel_id": "putz_manager_general"},
-                "data": data or {}
+                "to": t,  # to=توکن مقصد
+                "priority": "high",  # priority=اهمیت بالا
+                "notification": {"title": title, "body": body, "android_channel_id": channel_id},  # notification=بخش اعلان (Android channel id سفارشی)
+                "data": data or {}  # data=داده سفارشی
             }  # پایان payload
             try:  # try
                 await client.post(url, headers=headers, json=payload)  # POST
@@ -353,11 +353,11 @@ async def send_push_to_tokens(tokens: List[str], title: str, body: str, data: Op
 
 async def send_push_to_managers(title: str, body: str, data: Optional[dict] = None):  # تابع=ارسال پوش مدیران
     tokens = await get_manager_tokens()  # گرفتن توکن‌ها
-    await send_push_to_tokens(tokens, title, body, data)  # ارسال
+    await send_push_to_tokens(tokens, title, body, data, channel_id="putz_manager_general")  # ارسال با کانال مدیر
 
 async def send_push_to_user(phone: str, title: str, body: str, data: Optional[dict] = None):  # تابع=ارسال پوش کاربر
     tokens = await get_user_tokens(phone)  # گرفتن توکن‌های کاربر
-    await send_push_to_tokens(tokens, title, body, data)  # ارسال
+    await send_push_to_tokens(tokens, title, body, data, channel_id="order_status_channel")  # ارسال با کانال کاربر
 
 # -------------------- App & CORS --------------------
 app = FastAPI()  # نمونه اپ
