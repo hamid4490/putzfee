@@ -1,4 +1,4 @@
-# FILE: server/main.py  # فایل=مسیر سرور FastAPI (تعریف ثابت‌های لاگین + اصلاح کامل لاگین با هدرها)
+# FILE: server/main.py  # فایل=مسیر سرور FastAPI (افزودن verify_token/logout + احراز JWT روی مسیرهای کاربری)  # توضیح=نسخه کامل با اعمال گارد احراز
 
 # -*- coding: utf-8 -*-  # کدینگ فایل=یونیکد
 # FastAPI server (orders + hourly scheduling + DB notifications + Push backend switch FCM/NTFY + AdminKey + execution_time + user push)  # توضیح=سرور با پوش مدیر/کاربر و بک‌اند قابل سوئیچ
@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone  # کلاس‌های زمان
 from typing import Optional, List, Dict  # نوع‌دهی
 
 import bcrypt  # کتابخانه=bcrypt برای هش امن
-import jwt  # کتابخانه=JWT برای توکن دسترسی
+import jwt  # کتابخانه=JWT برای توکن دسترسی (PyJWT)
 from fastapi import FastAPI, HTTPException, Request  # FastAPI=چارچوب | HTTPException=استثناء HTTP | Request=درخواست
 from fastapi.middleware.cors import CORSMiddleware  # CORS=میان‌افزار CORS
 from pydantic import BaseModel  # BaseModel=مدل‌های بدنه JSON
@@ -37,15 +37,15 @@ ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")  # ALLOW_ORIGINS=مبداه�
 FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "")  # FCM_SERVER_KEY=کلید سرور FCM (وقتی PUSH_BACKEND=fcm)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")  # ADMIN_KEY=کلید ادمین برای مسیرهای مدیریتی
 
-# —— ثابت‌های محدودیت لاگین (افزوده‌شده) ——
-LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))  # LOGIN_WINDOW_SECONDS=طول پنجره شمارش تلاش‌ها (ثانیه) پیش‌فرض=۶۰۰ (۱۰ دقیقه)
-LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))  # LOGIN_MAX_ATTEMPTS=حداکثر تعداد تلاش مجاز در پنجره پیش‌فرض=۵
-LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))  # LOGIN_LOCK_SECONDS=مدت قفل پس از اتمام تلاش‌ها پیش‌فرض=۱۸۰۰ (۳۰ دقیقه)
+# —— ثابت‌های محدودیت لاگین ——
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))  # LOGIN_WINDOW_SECONDS=طول پنجره شمارش تلاش‌ها (ثانیه)
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))  # LOGIN_MAX_ATTEMPTS=حداکثر تعداد تلاش مجاز
+LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))  # LOGIN_LOCK_SECONDS=مدت قفل پس از اتمام تلاش‌ها (ثانیه)
 
-# —— بک‌اند پوش قابل سوئیچ (بدون وابستگی به گوگل) ——
+# —— بک‌اند پوش قابل سوئیچ ——
 PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()  # PUSH_BACKEND=انتخاب بک‌اند («fcm» یا «ntfy»)
-NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()  # NTFY_BASE_URL=آدرس پایه ntfy (پیش‌فرض ntfy.sh)
-NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()  # NTFY_AUTH=هدر Authorization برای ntfy (اختیاری: Bearer/Basic ...)
+NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()  # NTFY_BASE_URL=آدرس پایه ntfy
+NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()  # NTFY_AUTH=هدر Authorization برای ntfy (اختیاری)
 
 database = Database(DATABASE_URL)  # database=نمونه اتصال Async به DB
 Base = declarative_base()  # Base=کلاس پایه ORM
@@ -232,6 +232,9 @@ class PushRegister(BaseModel):  # مدل=ثبت پوش
     platform: str = "android"  # platform
     user_phone: Optional[str] = None  # user_phone
 
+class LogoutRequest(BaseModel):  # مدل=بدنه خروج کاربر
+    refresh_token: str  # refresh_token=رفرش‌توکن خام
+
 # -------------------- Security helpers --------------------
 def bcrypt_hash_password(password: str) -> str:  # تابع=هش bcrypt
     salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)  # salt=نمک با تعداد دور تنظیم‌شده
@@ -263,7 +266,30 @@ def hash_refresh_token(token: str) -> str:  # تابع=هش رفرش‌توکن
 def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):  # تابع=قالب پاسخ واحد
     return {"status": status, "code": code, "message": message, "data": data or {}}  # return=دیکشنری استاندارد
 
-# -------------------- Admin helper --------------------
+def extract_bearer_token(request: Request) -> Optional[str]:  # تابع=استخراج Bearer Token از هدر
+    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""  # auth=مقدار هدر Authorization
+    if not auth.lower().startswith("bearer "):  # if=عدم شروع با Bearer
+        return None  # return=None
+    return auth.split(" ", 1)[1].strip()  # return=توکن بدون prefex
+
+def decode_access_token(token: str) -> Optional[dict]:  # تابع=decode توکن دسترسی با بررسی type=access
+    try:  # try=محافظ
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])  # payload=دیکود با کلید و الگوریتم
+        if payload.get("type") != "access":  # if=نوع غیر از access
+            return None  # return=None
+        return payload  # return=payload معتبر
+    except Exception:  # خطا=توکن نامعتبر/منقضی
+        return None  # return=None
+
+def get_auth_phone_or_401(request: Request) -> str:  # تابع=برگرداندن phone از JWT یا 401
+    token = extract_bearer_token(request)  # token=استخراج توکن از هدر
+    if not token:  # if=نبود توکن
+        raise HTTPException(status_code=401, detail="missing bearer token")  # raise=401
+    payload = decode_access_token(token)  # payload=دیکود
+    if not payload or not payload.get("sub"):  # if=نامعتبر
+        raise HTTPException(status_code=401, detail="invalid token")  # raise=401
+    return str(payload["sub"])  # return=شماره داخل sub
+
 def require_admin(request: Request):  # تابع=بررسی هدر ادمین
     key = request.headers.get("x-admin-key", "")  # key=خواندن هدر X-Admin-Key
     if not key or key != ADMIN_KEY:  # if=نبود/عدم انطباق
@@ -419,6 +445,26 @@ async def shutdown():  # تابع=خاموشی
 def read_root():  # تابع=سلامتی
     return {"message": "Putzfee FastAPI Server is running!"}  # پاسخ=پیام ساده سلامتی
 
+# -------------------- Auth helpers endpoints --------------------
+@app.get("/verify_token")  # مسیر=اعتبارسنجی سریع توکن دسترسی
+def verify_token(request: Request):  # تابع=بررسی Bearer و پاسخ بولین
+    token = extract_bearer_token(request)  # token=گرفتن توکن از هدر
+    if not token:  # if=نبود توکن
+        return {"status": "ok", "valid": False}  # پاسخ=نامعتبر
+    payload = decode_access_token(token)  # payload=دیکود
+    return {"status": "ok", "valid": bool(payload and payload.get("sub"))}  # پاسخ=True/False
+
+@app.post("/logout")  # مسیر=خروج و ابطال رفرش‌توکن
+async def logout_user(body: LogoutRequest):  # تابع=لوگ‌اوت
+    if not body.refresh_token:  # if=بدون بدنه
+        raise HTTPException(status_code=400, detail="refresh_token required")  # 400
+    token_hash = hash_refresh_token(body.refresh_token)  # token_hash=هش رفرش
+    upd = RefreshTokenTable.__table__.update().where(  # upd=آپدیت سطر
+        RefreshTokenTable.token_hash == token_hash
+    ).values(revoked=True)  # values=revoked=True
+    await database.execute(upd)  # اجرا=آپدیت
+    return unified_response("ok", "LOGOUT", "refresh token revoked", {})  # پاسخ=ok
+
 # -------------------- Push endpoints --------------------
 @app.post("/push/register")  # مسیر=ثبت/به‌روزرسانی توکن/تاپیک پوش
 async def register_push_token(body: PushRegister, request: Request):  # تابع=ثبت توکن
@@ -468,7 +514,6 @@ async def login_user(user: UserLoginRequest, request: Request):  # تابع=ور
 
     if attempt_row and attempt_row["locked_until"] and attempt_row["locked_until"] > now:  # شرط=قفل فعال
         retry_after = int((attempt_row["locked_until"] - now).total_seconds())  # retry_after=ثانیه تا بازشدن
-        # 429 با بدنه و هدر Retry-After
         raise HTTPException(status_code=429, detail={"code": "RATE_LIMITED", "lock_remaining": retry_after}, headers={"Retry-After": str(retry_after)})  # raise=429 قفل موقت
 
     sel_user = UserTable.__table__.select().where(UserTable.phone == user.phone)  # sel_user=یافتن کاربر
@@ -480,7 +525,6 @@ async def login_user(user: UserLoginRequest, request: Request):  # تابع=ور
 
     if not verify_password_secure(user.password, db_user["password_hash"]):  # رمز اشتباه
         await _register_login_failure(user.phone, client_ip)  # ثبت شکست
-        # خواندن دوباره تلاش‌ها بعد از ثبت شکست برای محاسبه remaining
         updated = await database.fetch_one(sel_attempt)  # updated=رکورد به‌روز
         attempts = int(updated["attempt_count"]) if updated and updated["attempt_count"] is not None else 1  # attempts=تعداد فعلی
         remaining = max(0, LOGIN_MAX_ATTEMPTS - attempts)  # remaining=باقی‌مانده
@@ -551,7 +595,10 @@ async def refresh_access_token(req: Dict):  # تابع=رفرش
 
 # -------------------- Notifications --------------------
 @app.get("/user/{phone}/notifications")  # مسیر=فهرست اعلان‌ها
-async def get_notifications(phone: str, only_unread: bool = True, limit: int = 50, offset: int = 0):  # تابع=گرفتن اعلان‌ها
+async def get_notifications(phone: str, request: Request, only_unread: bool = True, limit: int = 50, offset: int = 0):  # تابع=گرفتن اعلان‌ها
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     base_sel = NotificationTable.__table__.select().where(NotificationTable.user_phone == phone)  # base_sel=انتخاب بر اساس شماره
     if only_unread:  # فقط نخوانده‌ها
         base_sel = base_sel.where(NotificationTable.read == False)  # شرط read=False
@@ -561,14 +608,20 @@ async def get_notifications(phone: str, only_unread: bool = True, limit: int = 5
     return unified_response("ok", "NOTIFICATIONS", "user notifications", {"items": items})  # پاسخ=ok
 
 @app.post("/user/{phone}/notifications/{notif_id}/read")  # مسیر=علامت خوانده‌شدن اعلان
-async def mark_notification_read(phone: str, notif_id: int):  # تابع=علامت خوانده
+async def mark_notification_read(phone: str, notif_id: int, request: Request):  # تابع=علامت خوانده
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     now = datetime.now(timezone.utc)  # اکنون
     upd = NotificationTable.__table__.update().where((NotificationTable.id == notif_id) & (NotificationTable.user_phone == phone)).values(read=True, read_at=now)  # upd=به‌روزرسانی
     await database.execute(upd)  # اجرا
     return unified_response("ok", "NOTIF_READ", "notification marked as read", {"id": notif_id})  # پاسخ=ok
 
 @app.post("/user/{phone}/notifications/mark_all_read")  # مسیر=علامت خوانده‌شدن همه
-async def mark_all_notifications_read(phone: str):  # تابع=علامت همه خوانده
+async def mark_all_notifications_read(phone: str, request: Request):  # تابع=علامت همه خوانده
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     now = datetime.now(timezone.utc)  # اکنون
     upd = NotificationTable.__table__.update().where((NotificationTable.user_phone == phone) & (NotificationTable.read == False)).values(read=True, read_at=now)  # upd=به‌روزرسانی
     await database.execute(upd)  # اجرا
@@ -576,7 +629,10 @@ async def mark_all_notifications_read(phone: str):  # تابع=علامت همه
 
 # -------------------- Cars --------------------
 @app.get("/user_cars/{user_phone}")  # مسیر=ماشین‌های کاربر
-async def get_user_cars(user_phone: str):  # تابع=ماشین‌ها
+async def get_user_cars(user_phone: str, request: Request):  # تابع=ماشین‌ها
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != user_phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     query = UserTable.__table__.select().where(UserTable.phone == user_phone)  # query=انتخاب کاربر
     user = await database.fetch_one(query)  # user=نتیجه
     if not user:  # نبود
@@ -585,7 +641,10 @@ async def get_user_cars(user_phone: str):  # تابع=ماشین‌ها
     return unified_response("ok", "USER_CARS", "user cars", {"items": items})  # پاسخ=ok
 
 @app.post("/user_cars")  # مسیر=به‌روزرسانی ماشین‌ها
-async def update_user_cars(data: CarListUpdateRequest):  # تابع=آپدیت ماشین‌ها
+async def update_user_cars(data: CarListUpdateRequest, request: Request):  # تابع=آپدیت ماشین‌ها
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != data.user_phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     sel = UserTable.__table__.select().where(UserTable.phone == data.user_phone)  # sel=یافتن کاربر
     user = await database.fetch_one(sel)  # user=نتیجه
     if not user:  # نبود
@@ -596,7 +655,10 @@ async def update_user_cars(data: CarListUpdateRequest):  # تابع=آپدیت �
 
 # -------------------- Orders --------------------
 @app.post("/order")  # مسیر=ثبت سفارش
-async def create_order(order: OrderRequest):  # تابع=ایجاد سفارش
+async def create_order(order: OrderRequest, request: Request):  # تابع=ایجاد سفارش
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != order.user_phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     ins = RequestTable.__table__.insert().values(  # ins=ساخت INSERT
         user_phone=order.user_phone,
         latitude=order.location.latitude,
@@ -620,7 +682,10 @@ async def create_order(order: OrderRequest):  # تابع=ایجاد سفارش
     return unified_response("ok", "REQUEST_CREATED", "request created", {"id": new_id})  # پاسخ=ok
 
 @app.post("/cancel_order")  # مسیر=لغو سفارش
-async def cancel_order(cancel: CancelRequest):  # تابع=لغو
+async def cancel_order(cancel: CancelRequest, request: Request):  # تابع=لغو
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != cancel.user_phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     upd = (RequestTable.__table__.update().where(
         (RequestTable.user_phone == cancel.user_phone) &
         (RequestTable.service_type == cancel.service_type) &
@@ -643,14 +708,20 @@ async def cancel_order(cancel: CancelRequest):  # تابع=لغو
     raise HTTPException(status_code=404, detail="active order not found")  # raise=404 اگر سفارش فعالی نبود
 
 @app.get("/user_active_services/{user_phone}")  # مسیر=سرویس‌های فعال کاربر
-async def get_user_active_services(user_phone: str):  # تابع=سفارش‌های فعال
+async def get_user_active_services(user_phone: str, request: Request):  # تابع=سفارش‌های فعال
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != user_phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     sel = RequestTable.__table__.select().where((RequestTable.user_phone == user_phone) & (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"])))  # sel=انتخاب فعال‌ها
     result = await database.fetch_all(sel)  # result=لیست ردیف‌ها
     items = [dict(r) for r in result]  # items=تبدیل به dict
     return unified_response("ok", "USER_ACTIVE_SERVICES", "active services", {"items": items})  # پاسخ=ok
 
 @app.get("/user_orders/{user_phone}")  # مسیر=تاریخچه کاربر
-async def get_user_orders(user_phone: str):  # تابع=سفارش‌های کاربر
+async def get_user_orders(user_phone: str, request: Request):  # تابع=سفارش‌های کاربر
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != user_phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     sel = RequestTable.__table__.select().where(RequestTable.user_phone == user_phone)  # sel=انتخاب همه سفارش‌های کاربر
     result = await database.fetch_all(sel)  # result=لیست
     items = [dict(r) for r in result]  # items=تبدیل به dict
@@ -847,9 +918,12 @@ async def finish_order(order_id: int, request: Request):  # تابع=پایان
 
 # -------------------- Profile --------------------
 @app.post("/user/profile")  # مسیر=ذخیره پروفایل
-async def update_profile(body: UserProfileUpdate):  # تابع=به‌روزرسانی پروفایل
+async def update_profile(body: UserProfileUpdate, request: Request):  # تابع=به‌روزرسانی پروفایل
     if not body.phone.strip():  # شماره خالی
         raise HTTPException(status_code=400, detail="phone_required")  # 400
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != body.phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     sel = UserTable.__table__.select().where(UserTable.phone == body.phone)  # sel=یافتن کاربر
     user = await database.fetch_one(sel)  # user=نتیجه
     if user is None:  # نبود
@@ -858,7 +932,10 @@ async def update_profile(body: UserProfileUpdate):  # تابع=به‌روزرس
     return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": body.phone})  # پاسخ=ok
 
 @app.get("/user/profile/{phone}")  # مسیر=خواندن پروفایل
-async def get_user_profile(phone: str):  # تابع=خواندن پروفایل
+async def get_user_profile(phone: str, request: Request):  # تابع=خواندن پروفایل
+    auth_phone = get_auth_phone_or_401(request)  # auth_phone=شماره از JWT
+    if auth_phone != phone:  # if=عدم انطباق
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
     sel = UserTable.__table__.select().where(UserTable.phone == phone)  # sel=انتخاب کاربر
     db_user = await database.fetch_one(sel)  # db_user=نتیجه
     if db_user is None:  # نبود
