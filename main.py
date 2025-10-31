@@ -1,53 +1,53 @@
-# FILE: server/main.py  # فایل=سرور FastAPI (برداشتن گارد JWT از مسیرهای کاربری برای بازگشت به رفتار قبلی اپ)
+# FILE: server/main.py  # فایل=سرور FastAPI (بازگردانی گارد JWT روی مسیرهای کاربری + تطبیق sub با phone)
 
-# -*- coding: utf-8 -*-
-import os
-import hashlib
-import secrets
-from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict
+# -*- coding: utf-8 -*-  # کدینگ فایل
+import os  # ماژول سیستم
+import hashlib  # ماژول هش
+import secrets  # تولید توکن تصادفی
+from datetime import datetime, timedelta, timezone  # زمان/تاریخ
+from typing import Optional, List, Dict  # تایپ‌ها
 
-import bcrypt
-import jwt
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import bcrypt  # bcrypt برای هش رمز
+import jwt  # PyJWT برای توکن
+from fastapi import FastAPI, HTTPException, Request  # FastAPI و انواع
+from fastapi.middleware.cors import CORSMiddleware  # CORS
+from pydantic import BaseModel  # Pydantic مدل‌ها
 
-from sqlalchemy import (
+from sqlalchemy import (  # SQLAlchemy ORM
     Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Index, select, func, and_, text, UniqueConstraint
 )
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.declarative import declarative_base
-import sqlalchemy
-from databases import Database
-from dotenv import load_dotenv
-import httpx
+from sqlalchemy.dialects.postgresql import JSONB  # JSONB
+from sqlalchemy.ext.declarative import declarative_base  # Base ORM
+import sqlalchemy  # پکیج SQLAlchemy
+from databases import Database  # اتصال async به DB
+from dotenv import load_dotenv  # .env
+import httpx  # httpx async
 
 # -------------------- Config --------------------
-load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")
-PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
-BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
-ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
-FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "")
-ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")
+load_dotenv()  # بارگذاری .env
+DATABASE_URL = os.getenv("DATABASE_URL")  # آدرس دیتابیس
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")  # کلید JWT
+PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")  # pepper رمز
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))  # انقضای access
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))  # انقضای refresh
+BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))  # دور bcrypt
+ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")  # مبداهای CORS
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "")  # کلید FCM
+ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")  # کلید ادمین
 
-LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))
-LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
-LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))  # پنجره تلاش ورود
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))  # حداکثر تلاش
+LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))  # قفل
 
-PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()
-NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()
-NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()
+PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()  # بک‌اند پوش
+NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()  # آدرس ntfy
+NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()  # هدر احراز ntfy
 
-database = Database(DATABASE_URL)
-Base = declarative_base()
+database = Database(DATABASE_URL)  # اتصال async
+Base = declarative_base()  # Base ORM
 
 # -------------------- ORM models --------------------
-class UserTable(Base):
+class UserTable(Base):  # جدول کاربران
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String, unique=True, index=True)
@@ -56,7 +56,7 @@ class UserTable(Base):
     name = Column(String, default="")
     car_list = Column(JSONB, default=list)
 
-class DriverTable(Base):
+class DriverTable(Base):  # جدول سرویس‌گیرنده‌ها
     __tablename__ = "drivers"
     id = Column(Integer, primary_key=True, index=True)
     first_name = Column(String)
@@ -68,7 +68,7 @@ class DriverTable(Base):
     is_online = Column(Boolean, default=False)
     status = Column(String, default="فعال")
 
-class RequestTable(Base):
+class RequestTable(Base):  # جدول سفارش‌ها
     __tablename__ = "requests"
     id = Column(Integer, primary_key=True, index=True)
     user_phone = Column(String, index=True)
@@ -89,7 +89,7 @@ class RequestTable(Base):
     service_place = Column(String, default="client")
     execution_start = Column(DateTime(timezone=True), nullable=True)
 
-class RefreshTokenTable(Base):
+class RefreshTokenTable(Base):  # جدول رفرش‌توکن‌ها
     __tablename__ = "refresh_tokens"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True)
@@ -99,7 +99,7 @@ class RefreshTokenTable(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     __table_args__ = (Index("ix_refresh_token_user_id_expires", "user_id", "expires_at"),)
 
-class LoginAttemptTable(Base):
+class LoginAttemptTable(Base):  # جدول تلاش‌های ورود
     __tablename__ = "login_attempts"
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String, index=True)
@@ -111,7 +111,7 @@ class LoginAttemptTable(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     __table_args__ = (Index("ix_login_attempt_phone_ip", "phone", "ip"),)
 
-class ScheduleSlotTable(Base):
+class ScheduleSlotTable(Base):  # جدول اسلات‌های پیشنهادی
     __tablename__ = "schedule_slots"
     id = Column(Integer, primary_key=True, index=True)
     request_id = Column(Integer, ForeignKey("requests.id"), index=True)
@@ -121,7 +121,7 @@ class ScheduleSlotTable(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     __table_args__ = (Index("ix_schedule_slots_req_status", "request_id", "status"),)
 
-class AppointmentTable(Base):
+class AppointmentTable(Base):  # جدول نوبت‌های قطعی
     __tablename__ = "appointments"
     id = Column(Integer, primary_key=True, index=True)
     provider_phone = Column(String, index=True)
@@ -135,7 +135,7 @@ class AppointmentTable(Base):
         Index("ix_provider_time", "provider_phone", "start_time", "end_time"),
     )
 
-class NotificationTable(Base):
+class NotificationTable(Base):  # جدول اعلان‌ها
     __tablename__ = "notifications"
     id = Column(Integer, primary_key=True, index=True)
     user_phone = Column(String, index=True)
@@ -147,7 +147,7 @@ class NotificationTable(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     __table_args__ = (Index("ix_notifs_user_read_created", "user_phone", "read", "created_at"),)
 
-class DeviceTokenTable(Base):
+class DeviceTokenTable(Base):  # جدول توکن‌های پوش
     __tablename__ = "device_tokens"
     id = Column(Integer, primary_key=True, index=True)
     token = Column(String, unique=True, index=True)
@@ -159,16 +159,16 @@ class DeviceTokenTable(Base):
     __table_args__ = (Index("ix_tokens_role_platform", "role", "platform"),)
 
 # -------------------- Pydantic models --------------------
-class CarInfo(BaseModel):
+class CarInfo(BaseModel):  # مدل ماشین
     brand: str
     model: str
     plate: str
 
-class Location(BaseModel):
+class Location(BaseModel):  # مدل مختصات
     latitude: float
     longitude: float
 
-class CarOrderItem(BaseModel):
+class CarOrderItem(BaseModel):  # مدل آیتم سفارش
     brand: str
     model: str
     plate: str
@@ -176,7 +176,7 @@ class CarOrderItem(BaseModel):
     wash_inside: bool = False
     polish: bool = False
 
-class OrderRequest(BaseModel):
+class OrderRequest(BaseModel):  # بدنه ثبت سفارش
     user_phone: str
     location: Location
     car_list: List[CarOrderItem]
@@ -188,56 +188,56 @@ class OrderRequest(BaseModel):
     payment_type: str
     service_place: str
 
-class CarListUpdateRequest(BaseModel):
+class CarListUpdateRequest(BaseModel):  # بدنه آپدیت ماشین‌ها
     user_phone: str
     car_list: List[CarInfo]
 
-class CancelRequest(BaseModel):
+class CancelRequest(BaseModel):  # بدنه لغو سفارش
     user_phone: str
     service_type: str
 
-class UserRegisterRequest(BaseModel):
+class UserRegisterRequest(BaseModel):  # ثبت‌نام
     phone: str
     password: str
     address: Optional[str] = None
 
-class UserLoginRequest(BaseModel):
+class UserLoginRequest(BaseModel):  # ورود
     phone: str
     password: str
 
-class UserProfileUpdate(BaseModel):
+class UserProfileUpdate(BaseModel):  # آپدیت پروفایل
     phone: str
     name: str = ""
     address: str = ""
 
-class ProposedSlotsRequest(BaseModel):
+class ProposedSlotsRequest(BaseModel):  # پیشنهاد اسلات‌ها
     provider_phone: str
     slots: List[str]
 
-class ConfirmSlotRequest(BaseModel):
+class ConfirmSlotRequest(BaseModel):  # تأیید اسلات
     slot: str
 
-class PriceBody(BaseModel):
+class PriceBody(BaseModel):  # تعیین قیمت مدیر
     price: int
     agree: bool
     exec_time: Optional[str] = None
 
-class PushRegister(BaseModel):
+class PushRegister(BaseModel):  # ثبت پوش
     role: str
     token: str
     platform: str = "android"
     user_phone: Optional[str] = None
 
-class LogoutRequest(BaseModel):
+class LogoutRequest(BaseModel):  # بدنه خروج
     refresh_token: str
 
 # -------------------- Security helpers --------------------
-def bcrypt_hash_password(password: str) -> str:
+def bcrypt_hash_password(password: str) -> str:  # هش رمز
     salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
     mixed = (password + PASSWORD_PEPPER).encode("utf-8")
     return bcrypt.hashpw(mixed, salt).decode("utf-8")
 
-def verify_password_secure(password: str, stored_hash: str) -> bool:
+def verify_password_secure(password: str, stored_hash: str) -> bool:  # صحت رمز
     try:
         if stored_hash.startswith("$2"):
             mixed = (password + PASSWORD_PEPPER).encode("utf-8")
@@ -247,28 +247,28 @@ def verify_password_secure(password: str, stored_hash: str) -> bool:
     except Exception:
         return False
 
-def create_access_token(phone: str) -> str:
+def create_access_token(phone: str) -> str:  # ساخت access
     now = datetime.now(timezone.utc)
     exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {"sub": phone, "type": "access", "exp": exp}
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def create_refresh_token() -> str:
+def create_refresh_token() -> str:  # ساخت refresh
     return secrets.token_urlsafe(48)
 
-def hash_refresh_token(token: str) -> str:
+def hash_refresh_token(token: str) -> str:  # هش refresh
     return hashlib.sha256((token + PASSWORD_PEPPER).encode("utf-8")).hexdigest()
 
-def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):
+def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):  # پاسخ واحد
     return {"status": status, "code": code, "message": message, "data": data or {}}
 
-def extract_bearer_token(request: Request) -> Optional[str]:
+def extract_bearer_token(request: Request) -> Optional[str]:  # استخراج Bearer
     auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
     if not auth.lower().startswith("bearer "):
         return None
     return auth.split(" ", 1)[1].strip()
 
-def decode_access_token(token: str) -> Optional[dict]:
+def decode_access_token(token: str) -> Optional[dict]:  # دیکود access
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         if payload.get("type") != "access":
@@ -277,7 +277,7 @@ def decode_access_token(token: str) -> Optional[dict]:
     except Exception:
         return None
 
-def get_auth_phone_or_401(request: Request) -> str:
+def get_auth_phone_or_401(request: Request) -> str:  # استخراج phone از JWT یا 401
     token = extract_bearer_token(request)
     if not token:
         raise HTTPException(status_code=401, detail="missing bearer token")
@@ -286,19 +286,19 @@ def get_auth_phone_or_401(request: Request) -> str:
         raise HTTPException(status_code=401, detail="invalid token")
     return str(payload["sub"])
 
-def require_admin(request: Request):
+def require_admin(request: Request):  # بررسی کلید ادمین
     key = request.headers.get("x-admin-key", "")
     if not key or key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="admin auth required")
 
 # -------------------- Utils --------------------
-def get_client_ip(request: Request) -> str:
+def get_client_ip(request: Request) -> str:  # IP کلاینت
     xff = request.headers.get("x-forwarded-for", "")
     if xff:
         return xff.split(",")[0].strip()
     return request.client.host or "unknown"
 
-def parse_iso(ts: str) -> datetime:
+def parse_iso(ts: str) -> datetime:  # پارس ISO ساده به UTC
     try:
         raw = ts.strip()
         if "T" not in raw:
@@ -319,7 +319,7 @@ def parse_iso(ts: str) -> datetime:
     except Exception:
         raise HTTPException(status_code=400, detail=f"invalid datetime: {ts}")
 
-async def provider_is_free(provider_phone: str, start: datetime, end: datetime) -> bool:
+async def provider_is_free(provider_phone: str, start: datetime, end: datetime) -> bool:  # بازه آزاد
     q = AppointmentTable.__table__.select().where(
         (AppointmentTable.provider_phone == provider_phone) &
         (AppointmentTable.status == "BOOKED") &
@@ -329,7 +329,7 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime) 
     rows = await database.fetch_all(q)
     return len(rows) == 0
 
-async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None):
+async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None):  # ثبت اعلان DB
     ins = NotificationTable.__table__.insert().values(
         user_phone=phone, title=title, body=body, data=(data or {}), read=False, created_at=datetime.now(timezone.utc)
     )
@@ -411,7 +411,7 @@ async def send_push_to_user(phone: str, title: str, body: str, data: Optional[di
     await send_push_to_tokens(tokens, title, body, data, channel_id="order_status_channel")
 
 # -------------------- App & CORS --------------------
-app = FastAPI()
+app = FastAPI()  # اپ FastAPI
 allow_origins = ["*"] if ALLOW_ORIGINS_ENV.strip() == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -589,7 +589,7 @@ async def refresh_access_token(req: Dict):
     new_access = create_access_token(db_user["phone"])
     return unified_response("ok", "TOKEN_REFRESHED", "new access token", {"access_token": new_access})
 
-# -------------------- Notifications --------------------
+# -------------------- Notifications (محافظت‌شده با JWT) --------------------
 @app.get("/user/{phone}/notifications")
 async def get_notifications(phone: str, request: Request, only_unread: bool = True, limit: int = 50, offset: int = 0):
     auth_phone = get_auth_phone_or_401(request)
@@ -615,9 +615,12 @@ async def mark_notification_read(phone: str, notif_id: int, request: Request):
     await database.execute(upd)
     return unified_response("ok", "NOTIF_READ", "notification marked as read", {"id": notif_id})
 
-# -------------------- Cars (بدون گارد JWT) --------------------
+# -------------------- Cars (محافظت‌شده با JWT) --------------------
 @app.get("/user_cars/{user_phone}")
-async def get_user_cars(user_phone: str):
+async def get_user_cars(user_phone: str, request: Request):
+    auth_phone = get_auth_phone_or_401(request)
+    if auth_phone != user_phone:
+        raise HTTPException(status_code=403, detail="forbidden")
     query = UserTable.__table__.select().where(UserTable.phone == user_phone)
     user = await database.fetch_one(query)
     if not user:
@@ -626,7 +629,10 @@ async def get_user_cars(user_phone: str):
     return unified_response("ok", "USER_CARS", "user cars", {"items": items})
 
 @app.post("/user_cars")
-async def update_user_cars(data: CarListUpdateRequest):
+async def update_user_cars(data: CarListUpdateRequest, request: Request):
+    auth_phone = get_auth_phone_or_401(request)
+    if auth_phone != data.user_phone:
+        raise HTTPException(status_code=403, detail="forbidden")
     sel = UserTable.__table__.select().where(UserTable.phone == data.user_phone)
     user = await database.fetch_one(sel)
     if not user:
@@ -637,9 +643,12 @@ async def update_user_cars(data: CarListUpdateRequest):
     await database.execute(upd)
     return unified_response("ok", "CARS_SAVED", "cars saved", {"count": len(data.car_list)})
 
-# -------------------- Orders (بدون گارد JWT برای بازگشت به حالت قبلی) --------------------
+# -------------------- Orders (محافظت‌شده با JWT) --------------------
 @app.get("/user_active_services/{user_phone}")
-async def get_user_active_services(user_phone: str):
+async def get_user_active_services(user_phone: str, request: Request):
+    auth_phone = get_auth_phone_or_401(request)
+    if auth_phone != user_phone:
+        raise HTTPException(status_code=403, detail="forbidden")
     sel = RequestTable.__table__.select().where(
         (RequestTable.user_phone == user_phone) & (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]))
     )
@@ -648,13 +657,16 @@ async def get_user_active_services(user_phone: str):
     return unified_response("ok", "USER_ACTIVE_SERVICES", "active services", {"items": items})
 
 @app.get("/user_orders/{user_phone}")
-async def get_user_orders(user_phone: str):
+async def get_user_orders(user_phone: str, request: Request):
+    auth_phone = get_auth_phone_or_401(request)
+    if auth_phone != user_phone:
+        raise HTTPException(status_code=403, detail="forbidden")
     sel = RequestTable.__table__.select().where(RequestTable.user_phone == user_phone)
     result = await database.fetch_all(sel)
     items = [dict(r) for r in result]
     return unified_response("ok", "USER_ORDERS", "orders list", {"items": items})
 
-# -------------------- Scheduling (همان قبلی) --------------------
+# -------------------- Scheduling (بدون تغییر) --------------------
 @app.get("/provider/{provider_phone}/free_hours")
 async def get_free_hours(provider_phone: str, date: str, work_start: int = 8, work_end: int = 20, limit: int = 24):
     try:
@@ -712,7 +724,7 @@ async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optio
     items = sorted(busy)
     return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": items})
 
-# -------------------- Admin/Workflow --------------------
+# -------------------- Admin/Workflow (بدون تغییر) --------------------
 @app.get("/admin/requests/active")
 async def admin_active_requests(request: Request):
     require_admin(request)
@@ -806,11 +818,14 @@ async def reject_all_and_cancel(order_id: int):
         pass
     return unified_response("ok", "ORDER_CANCELED", "order canceled after rejecting proposals", {"id": order_id})
 
-# -------------------- Profile (بدون گارد JWT) --------------------
+# -------------------- Profile (محافظت‌شده با JWT) --------------------
 @app.post("/user/profile")
-async def update_profile(body: UserProfileUpdate):
+async def update_profile(body: UserProfileUpdate, request: Request):
     if not body.phone.strip():
         raise HTTPException(status_code=400, detail="phone_required")
+    auth_phone = get_auth_phone_or_401(request)
+    if auth_phone != body.phone:
+        raise HTTPException(status_code=403, detail="forbidden")
     sel = UserTable.__table__.select().where(UserTable.phone == body.phone)
     user = await database.fetch_one(sel)
     if user is None:
@@ -819,7 +834,10 @@ async def update_profile(body: UserProfileUpdate):
     return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": body.phone})
 
 @app.get("/user/profile/{phone}")
-async def get_user_profile(phone: str):
+async def get_user_profile(phone: str, request: Request):
+    auth_phone = get_auth_phone_or_401(request)
+    if auth_phone != phone:
+        raise HTTPException(status_code=403, detail="forbidden")
     sel = UserTable.__table__.select().where(UserTable.phone == phone)
     db_user = await database.fetch_one(sel)
     if db_user is None:
