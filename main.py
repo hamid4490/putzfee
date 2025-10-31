@@ -1,50 +1,50 @@
-# FILE: server/main.py  # فایل=سرور FastAPI (گارد JWT روی مسیرهای slots + verify_token/logout + گارد روی سایر مسیرها)
+# FILE: server/main.py  # فایل=سرور FastAPI (افزودن نوتیف order_approved در تأیید مدیر + نگهداری همه تغییرات قبلی)
 
-# -*- coding: utf-8 -*-
-import os
-import hashlib
-import secrets
-from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict
+# -*- coding: utf-8 -*-  # کدینگ فایل=یونیکد
+import os  # import=سیستم
+import hashlib  # import=هش
+import secrets  # import=توکن تصادفی
+from datetime import datetime, timedelta, timezone  # import=زمان/تاریخ
+from typing import Optional, List, Dict  # import=نوع‌دهی
 
-import bcrypt
-import jwt
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import bcrypt  # import=bcrypt
+import jwt  # import=PyJWT
+from fastapi import FastAPI, HTTPException, Request  # import=FastAPI
+from fastapi.middleware.cors import CORSMiddleware  # import=CORS
+from pydantic import BaseModel  # import=BaseModel
 
-from sqlalchemy import (
+from sqlalchemy import (  # import=SQLAlchemy
     Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Index, select, func, and_, text, UniqueConstraint
 )
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.declarative import declarative_base
-import sqlalchemy
-from databases import Database
-from dotenv import load_dotenv
-import httpx
+from sqlalchemy.dialects.postgresql import JSONB  # import=JSONB
+from sqlalchemy.ext.declarative import declarative_base  # import=Base
+import sqlalchemy  # import=sqlalchemy
+from databases import Database  # import=databases (async)
+from dotenv import load_dotenv  # import=env loader
+import httpx  # import=httpx async
 
 # -------------------- Config --------------------
-load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")
-PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
-BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
-ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
-FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "")
-ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")
+load_dotenv()  # بارگذاری .env
+DATABASE_URL = os.getenv("DATABASE_URL")  # آدرس دیتابیس
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")  # کلید JWT
+PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")  # pepper
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))  # انقضای access
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))  # انقضای refresh
+BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))  # دور bcrypt
+ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")  # مبداهای CORS
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "")  # کلید FCM
+ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")  # کلید ادمین
 
-LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))
-LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
-LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))  # پنجره شمارش
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))  # حداکثر تلاش
+LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))  # طول قفل
 
-PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()
-NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()
-NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()
+PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()  # بک‌اند پوش
+NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()  # آدرس ntfy
+NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()  # هدر احراز ntfy
 
-database = Database(DATABASE_URL)
-Base = declarative_base()
+database = Database(DATABASE_URL)  # اتصال async
+Base = declarative_base()  # Base ORM
 
 # -------------------- ORM models --------------------
 class UserTable(Base):
@@ -731,7 +731,7 @@ async def get_user_orders(user_phone: str, request: Request):
     items = [dict(r) for r in result]
     return unified_response("ok", "USER_ORDERS", "orders list", {"items": items})
 
-# -------------------- Scheduling (1 hour slots) --------------------
+# -------------------- Scheduling --------------------
 @app.get("/provider/{provider_phone}/free_hours")
 async def get_free_hours(provider_phone: str, date: str, work_start: int = 8, work_end: int = 20, limit: int = 24):
     try:
@@ -789,7 +789,7 @@ async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optio
     items = sorted(busy)
     return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": items})
 
-# گارد مالکیت برای order_id
+# Helper: اطمینان از مالکیت سفارش
 async def _ensure_order_ownership_or_404(order_id: int, auth_phone: str) -> Dict:
     req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == order_id))
     if not req:
@@ -821,6 +821,10 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
             status="WAITING", driver_phone=provider, scheduled_start=None
         ))
         try:
+            # 1) نوتیف «تأیید درخواست»
+            await notify_user(req["user_phone"], "تأیید درخواست", "درخواست شما تایید شد.", data={"type": "order_approved", "order_id": order_id})
+            await send_push_to_user(req["user_phone"], "تأیید درخواست", "درخواست شما تایید شد.", data={"type": "order_approved", "order_id": order_id})
+            # 2) نوتیف «زمان‌بندی بازدید»
             await notify_user(req["user_phone"], "زمان‌بندی بازدید", "لطفاً یکی از زمان‌های پیشنهادی را انتخاب کنید.", data={"type": "visit_slots", "order_id": order_id, "slots": accepted})
             await send_push_to_user(req["user_phone"], "زمان‌بندی بازدید", "لطفاً یکی از زمان‌های پیشنهادی را انتخاب کنید.", data={"type": "visit_slots", "order_id": order_id})
         except Exception:
