@@ -1,56 +1,69 @@
-# FILE: server/main.py  # FastAPI server with JWT + backward-compat auth for existing client
+# FILE: server/main.py  # FastAPI server with JWT + FCM HTTP v1 push
 
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-  # کدینگ فایل
 
-import os
-import hashlib
-import secrets
-from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict
+import os  # import=خواندن متغیرهای محیطی
+import hashlib  # import=هش برای refresh token
+import secrets  # import=تولید توکن امن
+from datetime import datetime, timedelta, timezone  # import=تاریخ/زمان
+from typing import Optional, List, Dict  # import=تایپ‌ها
 
-import bcrypt
-import jwt
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import bcrypt  # import=بکربت برای رمز عبور
+import jwt  # import=PyJWT برای JWT داخلی و امضای سرویس‌اکانت
+from fastapi import FastAPI, HTTPException, Request  # import=فست‌API
+from fastapi.middleware.cors import CORSMiddleware  # import=CORS
+from pydantic import BaseModel  # import=مدل بدنه‌ها
 
-from sqlalchemy import (
+from sqlalchemy import (  # import=ORM SQLAlchemy
     Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Index, select, func, and_, text, UniqueConstraint
 )
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.declarative import declarative_base
-import sqlalchemy
-from databases import Database
-from dotenv import load_dotenv
-import httpx
+from sqlalchemy.dialects.postgresql import JSONB  # import=JSONB برای Postgres
+from sqlalchemy.ext.declarative import declarative_base  # import=Base ORM
+import sqlalchemy  # import=SQLAlchemy (Engine)
+from databases import Database  # import=databases async
+from dotenv import load_dotenv  # import=بارگذاری .env
+import httpx  # import=کلاینت HTTP async
+
+import json  # import=برای JSON سرویس‌اکانت
+import base64  # import=برای decode متن Base64
+import time  # import=برای کش‌کردن توکن OAuth2
 
 # -------------------- Config --------------------
-load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")
-PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
-BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
-ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
-FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "")
-ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")
+load_dotenv()  # بارگذاری متغیرهای .env
+
+DATABASE_URL = os.getenv("DATABASE_URL")  # آدرس دیتابیس
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")  # کلید JWT داخلی
+PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")  # پپر رمز
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))  # عمر access
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))  # عمر refresh
+BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))  # تعداد دور bcrypt
+ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")  # مبداهای مجاز CORS
+
+# Legacy FCM (در صورت نبود v1 استفاده نمی‌کنیم مگر تنظیم باشد)
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "")  # کلید Legacy (قدیمی)
+
+# FCM HTTP v1 (جدید)
+FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()  # Project ID فایربیس
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()  # JSON سرویس‌اکانت
+GOOGLE_APPLICATION_CREDENTIALS_JSON_B64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON_B64", "").strip()  # JSON سرویس‌اکانت Base64 (اختیاری)
+
+ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")  # کلید ادمین
 
 # Backward-compat for existing client (no Authorization header yet)
-AUTH_COMPAT = os.getenv("AUTH_COMPAT", "1").strip()  # "1" enables fallback to provided phone, "0" enforces strict JWT
+AUTH_COMPAT = os.getenv("AUTH_COMPAT", "1").strip()  # سازگاری احراز با phone
 
 # —— Login rate limit ——
-LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))
-LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
-LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))  # پنجره زمانی تلاش‌ها
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))  # حداکثر تلاش
+LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))  # زمان قفل
 
 # —— Pluggable push backend ——
-PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()
-NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()
-NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()
+PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()  # بک‌اند پوش
+NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()  # آدرس ntfy (در صورت نیاز)
+NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()  # احراز ntfy
 
-database = Database(DATABASE_URL)
-Base = declarative_base()
+database = Database(DATABASE_URL)  # اتصال async دیتابیس
+Base = declarative_base()  # پایه ORM
 
 # -------------------- ORM models --------------------
 class UserTable(Base):
@@ -156,8 +169,8 @@ class NotificationTable(Base):
 class DeviceTokenTable(Base):
     __tablename__ = "device_tokens"
     id = Column(Integer, primary_key=True, index=True)
-    token = Column(String, unique=True, index=True)  # FCM token or NTFY topic
-    role = Column(String, index=True)               # client/manager
+    token = Column(String, unique=True, index=True)
+    role = Column(String, index=True)
     platform = Column(String, default="android", index=True)
     user_phone = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -284,13 +297,6 @@ def decode_access_token(token: str) -> Optional[dict]:
         return None
 
 def get_auth_phone(request: Request, fallback_phone: Optional[str] = None, enforce: bool = False) -> str:
-    """
-    Backward-compatible auth:
-    - If Bearer present and valid: return sub (and check match with fallback if provided)
-    - If Bearer missing/invalid:
-        * if AUTH_COMPAT == "1" and fallback_phone exists: allow and return fallback_phone
-        * else: if enforce True -> 401, else return fallback_phone (may be empty)
-    """
     token = extract_bearer_token(request)
     if token:
         payload = decode_access_token(token)
@@ -300,8 +306,6 @@ def get_auth_phone(request: Request, fallback_phone: Optional[str] = None, enfor
         if fallback_phone and sub != fallback_phone:
             raise HTTPException(status_code=403, detail="forbidden")
         return sub
-
-    # No token -> compat path
     if AUTH_COMPAT == "1" and fallback_phone:
         return fallback_phone
     if enforce:
@@ -358,6 +362,78 @@ async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = 
     await database.execute(ins)
 
 # -------------------- Push helpers --------------------
+# کش توکن OAuth2 برای FCM v1
+_FCM_OAUTH_TOKEN = ""  # توکن OAuth2 جاری
+_FCM_OAUTH_EXP = 0.0   # زمان انقضای تقریبی (epoch seconds)
+
+def _load_service_account() -> Optional[dict]:
+    """بارگذاری JSON سرویس‌اکانت از Env (متن یا Base64)."""
+    raw = GOOGLE_APPLICATION_CREDENTIALS_JSON
+    if not raw and GOOGLE_APPLICATION_CREDENTIALS_JSON_B64:
+        try:
+            raw = base64.b64decode(GOOGLE_APPLICATION_CREDENTIALS_JSON_B64).decode("utf-8")
+        except Exception:
+            raw = ""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        # انتظار می‌رود شامل client_email و private_key باشد
+        if "client_email" in data and "private_key" in data:
+            return data
+    except Exception:
+        return None
+    return None
+
+def _get_oauth2_token_for_fcm() -> Optional[str]:
+    """گرفتن توکن OAuth2 برای FCM v1 با امضای سرویس‌اکانت و کش‌کردن تا انقضا."""
+    global _FCM_OAUTH_TOKEN, _FCM_OAUTH_EXP
+    now = time.time()
+    if _FCM_OAUTH_TOKEN and (_FCM_OAUTH_EXP - 60) > now:
+        return _FCM_OAUTH_TOKEN
+    sa = _load_service_account()
+    if not sa:
+        return None
+    client_email = sa.get("client_email", "")
+    private_key = sa.get("private_key", "")
+    if not client_email or not private_key:
+        return None
+    # ساخت assertion JWT برای OAuth2 token endpoint
+    issued = int(now)
+    expires = issued + 3600
+    payload = {
+        "iss": client_email,  # ایمیل سرویس‌اکانت
+        "scope": "https://www.googleapis.com/auth/firebase.messaging",  # اسکوپ FCM
+        "aud": "https://oauth2.googleapis.com/token",  # مخاطب توکن
+        "iat": issued,  # زمان صدور
+        "exp": expires  # زمان انقضا
+    }
+    try:
+        assertion = jwt.encode(payload, private_key, algorithm="RS256")  # امضا با کلید خصوصی RS256
+    except Exception:
+        return None
+    # تبادل assertion با access_token
+    try:
+        resp = httpx.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": assertion
+            },
+            timeout=10.0
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            token = data.get("access_token", "")
+            expires_in = int(data.get("expires_in", 3600))
+            if token:
+                _FCM_OAUTH_TOKEN = token
+                _FCM_OAUTH_EXP = now + expires_in
+                return token
+    except Exception:
+        return None
+    return None
+
 async def get_manager_tokens() -> List[str]:
     sel = DeviceTokenTable.__table__.select().where(
         (DeviceTokenTable.role == "manager") & (DeviceTokenTable.platform == "android")
@@ -382,7 +458,8 @@ async def get_user_tokens(phone: str) -> List[str]:
             seen.add(t); tokens.append(t)
     return tokens
 
-async def _send_fcm(tokens: List[str], title: str, body: str, data: Optional[dict], channel_id: str):
+async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: Optional[dict], channel_id: str):
+    """ارسال با Legacy فقط اگر FCM_SERVER_KEY تنظیم است (حالت پشتیبان)."""
     if not FCM_SERVER_KEY or not tokens:
         return
     url = "https://fcm.googleapis.com/fcm/send"
@@ -397,6 +474,35 @@ async def _send_fcm(tokens: List[str], title: str, body: str, data: Optional[dic
             }
             try:
                 await client.post(url, headers=headers, json=payload)
+            except Exception:
+                pass
+
+async def _send_fcm_v1(tokens: List[str], title: str, body: str, data: Optional[dict], channel_id: str):
+    """ارسال پوش با FCM HTTP v1 (توصیه‌شده)."""
+    if not tokens or not FCM_PROJECT_ID or not _load_service_account():
+        return
+    access_token = _get_oauth2_token_for_fcm()
+    if not access_token:
+        return
+    url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=utf-8"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for t in tokens:
+            message = {
+                "message": {
+                    "token": t,
+                    "notification": {"title": title, "body": body},
+                    "android": {
+                        "priority": "HIGH",
+                        "notification": {
+                            "channel_id": channel_id
+                        }
+                    },
+                    "data": data or {}
+                }
+            }
+            try:
+                await client.post(url, headers=headers, json=message)
             except Exception:
                 pass
 
@@ -416,10 +522,14 @@ async def _send_ntfy(topics: List[str], title: str, body: str, data: Optional[di
                 pass
 
 async def send_push_to_tokens(tokens: List[str], title: str, body: str, data: Optional[dict] = None, channel_id: str = "order_status_channel"):
+    """رابط واحد ارسال پوش: اولویت با FCM v1، در غیراین‌صورت Legacy، وگرنه ntfy اگر انتخاب شده باشد."""
     if PUSH_BACKEND == "ntfy":
-        await _send_ntfy(tokens, title, body, data)
-    else:
-        await _send_fcm(tokens, title, body, data, channel_id)
+        await _send_ntfy(tokens, title, body, data); return
+    # تلاش v1 اگر تنظیمات کامل باشد
+    if FCM_PROJECT_ID and _load_service_account():
+        await _send_fcm_v1(tokens, title, body, data, channel_id); return
+    # پشتیبان: Legacy (اگر کلید قدیمی موجود است)
+    await _send_fcm_legacy(tokens, title, body, data, channel_id)
 
 async def send_push_to_managers(title: str, body: str, data: Optional[dict] = None):
     tokens = await get_manager_tokens()
@@ -804,7 +914,7 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
         await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(status="WAITING", driver_phone=provider, scheduled_start=None))
         try:
             await notify_user(req["user_phone"], "زمان‌بندی بازدید", "لطفاً یکی از زمان‌های پیشنهادی را انتخاب کنید.", data={"type": "visit_slots", "order_id": order_id, "slots": accepted})
-            await send_push_to_user(req["user_phone"], "زمان‌بندی بازدید", "لطفاً یکی از زمان‌های پیشنهادی را انتخاب کنید.", data={"type": "visit_slots", "order_id": order_id})
+            await send_push_to_user(req["user_phone"], "زمان‌بندی بازدید", "لطفاً یکی از زمان‌های پیشنهادی را انتخاب کنید.", data={"type": "visit_slots", "order_id": str(order_id)})
         except Exception:
             pass
     return unified_response("ok", "SLOTS_PROPOSED", "slots proposed", {"accepted": accepted})
@@ -885,13 +995,13 @@ async def admin_set_price_and_status(order_id: int, body: PriceBody, request: Re
         values["execution_start"] = start
         try:
             await notify_user(req["user_phone"], "تعیین قیمت و زمان اجرا", "قیمت و زمان اجرای کار تعیین شد.", data={"type": "execution_time", "order_id": order_id, "start": start.isoformat(), "price": body.price})
-            await send_push_to_user(req["user_phone"], "تعیین قیمت و زمان اجرا", "قیمت و زمان اجرای کار تعیین شد.", data={"type": "execution_time", "order_id": order_id})
+            await send_push_to_user(req["user_phone"], "تعیین قیمت و زمان اجرا", "قیمت و زمان اجرای کار تعیین شد.", data={"type": "execution_time", "order_id": str(order_id)})
         except Exception:
             pass
     elif body.agree:
         try:
             await notify_user(req["user_phone"], "تعیین قیمت", "قیمت سرویس تعیین شد.", data={"type": "price_set", "order_id": order_id, "price": body.price})
-            await send_push_to_user(req["user_phone"], "تعیین قیمت", "قیمت سرویس تعیین شد.", data={"type": "price_set", "order_id": order_id})
+            await send_push_to_user(req["user_phone"], "تعیین قیمت", "قیمت سرویس تعیین شد.", data={"type": "price_set", "order_id": str(order_id)})
         except Exception:
             pass
 
@@ -920,7 +1030,7 @@ async def finish_order(order_id: int, request: Request):
     await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(status="FINISH", finish_datetime=now_iso))
     try:
         await notify_user(req["user_phone"], "اتمام کار", "کار با موفقیت به پایان رسید.", data={"type": "work_finished", "order_id": order_id})
-        await send_push_to_user(req["user_phone"], "اتمام کار", "کار با موفقیت به پایان رسید.", data={"type": "work_finished", "order_id": order_id})
+        await send_push_to_user(req["user_phone"], "اتمام کار", "کار با موفقیت به پایان رسید.", data={"type": "work_finished", "order_id": str(order_id)})
     except Exception:
         pass
     return unified_response("ok", "ORDER_FINISHED", "order finished", {"order_id": order_id, "status": "FINISH"})
