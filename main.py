@@ -257,6 +257,9 @@ class PushRegister(BaseModel):
 class LogoutRequest(BaseModel):
     refresh_token: str
 
+class PushUnregister(BaseModel): 
+    token: str  
+
 # -------------------- Security helpers --------------------
 def bcrypt_hash_password(password: str) -> str:
     salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
@@ -1092,3 +1095,13 @@ async def debug_users():
         address_val = mapping["address"] if "address" in mapping else ""
         out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})
     return out
+
+# --- انتهای بخش Push endpoints: API جدید برای unregister ---
+@app.post("/push/unregister")
+async def unregister_push_token(body: PushUnregister):  # fun=حذف ردیف توکن از جدول
+    delq = DeviceTokenTable.__table__.delete().where(  # delq=دستور حذف از جدول device_tokens
+        DeviceTokenTable.token == body.token  # شرط=توکن دقیقا برابر باشد
+    )
+    await database.execute(delq)  # اجرا=حذف
+    logger.info(f"push/unregister token_tail={body.token[-8:]}")  # log=برای رهگیری
+    return unified_response("ok", "TOKEN_UNREGISTERED", "unregistered", {})  # پاسخ=موفق
