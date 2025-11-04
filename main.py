@@ -1,8 +1,9 @@
-# FILE: server/main.py  # FastAPI server with JWT + FCM HTTP v1 push (fixed private_key newlines + push logging)
+# FILE: server/main.py  # FastAPI server with JWT + FCM HTTP v1 push (project_id from SA + unregister + mark read endpoints kept)  # فایل=سرور کامل (اصلاح اعلان پس از خروج، حذف توکن دستگاه، بهبود FCM v1)
 
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-  # کدگذاری فایل
 
 import os  # خواندن Env
+import re  # Regex برای استخراج errorCode از پاسخ FCM
 import hashlib  # هش refresh token
 import secrets  # تولید توکن امن
 from datetime import datetime, timedelta, timezone  # تاریخ/زمان
@@ -32,57 +33,57 @@ import logging  # لاگ
 # -------------------- Config --------------------
 load_dotenv()  # بارگذاری .env
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")
-PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
-BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
-ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")
+DATABASE_URL = os.getenv("DATABASE_URL")  # URL دیتابیس
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret")  # کلید JWT
+PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper")  # پپر رمز
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))  # مدت اعتبار دسترسی
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))  # مدت اعتبار رفرش
+BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))  # دور هش
+ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*")  # مبداهای مجاز CORS
 
 # Legacy (پشتیبان)
-FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()  # کلید Legacy FCM
 
 # FCM HTTP v1
-FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()
-GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
-GOOGLE_APPLICATION_CREDENTIALS_JSON_B64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON_B64", "").strip()
+FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()  # شناسه پروژه (Fallback)
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()  # JSON سرویس‌اکانت
+GOOGLE_APPLICATION_CREDENTIALS_JSON_B64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON_B64", "").strip()  # JSON سرویس‌اکانت (Base64)
 
-ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")
+ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")  # کلید ادمین
 
-AUTH_COMPAT = os.getenv("AUTH_COMPAT", "1").strip()
+AUTH_COMPAT = os.getenv("AUTH_COMPAT", "1").strip()  # سازگاری قدیمی
 
-LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))
-LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
-LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))  # پنجره لاگین
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))  # حداکثر تلاش
+LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))  # قفل موقت
 
-PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()
-NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()
-NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()
+PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()  # بک‌اند پوش
+NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()  # آدرس ntfy
+NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()  # توکن ntfy
 
 # لاگر پوش
-logger = logging.getLogger("putz.push")
-if not logger.handlers:
-    h = logging.StreamHandler()
-    fmt = logging.Formatter("[PUSH] %(levelname)s: %(message)s")
-    h.setFormatter(fmt)
-    logger.addHandler(h)
-logger.setLevel(logging.INFO)
+logger = logging.getLogger("putz.push")  # لاگر اختصاصی پوش
+if not logger.handlers:  # درصورت نبود هندلر
+    h = logging.StreamHandler()  # استریم هندلر
+    fmt = logging.Formatter("[PUSH] %(levelname)s: %(message)s")  # فرمت
+    h.setFormatter(fmt)  # اعمال فرمت
+    logger.addHandler(h)  # افزودن هندلر
+logger.setLevel(logging.INFO)  # سطح لاگ
 
-database = Database(DATABASE_URL)
-Base = declarative_base()
+database = Database(DATABASE_URL)  # اتصال async دیتابیس
+Base = declarative_base()  # Base ORM
 
 # -------------------- ORM models --------------------
-class UserTable(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    phone = Column(String, unique=True, index=True)
-    password_hash = Column(String)
-    address = Column(String)
-    name = Column(String, default="")
-    car_list = Column(JSONB, default=list)
+class UserTable(Base):  # مدل جدول کاربران
+    __tablename__ = "users"  # نام جدول
+    id = Column(Integer, primary_key=True, index=True)  # کلید
+    phone = Column(String, unique=True, index=True)  # شماره
+    password_hash = Column(String)  # هش رمز
+    address = Column(String)  # آدرس
+    name = Column(String, default="")  # نام
+    car_list = Column(JSONB, default=list)  # لیست ماشین‌ها
 
-class DriverTable(Base):
+class DriverTable(Base):  # مدل راننده (استفاده احتمالی)
     __tablename__ = "drivers"
     id = Column(Integer, primary_key=True, index=True)
     first_name = Column(String)
@@ -94,28 +95,28 @@ class DriverTable(Base):
     is_online = Column(Boolean, default=False)
     status = Column(String, default="فعال")
 
-class RequestTable(Base):
+class RequestTable(Base):  # جدول سفارش
     __tablename__ = "requests"
-    id = Column(Integer, primary_key=True, index=True)
-    user_phone = Column(String, index=True)
-    latitude = Column(Float)
-    longitude = Column(Float)
-    car_list = Column(JSONB)
-    address = Column(String)
-    home_number = Column(String, default="")
-    service_type = Column(String, index=True)
-    price = Column(Integer)
-    request_datetime = Column(String)
-    status = Column(String)
-    driver_name = Column(String)
-    driver_phone = Column(String)
-    finish_datetime = Column(String)
-    payment_type = Column(String)
-    scheduled_start = Column(DateTime(timezone=True), nullable=True)
-    service_place = Column(String, default="client")
-    execution_start = Column(DateTime(timezone=True), nullable=True)
+    id = Column(Integer, primary_key=True, index=True)  # کلید
+    user_phone = Column(String, index=True)  # شماره کاربر
+    latitude = Column(Float)  # عرض
+    longitude = Column(Float)  # طول
+    car_list = Column(JSONB)  # لیست خودرو/آیتم‌ها
+    address = Column(String)  # آدرس
+    home_number = Column(String, default="")  # پلاک
+    service_type = Column(String, index=True)  # نوع سرویس
+    price = Column(Integer)  # قیمت
+    request_datetime = Column(String)  # زمان ثبت
+    status = Column(String)  # وضعیت
+    driver_name = Column(String)  # نام راننده
+    driver_phone = Column(String)  # شماره راننده
+    finish_datetime = Column(String)  # زمان پایان
+    payment_type = Column(String)  # روش پرداخت
+    scheduled_start = Column(DateTime(timezone=True), nullable=True)  # زمان تأیید شده
+    service_place = Column(String, default="client")  # محل سرویس
+    execution_start = Column(DateTime(timezone=True), nullable=True)  # شروع اجرا
 
-class RefreshTokenTable(Base):
+class RefreshTokenTable(Base):  # جدول رفرش توکن
     __tablename__ = "refresh_tokens"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True)
@@ -125,7 +126,7 @@ class RefreshTokenTable(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     __table_args__ = (Index("ix_refresh_token_user_id_expires", "user_id", "expires_at"),)
 
-class LoginAttemptTable(Base):
+class LoginAttemptTable(Base):  # جدول تلاش‌های لاگین
     __tablename__ = "login_attempts"
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String, index=True)
@@ -137,7 +138,7 @@ class LoginAttemptTable(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     __table_args__ = (Index("ix_login_attempt_phone_ip", "phone", "ip"),)
 
-class ScheduleSlotTable(Base):
+class ScheduleSlotTable(Base):  # جدول اسلات‌های پیشنهادی
     __tablename__ = "schedule_slots"
     id = Column(Integer, primary_key=True, index=True)
     request_id = Column(Integer, ForeignKey("requests.id"), index=True)
@@ -147,7 +148,7 @@ class ScheduleSlotTable(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     __table_args__ = (Index("ix_schedule_slots_req_status", "request_id", "status"),)
 
-class AppointmentTable(Base):
+class AppointmentTable(Base):  # جدول رزرو نهایی
     __tablename__ = "appointments"
     id = Column(Integer, primary_key=True, index=True)
     provider_phone = Column(String, index=True)
@@ -161,7 +162,7 @@ class AppointmentTable(Base):
         Index("ix_provider_time", "provider_phone", "start_time", "end_time"),
     )
 
-class NotificationTable(Base):
+class NotificationTable(Base):  # جدول اعلان‌ها
     __tablename__ = "notifications"
     id = Column(Integer, primary_key=True, index=True)
     user_phone = Column(String, index=True)
@@ -173,7 +174,7 @@ class NotificationTable(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     __table_args__ = (Index("ix_notifs_user_read_created", "user_phone", "read", "created_at"),)
 
-class DeviceTokenTable(Base):
+class DeviceTokenTable(Base):  # جدول توکن‌های دستگاه
     __tablename__ = "device_tokens"
     id = Column(Integer, primary_key=True, index=True)
     token = Column(String, unique=True, index=True)
@@ -185,270 +186,270 @@ class DeviceTokenTable(Base):
     __table_args__ = (Index("ix_tokens_role_platform", "role", "platform"),)
 
 # -------------------- Pydantic models --------------------
-class CarInfo(BaseModel):
-    brand: str
-    model: str
-    plate: str
+class CarInfo(BaseModel):  # مدل ورودی ماشین
+    brand: str  # برند
+    model: str  # مدل
+    plate: str  # پلاک
 
-class Location(BaseModel):
-    latitude: float
-    longitude: float
+class Location(BaseModel):  # مدل مکان
+    latitude: float  # عرض
+    longitude: float  # طول
 
-class CarOrderItem(BaseModel):
-    brand: str
-    model: str
-    plate: str
-    wash_outside: bool = False
-    wash_inside: bool = False
-    polish: bool = False
+class CarOrderItem(BaseModel):  # آیتم سفارش کارواش
+    brand: str  # برند
+    model: str  # مدل
+    plate: str  # پلاک
+    wash_outside: bool = False  # روشویی
+    wash_inside: bool = False  # توشویی
+    polish: bool = False  # پولیش
 
-class OrderRequest(BaseModel):
-    user_phone: str
-    location: Location
-    car_list: List[CarOrderItem]
-    address: str
-    home_number: Optional[str] = ""
-    service_type: str
-    price: int
-    request_datetime: str
-    payment_type: str
-    service_place: str
+class OrderRequest(BaseModel):  # بدنه ثبت سفارش
+    user_phone: str  # شماره کاربر
+    location: Location  # مکان
+    car_list: List[CarOrderItem]  # آیتم‌ها
+    address: str  # آدرس
+    home_number: Optional[str] = ""  # پلاک
+    service_type: str  # نوع سرویس
+    price: int  # قیمت
+    request_datetime: str  # زمان ثبت
+    payment_type: str  # پرداخت
+    service_place: str  # محل سرویس
 
-class CarListUpdateRequest(BaseModel):
-    user_phone: str
-    car_list: List[CarInfo]
+class CarListUpdateRequest(BaseModel):  # بدنه ذخیره لیست خودرو
+    user_phone: str  # شماره
+    car_list: List[CarInfo]  # لیست خودرو
 
-class CancelRequest(BaseModel):
-    user_phone: str
-    service_type: str
+class CancelRequest(BaseModel):  # بدنه لغو سفارش
+    user_phone: str  # شماره
+    service_type: str  # سرویس
 
-class UserRegisterRequest(BaseModel):
-    phone: str
-    password: str
-    address: Optional[str] = None
+class UserRegisterRequest(BaseModel):  # بدنه ثبت‌نام
+    phone: str  # شماره
+    password: str  # رمز
+    address: Optional[str] = None  # آدرس
 
-class UserLoginRequest(BaseModel):
-    phone: str
-    password: str
+class UserLoginRequest(BaseModel):  # بدنه ورود
+    phone: str  # شماره
+    password: str  # رمز
 
-class UserProfileUpdate(BaseModel):
-    phone: str
-    name: str = ""
-    address: str = ""
+class UserProfileUpdate(BaseModel):  # بدنه ذخیره پروفایل
+    phone: str  # شماره
+    name: str = ""  # نام
+    address: str = ""  # آدرس
 
-class ProposedSlotsRequest(BaseModel):
-    provider_phone: str
-    slots: List[str]
+class ProposedSlotsRequest(BaseModel):  # بدنه پیشنهاد اسلات‌ها
+    provider_phone: str  # شماره سرویس‌دهنده
+    slots: List[str]  # لیست اسلات‌ها
 
-class ConfirmSlotRequest(BaseModel):
-    slot: str
+class ConfirmSlotRequest(BaseModel):  # بدنه تایید اسلات
+    slot: str  # زمان ISO
 
-class PriceBody(BaseModel):
-    price: int
-    agree: bool
-    exec_time: Optional[str] = None
+class PriceBody(BaseModel):  # بدنه تعیین قیمت
+    price: int  # قیمت
+    agree: bool  # موافقت
+    exec_time: Optional[str] = None  # زمان اجرا
 
-class PushRegister(BaseModel):
-    role: str
-    token: str
-    platform: str = "android"
-    user_phone: Optional[str] = None
+class PushRegister(BaseModel):  # بدنه ثبت توکن
+    role: str  # نقش
+    token: str  # توکن
+    platform: str = "android"  # پلتفرم
+    user_phone: Optional[str] = None  # شماره
 
-class LogoutRequest(BaseModel):
-    refresh_token: str
+class PushUnregister(BaseModel):  # بدنه لغو ثبت توکن
+    token: str  # توکن دستگاه
 
-class PushUnregister(BaseModel): 
-    token: str  
+class LogoutRequest(BaseModel):  # بدنه خروج
+    refresh_token: str  # رفرش توکن
+    device_token: Optional[str] = None  # توکن دستگاه (اختیاری؛ برای حذف دقیق‌تر)
 
 # -------------------- Security helpers --------------------
-def bcrypt_hash_password(password: str) -> str:
-    salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
-    mixed = (password + PASSWORD_PEPPER).encode("utf-8")
-    return bcrypt.hashpw(mixed, salt).decode("utf-8")
+def bcrypt_hash_password(password: str) -> str:  # تابع هش رمز
+    salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)  # تولید نمک
+    mixed = (password + PASSWORD_PEPPER).encode("utf-8")  # ترکیب با پپر
+    return bcrypt.hashpw(mixed, salt).decode("utf-8")  # هش و بازگشت
 
-def verify_password_secure(password: str, stored_hash: str) -> bool:
+def verify_password_secure(password: str, stored_hash: str) -> bool:  # بررسی رمز
     try:
-        if stored_hash.startswith("$2"):
-            mixed = (password + PASSWORD_PEPPER).encode("utf-8")
-            return bcrypt.checkpw(mixed, stored_hash.encode("utf-8"))
-        old = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        return old == stored_hash
+        if stored_hash.startswith("$2"):  # اگر bcrypt
+            mixed = (password + PASSWORD_PEPPER).encode("utf-8")  # ترکیب
+            return bcrypt.checkpw(mixed, stored_hash.encode("utf-8"))  # بررسی
+        old = hashlib.sha256(password.encode("utf-8")).hexdigest()  # سازگاری قدیمی
+        return old == stored_hash  # مقایسه
     except Exception:
-        return False
+        return False  # خطا → نادرست
 
-def create_access_token(phone: str) -> str:
-    now = datetime.now(timezone.utc)
-    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload = {"sub": phone, "type": "access", "exp": exp}
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+def create_access_token(phone: str) -> str:  # ساخت توکن دسترسی
+    now = datetime.now(timezone.utc)  # اکنون
+    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)  # انقضا
+    payload = {"sub": phone, "type": "access", "exp": exp}  # بدنه
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")  # امضاء
 
-def create_refresh_token() -> str:
-    return secrets.token_urlsafe(48)
+def create_refresh_token() -> str:  # ساخت رفرش
+    return secrets.token_urlsafe(48)  # توکن امن
 
-def hash_refresh_token(token: str) -> str:
-    return hashlib.sha256((token + PASSWORD_PEPPER).encode("utf-8")).hexdigest()
+def hash_refresh_token(token: str) -> str:  # هش رفرش با پپر
+    return hashlib.sha256((token + PASSWORD_PEPPER).encode("utf-8")).hexdigest()  # هش
 
-def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):
-    return {"status": status, "code": code, "message": message, "data": (data or {})}
+def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):  # پاسخ واحد
+    return {"status": status, "code": code, "message": message, "data": (data or {})}  # قالب
 
-def extract_bearer_token(request: Request) -> Optional[str]:
-    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
-    if not auth.lower().startswith("bearer "):
-        return None
-    return auth.split(" ", 1)[1].strip()
+def extract_bearer_token(request: Request) -> Optional[str]:  # استخراج Bearer
+    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""  # هدر
+    if not auth.lower().startswith("bearer "):  # اگر Bearer نبود
+        return None  # خروج
+    return auth.split(" ", 1)[1].strip()  # برگرداندن توکن
 
-def decode_access_token(token: str) -> Optional[dict]:
+def decode_access_token(token: str) -> Optional[dict]:  # دیکود JWT
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        if payload.get("type") != "access":
-            return None
-        return payload
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])  # دیکود
+        if payload.get("type") != "access":  # نوع نادرست
+            return None  # خروج
+        return payload  # payload
     except Exception:
-        return None
+        return None  # خطا
 
-def get_auth_phone(request: Request, fallback_phone: Optional[str] = None, enforce: bool = False) -> str:
-    token = extract_bearer_token(request)
+def get_auth_phone(request: Request, fallback_phone: Optional[str] = None, enforce: bool = False) -> str:  # گرفتن شماره احراز
+    token = extract_bearer_token(request)  # استخراج توکن
     if token:
-        payload = decode_access_token(token)
-        if not payload or not payload.get("sub"):
-            raise HTTPException(status_code=401, detail="invalid token")
-        sub = str(payload["sub"])
-        if fallback_phone and sub != fallback_phone:
-            raise HTTPException(status_code=403, detail="forbidden")
-        return sub
-    if AUTH_COMPAT == "1" and fallback_phone:
-        return fallback_phone
-    if enforce:
-        raise HTTPException(status_code=401, detail="missing bearer token")
-    return fallback_phone or ""
+        payload = decode_access_token(token)  # دیکود
+        if not payload or not payload.get("sub"):  # نامعتبر
+            raise HTTPException(status_code=401, detail="invalid token")  # 401
+        sub = str(payload["sub"])  # شماره
+        if fallback_phone and sub != fallback_phone:  # اختلاف شماره
+            raise HTTPException(status_code=403, detail="forbidden")  # 403
+        return sub  # بازگشت شماره
+    if AUTH_COMPAT == "1" and fallback_phone:  # سازگاری
+        return fallback_phone  # بازگشت
+    if enforce:  # الزام
+        raise HTTPException(status_code=401, detail="missing bearer token")  # 401
+    return fallback_phone or ""  # بازگشت
 
-def require_admin(request: Request):
-    key = request.headers.get("x-admin-key", "")
-    if not key or key != ADMIN_KEY:
-        raise HTTPException(status_code=401, detail="admin auth required")
+def require_admin(request: Request):  # اعتبارسنجی ادمین
+    key = request.headers.get("x-admin-key", "")  # دریافت کلید
+    if not key or key != ADMIN_KEY:  # مقایسه
+        raise HTTPException(status_code=401, detail="admin auth required")  # 401
 
 # -------------------- Utils --------------------
-def get_client_ip(request: Request) -> str:
-    xff = request.headers.get("x-forwarded-for", "")
+def get_client_ip(request: Request) -> str:  # IP کلاینت
+    xff = request.headers.get("x-forwarded-for", "")  # هدر XFF
     if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host or "unknown"
+        return xff.split(",")[0].strip()  # اولین IP
+    return request.client.host or "unknown"  # IP مستقیم
 
-def parse_iso(ts: str) -> datetime:
+def parse_iso(ts: str) -> datetime:  # پارس ISO به datetime
     try:
-        raw = ts.strip()
+        raw = ts.strip()  # رشته
         if "T" not in raw:
-            raise ValueError("no T in ISO")
-        date_part, time_part = raw.split("T", 1)
-        time_part = time_part.replace("Z", "")
-        for sign in ["+", "-"]:
+            raise ValueError("no T in ISO")  # اعتبارسنجی
+        date_part, time_part = raw.split("T", 1)  # جداسازی
+        time_part = time_part.replace("Z", "")  # حذف Z
+        for sign in ["+", "-"]:  # حذف آفست نهایی
             idx = time_part.find(sign)
             if idx > 0:
                 time_part = time_part[:idx]
                 break
         if time_part.count(":") == 1:
-            time_part = f"{time_part}:00"
-        y, m, d = map(int, date_part.split("-"))
-        hh, mm, ss = map(int, time_part.split(":"))
-        dt = datetime(y, m, d, hh, mm, ss, tzinfo=timezone.utc)
-        return dt
+            time_part = f"{time_part}:00"  # افزودن ثانیه
+        y, m, d = map(int, date_part.split("-"))  # تاریخ
+        hh, mm, ss = map(int, time_part.split(":"))  # زمان
+        dt = datetime(y, m, d, hh, mm, ss, tzinfo=timezone.utc)  # datetime UTC
+        return dt  # بازگشت
     except Exception:
-        raise HTTPException(status_code=400, detail=f"invalid datetime: {ts}")
+        raise HTTPException(status_code=400, detail=f"invalid datetime: {ts}")  # 400
 
-async def provider_is_free(provider_phone: str, start: datetime, end: datetime) -> bool:
-    q = AppointmentTable.__table__.select().where(
+async def provider_is_free(provider_phone: str, start: datetime, end: datetime) -> bool:  # بررسی اشغال بودن
+    q = AppointmentTable.__table__.select().where(  # کوئری
         (AppointmentTable.provider_phone == provider_phone) &
         (AppointmentTable.status == "BOOKED") &
         (AppointmentTable.start_time < end) &
         (AppointmentTable.end_time > start)
     )
-    rows = await database.fetch_all(q)
-    return len(rows) == 0
+    rows = await database.fetch_all(q)  # اجرا
+    return len(rows) == 0  # آزاد بودن
 
-async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None):
-    ins = NotificationTable.__table__.insert().values(
+async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None):  # درج اعلان در DB
+    ins = NotificationTable.__table__.insert().values(  # درج
         user_phone=phone, title=title, body=body, data=(data or {}), read=False, created_at=datetime.now(timezone.utc)
     )
-    await database.execute(ins)
+    await database.execute(ins)  # اجرا
 
 # -------------------- Push helpers (FCM v1 + Legacy) --------------------
-_FCM_OAUTH_TOKEN = ""
-_FCM_OAUTH_EXP = 0.0
+_FCM_OAUTH_TOKEN = ""  # کش توکن OAuth2
+_FCM_OAUTH_EXP = 0.0  # انقضای کش
 
-def _load_service_account() -> Optional[dict]:
-    raw = GOOGLE_APPLICATION_CREDENTIALS_JSON
-    if not raw and GOOGLE_APPLICATION_CREDENTIALS_JSON_B64:
+def _load_service_account() -> Optional[dict]:  # بارگذاری سرویس‌اکانت
+    raw = GOOGLE_APPLICATION_CREDENTIALS_JSON  # خواندن ENV متنی
+    if not raw and GOOGLE_APPLICATION_CREDENTIALS_JSON_B64:  # اگر Base64 موجود است
         try:
-            raw = base64.b64decode(GOOGLE_APPLICATION_CREDENTIALS_JSON_B64).decode("utf-8")
+            raw = base64.b64decode(GOOGLE_APPLICATION_CREDENTIALS_JSON_B64).decode("utf-8")  # دیکد Base64
         except Exception as e:
-            logger.error(f"decode service account b64 failed: {e}")
-            raw = ""
+            logger.error(f"decode service account b64 failed: {e}")  # لاگ خطا
+            raw = ""  # خالی
     if not raw:
-        return None
+        return None  # نبود JSON
     try:
-        data = json.loads(raw)
-        if "client_email" in data and "private_key" in data:
-            # تبدیل \n به newline واقعی برای کلید خصوصی
-            pk = data.get("private_key", "")
+        data = json.loads(raw)  # پارس JSON
+        if "client_email" in data and "private_key" in data:  # کلیدها موجود
+            pk = data.get("private_key", "")  # کلید خصوصی
             if "\\n" in pk:
-                data["private_key"] = pk.replace("\\n", "\n")
-            return data
+                data["private_key"] = pk.replace("\\n", "\n")  # تبدیل \n
+            return data  # بازگشت
     except Exception as e:
-        logger.error(f"parse service account JSON failed: {e}")
-        return None
-    return None
+        logger.error(f"parse service account JSON failed: {e}")  # لاگ خطا
+        return None  # خطا
+    return None  # پیش‌فرض
 
-def _get_oauth2_token_for_fcm() -> Optional[str]:
-    global _FCM_OAUTH_TOKEN, _FCM_OAUTH_EXP
-    now = time.time()
-    if _FCM_OAUTH_TOKEN and (_FCM_OAUTH_EXP - 60) > now:
-        return _FCM_OAUTH_TOKEN
-    sa = _load_service_account()
+def _get_oauth2_token_for_fcm() -> Optional[str]:  # دریافت OAuth2 برای FCM
+    global _FCM_OAUTH_TOKEN, _FCM_OAUTH_EXP  # استفاده از کش
+    now = time.time()  # اکنون
+    if _FCM_OAUTH_TOKEN and (_FCM_OAUTH_EXP - 60) > now:  # هنوز معتبر؟
+        return _FCM_OAUTH_TOKEN  # بازگشت کش
+    sa = _load_service_account()  # سرویس‌اکانت
     if not sa:
-        logger.warning("service account JSON not loaded; skip FCM v1")
-        return None
-    client_email = sa.get("client_email", "")
-    private_key = sa.get("private_key", "")
+        logger.warning("service account JSON not loaded; skip FCM v1")  # هشدار
+        return None  # خروج
+    client_email = sa.get("client_email", "")  # ایمیل
+    private_key = sa.get("private_key", "")  # کلید
     if not client_email or not private_key:
-        logger.warning("service account missing client_email/private_key")
-        return None
-    issued = int(now)
-    expires = issued + 3600
+        logger.warning("service account missing client_email/private_key")  # هشدار
+        return None  # خروج
+    issued = int(now)  # زمان صدور
+    expires = issued + 3600  # انقضا
     payload = {
         "iss": client_email,
         "scope": "https://www.googleapis.com/auth/firebase.messaging",
         "aud": "https://oauth2.googleapis.com/token",
         "iat": issued,
         "exp": expires
-    }
+    }  # بدنه JWT
     try:
-        assertion = jwt.encode(payload, private_key, algorithm="RS256")
+        assertion = jwt.encode(payload, private_key, algorithm="RS256")  # امضاء JWT
     except Exception as e:
-        logger.error(f"build assertion failed: {e}")
-        return None
+        logger.error(f"build assertion failed: {e}")  # خطا
+        return None  # خروج
     try:
-        resp = httpx.post(
+        resp = httpx.post(  # درخواست توکن
             "https://oauth2.googleapis.com/token",
             data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
             timeout=10.0
         )
         if resp.status_code != 200:
-            logger.error(f"oauth token http {resp.status_code} {resp.text}")
+            logger.error(f"oauth token http {resp.status_code} {resp.text}")  # خطا HTTP
             return None
-        data = resp.json()
-        token = data.get("access_token", "")
-        expires_in = int(data.get("expires_in", 3600))
+        data = resp.json()  # JSON
+        token = data.get("access_token", "")  # توکن
+        expires_in = int(data.get("expires_in", 3600))  # انقضا
         if token:
-            _FCM_OAUTH_TOKEN = token
-            _FCM_OAUTH_EXP = now + expires_in
-            logger.info("fcm v1 access_token acquired")
-            return token
-        logger.error("oauth token missing access_token")
+            _FCM_OAUTH_TOKEN = token  # کش
+            _FCM_OAUTH_EXP = now + expires_in  # انقضا
+            logger.info("fcm v1 access_token acquired")  # لاگ
+            return token  # بازگشت
+        logger.error("oauth token missing access_token")  # خطا
     except Exception as e:
-        logger.error(f"oauth token request failed: {e}")
-    return None
+        logger.error(f"oauth token request failed: {e}")  # خطای شبکه
+    return None  # خروج
 
-async def get_manager_tokens() -> List[str]:
+async def get_manager_tokens() -> List[str]:  # توکن‌های مدیر
     sel = DeviceTokenTable.__table__.select().where(
         (DeviceTokenTable.role == "manager") & (DeviceTokenTable.platform == "android")
     )
@@ -460,7 +461,7 @@ async def get_manager_tokens() -> List[str]:
             seen.add(t); tokens.append(t)
     return tokens
 
-async def get_user_tokens(phone: str) -> List[str]:
+async def get_user_tokens(phone: str) -> List[str]:  # توکن‌های کاربر
     sel = DeviceTokenTable.__table__.select().where(
         (DeviceTokenTable.role == "client") & (DeviceTokenTable.user_phone == phone)
     )
@@ -472,7 +473,7 @@ async def get_user_tokens(phone: str) -> List[str]:
             seen.add(t); tokens.append(t)
     return tokens
 
-async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: Optional[dict], channel_id: str):
+async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: Optional[dict], channel_id: str):  # ارسال Legacy
     if not FCM_SERVER_KEY or not tokens:
         logger.info("legacy skipped (no server key or no tokens)")
         return
@@ -492,15 +493,25 @@ async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: Optio
             except Exception as e:
                 logger.error(f"legacy send failed: {e}")
 
-async def _send_fcm_v1(tokens: List[str], title: str, body: str, data: Optional[dict], channel_id: str):
-    if not tokens or not FCM_PROJECT_ID:
+async def remove_device_token(token: str):  # حذف توکن نامعتبر/خروج
+    try:
+        delq = DeviceTokenTable.__table__.delete().where(DeviceTokenTable.token == token)
+        await database.execute(delq)
+        logger.info(f"token removed (UNREGISTERED) token_tail={token[-8:]}")
+    except Exception as e:
+        logger.error(f"remove token failed: {e}")
+
+async def _send_fcm_v1(tokens: List[str], title: str, body: str, data: Optional[dict], channel_id: str):  # ارسال v1
+    sa = _load_service_account()  # سرویس‌اکانت
+    project_id = (sa or {}).get("project_id") or FCM_PROJECT_ID  # project_id معتبر
+    if not tokens or not project_id:
         logger.info("v1 skipped (no tokens or no project id)")
         return
-    access_token = _get_oauth2_token_for_fcm()
+    access_token = _get_oauth2_token_for_fcm()  # توکن OAuth2
     if not access_token:
         logger.error("v1 access_token not available")
         return
-    url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"
+    url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"  # URL با project_id صحیح
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=utf-8"}
     async with httpx.AsyncClient(timeout=10.0) as client:
         for t in tokens:
@@ -508,18 +519,33 @@ async def _send_fcm_v1(tokens: List[str], title: str, body: str, data: Optional[
                 "message": {
                     "token": t,
                     "notification": {"title": title, "body": body},
-                    "android": {
-                        "priority": "HIGH",
-                        "notification": {
-                            "channel_id": channel_id
-                        }
-                    },
+                    "android": {"priority": "HIGH", "notification": {"channel_id": channel_id}},
                     "data": {k: str(v) for (k, v) in (data or {}).items()}
                 }
             }
             try:
                 resp = await client.post(url, headers=headers, json=message)
-                logger.info(f"v1 send {resp.status_code} token_tail={t[-8:]} resp={resp.text[:200]}")
+                if resp.status_code == 200:
+                    logger.info(f"v1 send 200 token_tail={t[-8:]}")
+                    continue
+                text = resp.text
+                err_code = ""
+                try:
+                    j = resp.json()
+                    details = (((j or {}).get("error") or {}).get("details") or [])
+                    if isinstance(details, list) and len(details) > 0:
+                        err_code = (details[0] or {}).get("errorCode") or ""
+                except Exception:
+                    m = re.search(r'"errorCode"\s*:\s*"([A-Z_]+)"', text or "")
+                    if m:
+                        err_code = m.group(1)
+                logger.info(f"v1 send {resp.status_code} token_tail={t[-8:]} err_code={err_code} resp={text[:300]}")
+                if err_code == "UNREGISTERED" or resp.status_code == 404:
+                    await remove_device_token(t)
+                    if FCM_SERVER_KEY:
+                        await _send_fcm_legacy([t], title, body, data, channel_id)
+                if err_code == "SENDER_ID_MISMATCH":
+                    logger.error(f"SENDER_ID_MISMATCH: check google-services.json/app project and service account project_id={project_id}")
             except Exception as e:
                 logger.error(f"v1 send failed: {e}")
 
@@ -542,7 +568,7 @@ async def _send_ntfy(topics: List[str], title: str, body: str, data: Optional[di
 async def send_push_to_tokens(tokens: List[str], title: str, body: str, data: Optional[dict] = None, channel_id: str = "order_status_channel"):
     if PUSH_BACKEND == "ntfy":
         await _send_ntfy(tokens, title, body, data); return
-    if FCM_PROJECT_ID and _load_service_account():
+    if (FCM_PROJECT_ID or _load_service_account()) and _get_oauth2_token_for_fcm():
         await _send_fcm_v1(tokens, title, body, data, channel_id); return
     await _send_fcm_legacy(tokens, title, body, data, channel_id)
 
@@ -557,8 +583,8 @@ async def send_push_to_user(phone: str, title: str, body: str, data: Optional[di
     await send_push_to_tokens(tokens, title, body, data, channel_id="order_status_channel")
 
 # -------------------- App & CORS --------------------
-app = FastAPI()
-allow_origins = ["*"] if ALLOW_ORIGINS_ENV.strip() == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]
+app = FastAPI()  # اپ FastAPI
+allow_origins = ["*"] if ALLOW_ORIGINS_ENV.strip() == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]  # تنظیم CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
@@ -569,30 +595,29 @@ app.add_middleware(
 
 # -------------------- Startup/Shutdown --------------------
 @app.on_event("startup")
-async def startup():
-    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))
-    Base.metadata.create_all(engine)
-    with engine.begin() as conn:
+async def startup():  # شروع برنامه
+    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))  # Engine sync برای create_all
+    Base.metadata.create_all(engine)  # ساخت جداول
+    with engine.begin() as conn:  # تغییر ستون‌های جدید (در صورت نبود)
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS scheduled_start TIMESTAMPTZ NULL;"))
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS service_place TEXT DEFAULT 'client';"))
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS execution_start TIMESTAMPTZ NULL;"))
-    await database.connect()
-    # گزارش وضعیت تنظیمات FCM
-    ready_v1 = bool(FCM_PROJECT_ID and _load_service_account())
-    logger.info(f"startup FCM_BACKEND={PUSH_BACKEND} v1_ready={ready_v1} project_id={FCM_PROJECT_ID}")
+    await database.connect()  # اتصال async
+    ready_v1 = bool((FCM_PROJECT_ID or _load_service_account()) and _get_oauth2_token_for_fcm())  # آماده بودن v1
+    logger.info(f"startup FCM_BACKEND={PUSH_BACKEND} v1_ready={ready_v1} project_id={FCM_PROJECT_ID}")  # لاگ وضعیت
 
 @app.on_event("shutdown")
-async def shutdown():
-    await database.disconnect()
+async def shutdown():  # خاموشی
+    await database.disconnect()  # قطع اتصال
 
 # -------------------- Health --------------------
 @app.get("/")
-def read_root():
-    return {"message": "Putzfee FastAPI Server is running!"}
+def read_root():  # سلامت
+    return {"message": "Putzfee FastAPI Server is running!"}  # پیام
 
 # -------------------- Auth helpers endpoints --------------------
 @app.get("/verify_token")
-def verify_token(request: Request):
+def verify_token(request: Request):  # بررسی توکن
     token = extract_bearer_token(request)
     if not token:
         return {"status": "ok", "valid": False}
@@ -600,19 +625,35 @@ def verify_token(request: Request):
     return {"status": "ok", "valid": bool(payload and payload.get("sub"))}
 
 @app.post("/logout")
-async def logout_user(body: LogoutRequest):
+async def logout_user(body: LogoutRequest):  # خروج کاربر (حذف توکن دستگاه + ابطال رفرش)
     if not body.refresh_token:
         raise HTTPException(status_code=400, detail="refresh_token required")
-    token_hash = hash_refresh_token(body.refresh_token)
+    token_hash = hash_refresh_token(body.refresh_token)  # هش رفرش
+    # پیدا کردن ردیف رفرش برای استخراج user_id
+    sel_rt = RefreshTokenTable.__table__.select().where(RefreshTokenTable.token_hash == token_hash)  # انتخاب
+    rt_row = await database.fetch_one(sel_rt)  # دریافت
+    # ابطال رفرش
     upd = RefreshTokenTable.__table__.update().where(
         RefreshTokenTable.token_hash == token_hash
     ).values(revoked=True)
     await database.execute(upd)
-    return unified_response("ok", "LOGOUT", "refresh token revoked", {})
+    # حذف توکن دستگاه: اگر device_token داده شده → حذف همان؛ در غیر اینصورت سعی در حذف همه توکن‌های کاربر
+    if body.device_token and body.device_token.strip():
+        delq = DeviceTokenTable.__table__.delete().where(DeviceTokenTable.token == body.device_token.strip())
+        await database.execute(delq)
+    else:
+        if rt_row and (rt_row.get("user_id") is not None):
+            sel_user = UserTable.__table__.select().where(UserTable.id == rt_row["user_id"])
+            user = await database.fetch_one(sel_user)
+            if user:
+                phone = user["phone"]
+                del_all = DeviceTokenTable.__table__.delete().where(DeviceTokenTable.user_phone == phone)
+                await database.execute(del_all)
+    return unified_response("ok", "LOGOUT", "refresh token revoked and device tokens removed", {})
 
 # -------------------- Push endpoints --------------------
 @app.post("/push/register")
-async def register_push_token(body: PushRegister, request: Request):
+async def register_push_token(body: PushRegister, request: Request):  # ثبت توکن پوش
     now = datetime.now(timezone.utc)
     sel = DeviceTokenTable.__table__.select().where(DeviceTokenTable.token == body.token)
     row = await database.fetch_one(sel)
@@ -628,6 +669,13 @@ async def register_push_token(body: PushRegister, request: Request):
         await database.execute(upd)
     logger.info(f"push/register role={body.role} platform={body.platform} phone={body.user_phone}")
     return unified_response("ok", "TOKEN_REGISTERED", "registered", {"role": body.role})
+
+@app.post("/push/unregister")
+async def unregister_push_token(body: PushUnregister):  # لغو ثبت توکن پوش (قطع نوتیف پس از خروج)
+    delq = DeviceTokenTable.__table__.delete().where(DeviceTokenTable.token == body.token)
+    await database.execute(delq)
+    logger.info(f"push/unregister token_tail={body.token[-8:]}")
+    return unified_response("ok", "TOKEN_UNREGISTERED", "unregistered", {})
 
 # -------------------- Auth/User --------------------
 @app.get("/users/exists")
@@ -645,7 +693,7 @@ async def register_user(user: UserRegisterRequest):
         raise HTTPException(status_code=400, detail="User already exists")
     password_hash = bcrypt_hash_password(user.password)
     ins = UserTable.__table__.insert().values(
-        phone=user.phone, password_hash=password_hash, address=(user.address or "").strip(), name="", car_list=[]
+        phone=user.phone, password_hash=password_hash, address=(user.address or "").trim(), name="", car_list=[]
     )
     await database.execute(ins)
     return unified_response("ok", "USER_REGISTERED", "registered", {"phone": user.phone})
@@ -1095,13 +1143,3 @@ async def debug_users():
         address_val = mapping["address"] if "address" in mapping else ""
         out.append({"id": r["id"], "phone": r["phone"], "name": name_val, "address": address_val})
     return out
-
-# --- انتهای بخش Push endpoints: API جدید برای unregister ---
-@app.post("/push/unregister")
-async def unregister_push_token(body: PushUnregister):  # fun=حذف ردیف توکن از جدول
-    delq = DeviceTokenTable.__table__.delete().where(  # delq=دستور حذف از جدول device_tokens
-        DeviceTokenTable.token == body.token  # شرط=توکن دقیقا برابر باشد
-    )
-    await database.execute(delq)  # اجرا=حذف
-    logger.info(f"push/unregister token_tail={body.token[-8:]}")  # log=برای رهگیری
-    return unified_response("ok", "TOKEN_UNREGISTERED", "unregistered", {})  # پاسخ=موفق
