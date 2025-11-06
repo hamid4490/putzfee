@@ -1,5 +1,4 @@
 # FILE: server/main.py  # FastAPI server with JWT + FCM HTTP v1 push (project_id from SA + unregister + mark read endpoints kept)  # فایل=سرور کامل (اصلاح اعلان پس از خروج، حذف توکن دستگاه، بهبود FCM v1)
-
 # -*- coding: utf-8 -*-  # کدگذاری فایل
 
 import os  # خواندن Env
@@ -629,26 +628,39 @@ async def logout_user(body: LogoutRequest):  # خروج کاربر (حذف تو�
     if not body.refresh_token:
         raise HTTPException(status_code=400, detail="refresh_token required")
     token_hash = hash_refresh_token(body.refresh_token)  # هش رفرش
-    # پیدا کردن ردیف رفرش برای استخراج user_id
-    sel_rt = RefreshTokenTable.__table__.select().where(RefreshTokenTable.token_hash == token_hash)  # انتخاب
-    rt_row = await database.fetch_one(sel_rt)  # دریافت
+
+    sel_rt = RefreshTokenTable.__table__.select().where(RefreshTokenTable.token_hash == token_hash)  # انتخاب ردیف رفرش
+    rt_row = await database.fetch_one(sel_rt)  # دریافت ردیف (Record)
+
     # ابطال رفرش
     upd = RefreshTokenTable.__table__.update().where(
         RefreshTokenTable.token_hash == token_hash
     ).values(revoked=True)
     await database.execute(upd)
-    # حذف توکن دستگاه: اگر device_token داده شده → حذف همان؛ در غیر اینصورت سعی در حذف همه توکن‌های کاربر
+
+    # حذف توکن دستگاه: اگر device_token داده شده → حذف همان؛ در غیر اینصورت حذف همه توکن‌های منتسب به کاربر
     if body.device_token and body.device_token.strip():
         delq = DeviceTokenTable.__table__.delete().where(DeviceTokenTable.token == body.device_token.strip())
         await database.execute(delq)
     else:
-        if rt_row and (rt_row.get("user_id") is not None):
-            sel_user = UserTable.__table__.select().where(UserTable.id == rt_row["user_id"])
+        # --- اصلاح بحرانی: به‌جای rt_row.get(...) از _mapping یا ایندکس استفاده می‌شود تا AttributeError رخ ندهد ---
+        user_id_val = None  # مقدار user_id از ردیف رفرش
+        if rt_row:
+            mapping = getattr(rt_row, "_mapping", {})  # نگاشت امن ستون‌ها
+            user_id_val = mapping["user_id"] if "user_id" in mapping else None  # تلاش ۱: از mapping
+            if user_id_val is None:  # تلاش ۲: ایندکس مستقیم
+                try:
+                    user_id_val = rt_row["user_id"]
+                except Exception:
+                    user_id_val = None
+        if user_id_val is not None:
+            sel_user = UserTable.__table__.select().where(UserTable.id == user_id_val)
             user = await database.fetch_one(sel_user)
             if user:
                 phone = user["phone"]
                 del_all = DeviceTokenTable.__table__.delete().where(DeviceTokenTable.user_phone == phone)
                 await database.execute(del_all)
+
     return unified_response("ok", "LOGOUT", "refresh token revoked and device tokens removed", {})
 
 # -------------------- Push endpoints --------------------
@@ -693,7 +705,7 @@ async def register_user(user: UserRegisterRequest):
         raise HTTPException(status_code=400, detail="User already exists")
     password_hash = bcrypt_hash_password(user.password)
     ins = UserTable.__table__.insert().values(
-        phone=user.phone, password_hash=password_hash, address=(user.address or "").trim(), name="", car_list=[]
+        phone=user.phone, password_hash=password_hash, address=(user.address or "").strip(), name="", car_list=[]
     )
     await database.execute(ins)
     return unified_response("ok", "USER_REGISTERED", "registered", {"phone": user.phone})
