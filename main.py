@@ -1,9 +1,9 @@
-# FILE: server/main.py  # FastAPI server with JWT + FCM HTTP v1 push  # فایل=سرور کامل (پوش و اعلان دوطرفه برای تأیید/لغو + تثبیت confirm_slot + اصلاح logout و strip)
+# FILE: server/main.py  # FastAPI server with JWT + FCM HTTP v1 push  # فایل=سرور کامل (افزودن ADMIN_PHONES + احراز ادمین با JWT یا X-Admin-Key)
 
 # -*- coding: utf-8 -*-  # کدگذاری فایل
 
 import os  # خواندن Env
-import re  # Regex برای استخراج errorCode از پاسخ FCM
+import re  # Regex برای استخراج errorCode از پاسخ FCM و نرمال‌سازی شماره
 import hashlib  # هش refresh token
 import secrets  # تولید توکن امن
 from datetime import datetime, timedelta, timezone  # تاریخ/زمان
@@ -46,10 +46,22 @@ FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()  # کلید Legacy FCM
 
 # FCM HTTP v1
 FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()  # شناسه پروژه (Fallback)
-GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()  # JSON سرویس‌اکانت
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATIONS_CREDENTIALS_JSON", os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")).strip()  # JSON سرویس‌اکانت (سازگاری نام)
 GOOGLE_APPLICATION_CREDENTIALS_JSON_B64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON_B64", "").strip()  # JSON سرویس‌اکانت (Base64)
 
-ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")  # کلید ادمین
+ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")  # کلید ادمین (سازگاری قدیمی)
+
+# NEW: مدیرها بر اساس شماره تلفن (لیست با ویرگول) → JWT sub باید یکی از این‌ها باشد
+ADMIN_PHONES_ENV = os.getenv("ADMIN_PHONES", "").strip()  # رشته=لیست شماره‌ها با ویرگول
+def _normalize_phone(p: str) -> str:  # fun=نرمال‌سازی شماره برای مقایسه
+    return "".join(ch for ch in str(p or "") if ch.isdigit() or ch == "+")  # فقط رقم و +
+def _parse_admin_phones(s: str) -> set[str]:  # fun=پارس لیست شماره‌ها به مجموعه
+    out = set()  # مجموعه خروجی
+    for part in (s or "").split(","):  # حلقه روی بخش‌ها
+        vv = _normalize_phone(part.strip())  # نرمال‌سازی هر قسمت
+        if vv: out.add(vv)  # افزودن اگر غیرخالی
+    return out  # بازگشت مجموعه
+ADMIN_PHONES_SET = _parse_admin_phones(ADMIN_PHONES_ENV)  # مجموعه=شماره‌های مجاز مدیر
 
 AUTH_COMPAT = os.getenv("AUTH_COMPAT", "1").strip()  # سازگاری قدیمی
 
@@ -324,10 +336,19 @@ def get_auth_phone(request: Request, fallback_phone: Optional[str] = None, enfor
         raise HTTPException(status_code=401, detail="missing bearer token")  # 401
     return fallback_phone or ""  # بازگشت
 
-def require_admin(request: Request):  # اعتبارسنجی ادمین
-    key = request.headers.get("x-admin-key", "")  # دریافت کلید
-    if not key or key != ADMIN_KEY:  # مقایسه
-        raise HTTPException(status_code=401, detail="admin auth required")  # 401
+def require_admin(request: Request):  # اعتبارسنجی ادمین (JWT یا X-Admin-Key)
+    token = extract_bearer_token(request)  # توکن Bearer
+    if token:  # اگر توکن موجود
+        payload = decode_access_token(token)  # دیکود
+        sub = (payload or {}).get("sub")  # استخراج sub
+        norm = _normalize_phone(sub or "")  # نرمال‌سازی شماره
+        if norm and norm in ADMIN_PHONES_SET:  # اگر شماره در لیست مدیرها
+            return  # اجازه
+        raise HTTPException(status_code=401, detail="admin auth required")  # 401=عدم مجوز ادمین
+    key = request.headers.get("x-admin-key", "")  # خواندن کلید قدیمی از هدر
+    if key and key == ADMIN_KEY:  # سازگاری با کلید قدیمی
+        return  # اجازه
+    raise HTTPException(status_code=401, detail="admin auth required")  # 401=عدم مجوز
 
 # -------------------- Utils --------------------
 def get_client_ip(request: Request) -> str:  # IP کلاینت
@@ -601,7 +622,7 @@ async def startup():  # شروع برنامه
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS execution_start TIMESTAMPTZ NULL;"))
     await database.connect()  # اتصال async
     ready_v1 = bool((FCM_PROJECT_ID or _load_service_account()) and _get_oauth2_token_for_fcm())  # آماده بودن v1
-    logger.info(f"startup FCM_BACKEND={PUSH_BACKEND} v1_ready={ready_v1} project_id={FCM_PROJECT_ID}")  # لاگ وضعیت
+    logger.info(f"startup FCM_BACKEND={PUSH_BACKEND} v1_ready={ready_v1} project_id={FCM_PROJECT_ID} admin_phones={len(ADMIN_PHONES_SET)}")  # لاگ وضعیت
 
 @app.on_event("shutdown")
 async def shutdown():  # خاموشی
