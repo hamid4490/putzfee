@@ -1,4 +1,4 @@
-# FILE: server/main.py  # FastAPI server with JWT + FCM HTTP v1 push  # فایل=سرور کامل (تأیید زمان پایدار با بازه ۱ ثانیه‌ای؛ رفع باگ logout و trim→strip)
+# FILE: server/main.py  # FastAPI server with JWT + FCM HTTP v1 push  # فایل=سرور کامل (پوش و اعلان دوطرفه برای تأیید/لغو + تثبیت confirm_slot + اصلاح logout و strip)
 
 # -*- coding: utf-8 -*-  # کدگذاری فایل
 
@@ -318,8 +318,7 @@ def get_auth_phone(request: Request, fallback_phone: Optional[str] = None, enfor
         if fallback_phone and sub != fallback_phone:  # اختلاف شماره
             raise HTTPException(status_code=403, detail="forbidden")  # 403
         return sub  # بازگشت شماره
-    AUTH_COMPAT == "1" and fallback_phone  # سازگاری
-    if AUTH_COMPAT == "1" and fallback_phone:
+    if AUTH_COMPAT == "1" and fallback_phone:  # سازگاری
         return fallback_phone  # بازگشت
     if enforce:  # الزام
         raise HTTPException(status_code=401, detail="missing bearer token")  # 401
@@ -413,34 +412,46 @@ def _get_oauth2_token_for_fcm() -> Optional[str]:  # دریافت OAuth2 برا�
     private_key = sa.get("private_key", "")  # کلید
     issued = int(now)  # زمان صدور
     expires = issued + 3600  # انقضا
-    payload = {"iss": client_email, "scope": "https://www.googleapis.com/auth/firebase.messaging", "aud": "https://oauth2.googleapis.com/token", "iat": issued, "exp": expires}  # بدنه JWT
+    payload = {  # payload=JWT assertion برای OAuth2
+        "iss": client_email,  # iss=ایمیل سرویس‌اکانت
+        "scope": "https://www.googleapis.com/auth/firebase.messaging",  # scope=دسترسی FCM
+        "aud": "https://oauth2.googleapis.com/token",  # aud=گیرنده
+        "iat": issued,  # iat=زمان صدور
+        "exp": expires  # exp=انقضا
+    }
     try:
-        assertion = jwt.encode(payload, private_key, algorithm="RS256")  # امضاء JWT
+        assertion = jwt.encode(payload, private_key, algorithm="RS256")  # ساخت/امضای assertion
     except Exception as e:
-        logger.error(f"build assertion failed: {e}")  # خطا
+        logger.error(f"build assertion failed: {e}")  # خطای ساخت assertion
         return None  # خروج
     try:
-        resp = httpx.post("https://oauth2.googleapis.com/token", data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion}, timeout=10.0)  # درخواست توکن
-        if resp.status_code != 200:
-            logger.error(f"oauth token http {resp.status_code} {resp.text}")  # خطا HTTP
-            return None
-        data = resp.json()  # JSON
-        token = data.get("access_token", "")  # توکن
-        expires_in = int(data.get("expires_in", 3600))  # انقضا
-        if token:
-            _FCM_OAUTH_TOKEN = token  # کش
-            _FCM_OAUTH_EXP = now + expires_in  # انقضا
-            logger.info("fcm v1 access_token acquired")  # لاگ
-            return token  # بازگشت
-        logger.error("oauth token missing access_token")  # خطا
+        resp = httpx.post(  # درخواست توکن
+            "https://oauth2.googleapis.com/token",  # URL=اندپوینت توکن
+            data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},  # فرم=نوع گرنت + assertion
+            timeout=10.0  # timeout=۱۰ ثانیه
+        )
+        if resp.status_code != 200:  # بررسی=کد پاسخ
+            logger.error(f"oauth token http {resp.status_code} {resp.text}")  # لاگ=خطا
+            return None  # خروج
+        data = resp.json()  # JSON=پاسخ
+        token = data.get("access_token", "")  # استخراج=access_token
+        expires_in = int(data.get("expires_in", 3600))  # استخراج=انقضا
+        if token:  # اگر=توکن وجود دارد
+            _FCM_OAUTH_TOKEN = token  # ذخیره در کش
+            _FCM_OAUTH_EXP = now + expires_in  # ذخیره زمان انقضا
+            logger.info("fcm v1 access_token acquired")  # لاگ=گرفتن موفق
+            return token  # بازگشت=توکن
+        logger.error("oauth token missing access_token")  # لاگ=نبود access_token
     except Exception as e:
-        logger.error(f"oauth token request failed: {e}")  # خطای شبکه
+        logger.error(f"oauth token request failed: {e}")  # لاگ=خطای شبکه
     return None  # خروج
 
 async def get_manager_tokens() -> List[str]:  # توکن‌های مدیر
-    sel = DeviceTokenTable.__table__.select().where((DeviceTokenTable.role == "manager") & (DeviceTokenTable.platform == "android"))  # انتخاب
-    rows = await database.fetch_all(sel)  # دریافت
-    tokens, seen = [], set()  # لیست/مجموعه برای حذف تکراری
+    sel = DeviceTokenTable.__table__.select().where(
+        (DeviceTokenTable.role == "manager") & (DeviceTokenTable.platform == "android")
+    )
+    rows = await database.fetch_all(sel)
+    tokens, seen = [], set()
     for r in rows:
         t = r["token"]
         if t and t not in seen:
@@ -448,9 +459,11 @@ async def get_manager_tokens() -> List[str]:  # توکن‌های مدیر
     return tokens
 
 async def get_user_tokens(phone: str) -> List[str]:  # توکن‌های کاربر
-    sel = DeviceTokenTable.__table__.select().where((DeviceTokenTable.role == "client") & (DeviceTokenTable.user_phone == phone))  # انتخاب
-    rows = await database.fetch_all(sel)  # دریافت
-    tokens, seen = [], set()  # ساختارها برای یکتا
+    sel = DeviceTokenTable.__table__.select().where(
+        (DeviceTokenTable.role == "client") & (DeviceTokenTable.user_phone == phone)
+    )
+    rows = await database.fetch_all(sel)
+    tokens, seen = [], set()
     for r in rows:
         t = r["token"]
         if t and t not in seen:
@@ -465,7 +478,12 @@ async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: Optio
     headers = {"Authorization": f"key={FCM_SERVER_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=10.0) as client:
         for t in tokens:
-            payload = {"to": t, "priority": "high", "notification": {"title": title, "body": body, "android_channel_id": channel_id}, "data": data or {}}
+            payload = {
+                "to": t,
+                "priority": "high",
+                "notification": {"title": title, "body": body, "android_channel_id": channel_id},
+                "data": data or {}
+            }
             try:
                 resp = await client.post(url, headers=headers, json=payload)
                 logger.info(f"legacy send {resp.status_code} token_tail={t[-8:]} resp={resp.text[:200]}")
@@ -494,7 +512,14 @@ async def _send_fcm_v1(tokens: List[str], title: str, body: str, data: Optional[
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=utf-8"}
     async with httpx.AsyncClient(timeout=10.0) as client:
         for t in tokens:
-            message = {"message": {"token": t, "notification": {"title": title, "body": body}, "android": {"priority": "HIGH", "notification": {"channel_id": channel_id}}, "data": {k: str(v) for (k, v) in (data or {}).items()}}}
+            message = {
+                "message": {
+                    "token": t,
+                    "notification": {"title": title, "body": body},
+                    "android": {"priority": "HIGH", "notification": {"channel_id": channel_id}},
+                    "data": {k: str(v) for (k, v) in (data or {}).items()}
+                }
+            }
             try:
                 resp = await client.post(url, headers=headers, json=message)
                 if resp.status_code == 200:
@@ -872,8 +897,10 @@ async def cancel_order(cancel: CancelRequest, request: Request):
                 mapping = getattr(r, "_mapping", None)
                 oid = mapping["id"] if (mapping and "id" in mapping) else (r[0] if isinstance(r, (tuple, list)) and len(r) > 0 else None)
                 await send_push_to_managers("لغو درخواست", "کاربر سفارش را لغو کرد.", {"type": "order_canceled", "order_id": str(oid) if oid is not None else ""})
+                await notify_user(cancel.user_phone, "لغو سفارش", "درخواست شما لغو شد.", data={"type": "order_canceled", "order_id": oid or 0})
+                await send_push_to_user(cancel.user_phone, "لغو سفارش", "درخواست شما لغو شد.", data={"type": "order_canceled", "order_id": str(oid) if oid is not None else ""})
         except Exception as e:
-            logger.error(f"push to managers failed: {e}")
+            logger.error(f"push to managers/user failed: {e}")
         return unified_response("ok", "ORDER_CANCELED", "canceled", {"count": len(rows)})
     raise HTTPException(status_code=404, detail="active order not found")
 
@@ -979,38 +1006,36 @@ async def get_proposed_slots(order_id: int):
 
 @app.post("/order/{order_id}/confirm_slot")
 async def confirm_slot(order_id: int, body: ConfirmSlotRequest):
-    chosen_start = parse_iso(body.slot)  # زمان انتخابی به UTC (aware)
-    logger.info(f"confirm_slot begin order_id={order_id} raw='{body.slot}' chosen_utc={chosen_start.isoformat()}")  # لاگ شروع
+    chosen_start = parse_iso(body.slot)  # زمان انتخابی به UTC
+    logger.info(f"confirm_slot begin order_id={order_id} raw='{body.slot}' chosen_utc={chosen_start.isoformat()}")  # لاگ
 
-    chosen_floor = chosen_start.replace(microsecond=0)  # کف ثانیه (حذف میکروثانیه)
-    next_sec = chosen_floor + timedelta(seconds=1)  # مرز بالایی بازه ۱ ثانیه
+    chosen_floor = chosen_start.replace(microsecond=0)  # کف ثانیه
+    next_sec = chosen_floor + timedelta(seconds=1)  # مرز بالایی بازه
 
-    sel_slot = ScheduleSlotTable.__table__.select().where(  # انتخاب اسلات در بازه [کف، کف+۱s)
+    sel_slot = ScheduleSlotTable.__table__.select().where(
         (ScheduleSlotTable.request_id == order_id) &
         (ScheduleSlotTable.status == "PROPOSED") &
         (ScheduleSlotTable.slot_start >= chosen_floor) &
         (ScheduleSlotTable.slot_start < next_sec)
     )
-    slot = await database.fetch_one(sel_slot)  # دریافت اسلات تطبیق‌داده‌شده
-
+    slot = await database.fetch_one(sel_slot)
     if not slot:
-        logger.info(f"confirm_slot not_found order_id={order_id} chosen_floor={chosen_floor.isoformat()} next_sec={next_sec.isoformat()}")  # لاگ عدم تطبیق
-        raise HTTPException(status_code=404, detail="slot not found or not proposed")  # خطا: عدم وجود اسلات
+        logger.info(f"confirm_slot not_found order_id={order_id} chosen_floor={chosen_floor.isoformat()} next_sec={next_sec.isoformat()}")
+        raise HTTPException(status_code=404, detail="slot not found or not proposed")
 
-    provider_phone = slot["provider_phone"]  # سرویس‌دهنده
-    start = slot["slot_start"]  # زمان شروع واقعی ذخیره‌شده
-    end = start + timedelta(hours=1)  # پایان یک‌ساعت بعد
+    provider_phone = slot["provider_phone"]
+    start = slot["slot_start"]
+    end = start + timedelta(hours=1)
 
-    free = await provider_is_free(provider_phone, start, end)  # بررسی آزاد بودن
-    if not free:
-        await database.execute(ScheduleSlotTable.__table__.update().where(ScheduleSlotTable.id == slot["id"]).values(status="REJECTED"))  # رد اسلات پرشده
-        raise HTTPException(status_code=409, detail="slot no longer available")  # تعارض
+    if not await provider_is_free(provider_phone, start, end):
+        await database.execute(ScheduleSlotTable.__table__.update().where(ScheduleSlotTable.id == slot["id"]).values(status="REJECTED"))
+        raise HTTPException(status_code=409, detail="slot no longer available")
 
-    await database.execute(ScheduleSlotTable.__table__.update().where(ScheduleSlotTable.id == slot["id"]).values(status="ACCEPTED"))  # پذیرش
-    await database.execute(ScheduleSlotTable.__table__.update().where((ScheduleSlotTable.request_id == order_id) & (ScheduleSlotTable.status == "PROPOSED") & (ScheduleSlotTable.id != slot["id"])).values(status="REJECTED"))  # رد سایر پیشنهادها
-    await database.execute(AppointmentTable.__table__.insert().values(provider_phone=provider_phone, request_id=order_id, start_time=start, end_time=end, status="BOOKED", created_at=datetime.now(timezone.utc)))  # درج قرار
-    await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(scheduled_start=start, status="ASSIGNED", driver_phone=provider_phone))  # آپدیت سفارش
-    logger.info(f"confirm_slot ok order_id={order_id} provider={provider_phone} start={start.isoformat()} end={end.isoformat()}")  # لاگ موفقیت
+    await database.execute(ScheduleSlotTable.__table__.update().where(ScheduleSlotTable.id == slot["id"]).values(status="ACCEPTED"))
+    await database.execute(ScheduleSlotTable.__table__.update().where((ScheduleSlotTable.request_id == order_id) & (ScheduleSlotTable.status == "PROPOSED") & (ScheduleSlotTable.id != slot["id"])).values(status="REJECTED"))
+    await database.execute(AppointmentTable.__table__.insert().values(provider_phone=provider_phone, request_id=order_id, start_time=start, end_time=end, status="BOOKED", created_at=datetime.now(timezone.utc)))
+    await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(scheduled_start=start, status="ASSIGNED", driver_phone=provider_phone))
+    logger.info(f"confirm_slot ok order_id={order_id} provider={provider_phone} start={start.isoformat()} end={end.isoformat()}")
 
     try:
         await send_push_to_managers("تأیید زمان بازدید", "کاربر زمان بازدید را تأیید کرد.", {"type": "time_confirm", "order_id": str(order_id)})
@@ -1020,13 +1045,19 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest):
 
 @app.post("/order/{order_id}/reject_all_and_cancel")
 async def reject_all_and_cancel(order_id: int):
+    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == order_id))
+    user_phone = (req["user_phone"] if req else "").strip()
+
     await database.execute(ScheduleSlotTable.__table__.update().where((ScheduleSlotTable.request_id == order_id) & (ScheduleSlotTable.status == "PROPOSED")).values(status="REJECTED"))
     upd = RequestTable.__table__.update().where(RequestTable.id == order_id).values(status="CANCELED", scheduled_start=None).returning(RequestTable.id)
     await database.fetch_all(upd)
     try:
         await send_push_to_managers("لغو درخواست", "کاربر سفارش را لغو کرد.", {"type": "order_canceled", "order_id": str(order_id)})
+        if user_phone:
+            await notify_user(user_phone, "لغو سفارش", "درخواست شما لغو شد.", data={"type": "order_canceled", "order_id": order_id})
+            await send_push_to_user(user_phone, "لغو سفارش", "درخواست شما لغو شد.", data={"type": "order_canceled", "order_id": str(order_id)})
     except Exception as e:
-        logger.error(f"push to managers failed: {e}")
+        logger.error(f"push to managers/user failed: {e}")
     return unified_response("ok", "ORDER_CANCELED", "order canceled after rejecting proposals", {"id": order_id})
 
 # -------------------- Admin/Workflow --------------------
@@ -1073,6 +1104,12 @@ async def admin_set_price_and_status(order_id: int, body: PriceBody, request: Re
             await send_push_to_user(req["user_phone"], "تعیین قیمت", "قیمت سرویس تعیین شد.", data={"type": "price_set", "order_id": str(order_id)})
         except Exception as e:
             logger.error(f"push to user failed: {e}")
+    else:
+        try:
+            await notify_user(req["user_phone"], "لغو سفارش", "سفارش توسط مدیر لغو شد.", data={"type": "order_canceled", "order_id": order_id})
+            await send_push_to_user(req["user_phone"], "لغو سفارش", "سفارش شما لغو شد.", data={"type": "order_canceled", "order_id": str(order_id)})
+        except Exception as e:
+            logger.error(f"push to user failed: {e}")
 
     await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(**values))
     resp = {"order_id": order_id, "price": body.price, "status": new_status, "execution_start": values.get("execution_start").isoformat() if values.get("execution_start") else None}
@@ -1086,6 +1123,11 @@ async def start_order(order_id: int, request: Request):
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
     await database.execute(RequestTable.__table__.update().where(RequestTable.id == order_id).values(status="STARTED"))
+    try:
+        await notify_user(req["user_phone"], "شروع کار", "اجرای سفارش آغاز شد.", data={"type": "order_started", "order_id": order_id})
+        await send_push_to_user(req["user_phone"], "شروع کار", "اجرای سفارش آغاز شد.", data={"type": "order_started", "order_id": str(order_id)})
+    except Exception as e:
+        logger.error(f"push to user failed: {e}")
     return unified_response("ok", "ORDER_STARTED", "order started", {"order_id": order_id, "status": "STARTED"})
 
 @app.post("/order/{order_id}/finish")
