@@ -106,6 +106,7 @@ def parse_iso(ts: str) -> datetime:  # پارس ISO فقط UTC
         return dt.astimezone(timezone.utc)
     except Exception:
         raise HTTPException(status_code=400, detail=f"invalid UTC datetime: {ts}")
+
 # -------------------- ORM models --------------------
 
 class UserTable(Base):  # جدول کاربران
@@ -228,6 +229,7 @@ class DeviceTokenTable(Base):  # جدول توکن دستگاه
     __table_args__ = (
         Index("ix_tokens_role_platform", "role", "platform"),
     )
+
 # -------------------- Pydantic models --------------------
 
 class CarInfo(BaseModel):  # مدل خودرو
@@ -323,6 +325,18 @@ def verify_password_secure(password: str, stored_hash: str) -> bool:  # بررس
     except Exception:
         return False
 
+def create_access_token(subject_phone: str) -> str:  # ساخت access token
+    now = datetime.now(timezone.utc)  # زمان فعلی UTC
+    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)  # زمان انقضا
+    payload = {  # payload=داده‌های JWT
+        "sub": str(subject_phone),  # sub=شماره کاربر/مدیر
+        "type": "access",  # type=نوع توکن
+        "iat": int(now.timestamp()),  # iat=زمان صدور
+        "exp": int(exp.timestamp()),  # exp=زمان انقضا
+    }  # پایان payload
+    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")  # token=امضای JWT
+    return token  # بازگشت توکن
+
 def create_refresh_token() -> str:  # ساخت رفرش
     return secrets.token_urlsafe(48)
 
@@ -376,6 +390,7 @@ def require_admin(request: Request):  # احراز مدیر
     if key and key == ADMIN_KEY:
         return
     raise HTTPException(status_code=401, detail="admin auth required")
+
 # -------------------- Utils --------------------
 
 def get_client_ip(request: Request) -> str:  # گرفتن IP کلاینت
@@ -524,6 +539,7 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
+
 # -------------------- Health --------------------
 
 @app.get("/")  # مسیر سلامت
@@ -691,6 +707,7 @@ async def login_user(user: UserLoginRequest, request: Request):
             "name": db_user["name"] or ""
         }
     }
+
 # -------------------- Orders --------------------
 
 @app.post("/order")  # ثبت سفارش
@@ -867,6 +884,7 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
         )
 
     return unified_response("ok", "SLOTS_PROPOSED", "slots proposed", {"accepted": accepted})
+
 # -------------------- Confirm / Finish workflow --------------------
 
 @app.post("/order/{order_id}/confirm_slot")  # تأیید زمان توسط کاربر
@@ -1023,4 +1041,5 @@ async def debug_users():
             }
         )
     return out
+
 # -------------------- End of server/main.py --------------------
