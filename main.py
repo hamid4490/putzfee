@@ -947,21 +947,39 @@ async def get_user_orders(user_phone: str, request: Request):  # تابع
 # -------------------- Scheduling --------------------
 
 @app.get("/provider/{provider_phone}/free_hours")  # ساعات آزاد
-async def get_free_hours(provider_phone: str, date: str, work_start: int = 8, work_end: int = 20, limit: int = 24):  # تابع
-    d = datetime.fromisoformat(date).date()  # تاریخ
-    provider = provider_phone.strip()  # شماره
-    day_start = datetime(d.year, d.month, d.day, work_start, 0, tzinfo=timezone.utc)  # شروع روز UTC
-    day_end = datetime(d.year, d.month, d.day, work_end, 0, tzinfo=timezone.utc)  # پایان روز UTC
+async def get_free_hours(  # تابع=گرفتن اسلات‌های آزاد
+    provider_phone: str,  # provider_phone=شماره سرویس‌دهنده
+    date: str,  # date=تاریخ (YYYY-MM-DD)
+    work_start: int = 8,  # work_start=شروع ساعتی (UTC) برای سازگاری قدیمی
+    work_end: int = 20,  # work_end=پایان ساعتی (UTC) برای سازگاری قدیمی
+    limit: int = 24,  # limit=حداکثر خروجی
+    work_start_min: Optional[int] = None,  # work_start_min=شروع دقیقه‌ای نسبت به نیمه‌شب UTC (می‌تواند منفی باشد)
+    work_end_min: Optional[int] = None,  # work_end_min=پایان دقیقه‌ای نسبت به نیمه‌شب UTC (می‌تواند بزرگتر از 1440 باشد)
+):
+    d = datetime.fromisoformat(date).date()  # d=تبدیل رشته تاریخ به date
+    provider = provider_phone.strip()  # provider=شماره سرویس‌دهنده
+    midnight_utc = datetime(d.year, d.month, d.day, 0, 0, tzinfo=timezone.utc)  # midnight_utc=نیمه‌شب UTC همان تاریخ
 
-    results: List[str] = []  # لیست خروجی
-    cur = day_start  # شروع
-    while cur + timedelta(hours=1) <= day_end and len(results) < limit:  # حلقه ساعتی
-        s, e = cur, cur + timedelta(hours=1)  # بازه
-        if await provider_is_free(provider, s, e):  # اگر آزاد
-            results.append(s.isoformat())  # افزودن ISO
-        cur += timedelta(hours=1)  # حرکت
-    return unified_response("ok", "FREE_HOURS", "free hourly slots", {"items": results})  # پاسخ
+    if work_start_min is not None and work_end_min is not None:  # حالت=استفاده از دقیقه (پشتیبانی آفست نیم‌ساعته)
+        day_start = midnight_utc + timedelta(minutes=int(work_start_min))  # day_start=شروع بازه با دقیقه
+        day_end = midnight_utc + timedelta(minutes=int(work_end_min))  # day_end=پایان بازه با دقیقه
+    else:  # حالت=سازگاری قدیمی (ساعت کامل UTC)
+        day_start = datetime(d.year, d.month, d.day, int(work_start), 0, tzinfo=timezone.utc)  # day_start=شروع ساعتی UTC
+        day_end = datetime(d.year, d.month, d.day, int(work_end), 0, tzinfo=timezone.utc)  # day_end=پایان ساعتی UTC
 
+    if day_end <= day_start:  # کنترل=عبور از نیمه‌شب
+        day_end = day_end + timedelta(days=1)  # افزودن=یک روز به پایان
+
+    results: List[str] = []  # results=لیست خروجی ISO
+    cur = day_start  # cur=نقطه شروع پیمایش
+    while cur + timedelta(hours=1) <= day_end and len(results) < int(limit):  # حلقه=اسلات‌های یک‌ساعته
+        s, e = cur, cur + timedelta(hours=1)  # s/e=شروع/پایان اسلات
+        if await provider_is_free(provider, s, e):  # بررسی=آزاد بودن
+            results.append(s.isoformat())  # افزودن=شروع اسلات به ISO (UTC با Offset)
+        cur += timedelta(hours=1)  # گام=یک ساعت جلو
+
+    return unified_response("ok", "FREE_HOURS", "free hourly slots", {"items": results})  # پاسخ=لیست اسلات‌ها
+    
 @app.get("/busy_slots")  # ساعات مشغول
 async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optional[int] = None):  # تابع
     d = datetime.fromisoformat(date).date()  # تاریخ
@@ -1257,3 +1275,4 @@ async def debug_users():  # تابع
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن
     return out  # بازگشت
 # -------------------- End of server/main.py --------------------
+
