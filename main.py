@@ -885,6 +885,72 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
 
     return unified_response("ok", "SLOTS_PROPOSED", "slots proposed", {"accepted": accepted})
 
+@app.post("/admin/order/{order_id}/price")  # مسیر=ثبت قیمت/توافق مدیر
+async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # تابع=ثبت قیمت و زمان اجرا
+    require_admin(request)  # احراز=اجبار مدیر بودن
+
+    sel_req = RequestTable.__table__.select().where(RequestTable.id == order_id)  # کوئری=گرفتن سفارش با id
+    req_row = await database.fetch_one(sel_req)  # اجرا=خواندن سفارش از دیتابیس
+    if not req_row:  # شرط=اگر سفارش وجود نداشت
+        raise HTTPException(status_code=404, detail="order not found")  # خطا=404 سفارش یافت نشد
+
+    exec_dt: Optional[datetime] = None  # مقدار=زمان اجرا (UTC) پیش‌فرض None
+    new_status = "PRICE_REJECTED"  # مقدار=وضعیت پیش‌فرض برای عدم توافق (خارج از لیست فعال)
+
+    if body.agree:  # شرط=اگر توافق شد
+        if not body.exec_time or not str(body.exec_time).strip():  # شرط=زمان اجرا خالی است
+            raise HTTPException(status_code=400, detail="exec_time required when agree=true")  # خطا=نیاز به زمان اجرا
+        exec_dt = parse_iso(body.exec_time)  # تبدیل=پارس ISO و تبدیل به UTC
+        new_status = "IN_PROGRESS"  # وضعیت=در حال انجام بعد از توافق
+
+    upd = (  # upd=کوئری آپدیت سفارش
+        RequestTable.__table__.update()  # update=ساخت آپدیت
+        .where(RequestTable.id == order_id)  # where=همان سفارش
+        .values(  # values=مقادیر جدید
+            price=int(body.price),  # price=ثبت قیمت جدید
+            status=new_status,  # status=ثبت وضعیت جدید
+            execution_start=exec_dt  # execution_start=ثبت زمان اجرا (UTC) یا None
+        )  # پایان values
+        .returning(  # returning=برگرداندن داده برای پاسخ
+            RequestTable.id,  # id=شناسه
+            RequestTable.price,  # price=قیمت
+            RequestTable.status,  # status=وضعیت
+            RequestTable.execution_start  # execution_start=زمان اجرا
+        )  # پایان returning
+    )  # پایان upd
+
+    saved = await database.fetch_one(upd)  # اجرا=آپدیت و گرفتن نتیجه
+
+    try:  # تلاش=ثبت اعلان برای کاربر
+        if body.agree:  # شرط=توافق
+            await notify_user(  # ثبت اعلان
+                phone=req_row["user_phone"],  # شماره=کاربر
+                title="توافق قیمت",  # عنوان=توافق
+                body=f"قیمت {int(body.price)} ثبت شد. زمان اجرا: {exec_dt.isoformat() if exec_dt else ''}",  # متن=جزئیات
+                data={"order_id": int(order_id), "status": new_status}  # دیتا=شناسه و وضعیت
+            )  # پایان notify_user
+        else:  # شرط=عدم توافق
+            await notify_user(  # ثبت اعلان
+                phone=req_row["user_phone"],  # شماره=کاربر
+                title="عدم توافق قیمت",  # عنوان=عدم توافق
+                body="قیمت مورد توافق قرار نگرفت.",  # متن=پیام
+                data={"order_id": int(order_id), "status": new_status}  # دیتا=شناسه و وضعیت
+            )  # پایان notify_user
+    except Exception:  # خطا=اگر اعلان مشکل داشت
+        pass  # عبور=بدون کرش
+
+    return unified_response(  # پاسخ=فرمت واحد
+        "ok",  # status=ok
+        "PRICE_SET",  # code=کد پاسخ
+        "price/status updated",  # message=پیام
+        {  # data=بدنه دیتا
+            "order_id": int(saved["id"]) if saved else int(order_id),  # order_id=شناسه
+            "price": int(saved["price"]) if saved else int(body.price),  # price=قیمت
+            "status": str(saved["status"]) if saved else new_status,  # status=وضعیت
+            "execution_start": (saved["execution_start"].isoformat() if (saved and saved["execution_start"]) else None)  # execution_start=ISO UTC یا None
+        }  # پایان data
+    )  # پایان unified_response
+    
 # -------------------- Confirm / Finish workflow --------------------
 
 @app.post("/order/{order_id}/confirm_slot")  # تأیید زمان توسط کاربر
@@ -1043,3 +1109,4 @@ async def debug_users():
     return out
 
 # -------------------- End of server/main.py --------------------
+
