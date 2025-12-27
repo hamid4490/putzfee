@@ -409,16 +409,21 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime) 
     rows = await database.fetch_all(q)
     return len(rows) == 0
 
-async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None):  # ثبت اعلان
-    ins = NotificationTable.__table__.insert().values(
-        user_phone=phone,
-        title=title,
-        body=body,
-        data=(data or {}),
-        read=False,
-        created_at=datetime.now(timezone.utc)
-    )
-    await database.execute(ins)
+async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None):  # ثبت اعلان + ارسال پوش به کاربر
+    ins = NotificationTable.__table__.insert().values(  # ساخت کوئری درج اعلان در دیتابیس
+        user_phone=_normalize_phone(phone),  # ذخیره شماره نرمال‌شده
+        title=title,  # عنوان اعلان
+        body=body,  # متن اعلان
+        data=(data or {}),  # دیتای اضافی
+        read=False,  # خوانده نشده
+        created_at=datetime.now(timezone.utc)  # زمان ایجاد (UTC)
+    )  # پایان values
+    await database.execute(ins)  # اجرای درج در دیتابیس
+
+    try:  # محافظ برای جلوگیری از کرش در صورت خطای پوش
+        await push_notify_user(_normalize_phone(phone), title, body, (data or {}))  # ارسال پوش به توکن‌های کاربر
+    except Exception as e:  # گرفتن هر خطا
+        logger.error(f"push notify_user failed: {e}")  # لاگ خطا
 
 # -------------------- Push helpers --------------------
 
@@ -495,20 +500,121 @@ async def get_manager_tokens() -> List[str]:
             tokens.append(t)
     return tokens
 
-async def get_user_tokens(phone: str) -> List[str]:
-    sel = DeviceTokenTable.__table__.select().where(
-        (DeviceTokenTable.role == "client") &
-        (DeviceTokenTable.user_phone == phone)
-    )
-    rows = await database.fetch_all(sel)
-    seen, tokens = set(), []
-    for r in rows:
-        t = r["token"]
-        if t and t not in seen:
-            seen.add(t)
-            tokens.append(t)
-    return tokens
+async def get_user_tokens(phone: str) -> List[str]:  # گرفتن توکن‌های کاربر
+    norm = _normalize_phone(phone)  # نرمال‌سازی شماره
+    sel = DeviceTokenTable.__table__.select().where(  # ساخت کوئری انتخاب
+        (DeviceTokenTable.role.in_(["client", "user"])) &  # نقش کاربر
+        (DeviceTokenTable.user_phone == norm)  # شماره کاربر نرمال‌شده
+    )  # پایان where
+    rows = await database.fetch_all(sel)  # اجرای کوئری
+    seen, tokens = set(), []  # مجموعه جلوگیری از تکرار + لیست خروجی
+    for r in rows:  # حلقه روی ردیف‌ها
+        t = r["token"]  # خواندن token
+        if t and t not in seen:  # توکن معتبر و غیرتکراری
+            seen.add(t)  # افزودن به seen
+            tokens.append(t)  # افزودن به خروجی
+    return tokens  # بازگشت لیست
+    
+def _to_fcm_data(data: dict) -> dict:  # تبدیل data به رشته برای FCM
+    out = {}  # دیکشنری خروجی
+    for k, v in (data or {}).items():  # حلقه روی کلید/مقدارها
+        if v is None:  # مقدار None
+            continue  # رد کردن
+        out[str(k)] = str(v)  # تبدیل به string
+    return out  # بازگشت دیکشنری
 
+async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict):  # ارسال با FCM Legacy
+    if not tokens:  # بدون توکن
+        return  # خروج
+    if not FCM_SERVER_KEY:  # نبودن کلید legacy
+        logger.error("FCM_SERVER_KEY is empty")  # لاگ خطا
+        return  # خروج
+
+    headers = {  # هدرهای درخواست
+        "Authorization": f"key={FCM_SERVER_KEY}",  # هدر Authorization با کلید سرور
+        "Content-Type": "application/json"  # نوع محتوا
+    }  # پایان headers
+
+    payload = {  # بدنه درخواست legacy
+        "registration_ids": tokens,  # لیست توکن‌ها
+        "notification": {  # بخش notification
+            "title": title,  # عنوان
+            "body": body  # متن
+        },  # پایان notification
+        "data": _to_fcm_data(data)  # بخش data (همه رشته)
+    }  # پایان payload
+
+    async with httpx.AsyncClient(timeout=10.0) as client:  # کلاینت async برای HTTP
+        resp = await client.post(  # ارسال POST
+            "https://fcm.googleapis.com/fcm/send",  # آدرس legacy
+            headers=headers,  # هدرها
+            json=payload  # بدنه json
+        )  # پایان post
+
+    if resp.status_code != 200:  # وضعیت ناموفق
+        logger.error(f"FCM legacy send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ خطا
+
+async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict):  # ارسال با FCM HTTP v1 برای یک توکن
+    access = _get_oauth2_token_for_fcm()  # گرفتن OAuth token
+    if not access:  # نبودن توکن OAuth
+        logger.error("FCM v1 oauth token not available")  # لاگ خطا
+        return  # خروج
+
+    headers = {  # هدرهای درخواست v1
+        "Authorization": f"Bearer {access}",  # Bearer token
+        "Content-Type": "application/json"  # نوع محتوا
+    }  # پایان headers
+
+    msg = {  # بدنه پیام v1
+        "message": {  # message
+            "token": token,  # توکن مقصد
+            "notification": {  # notification
+                "title": title,  # عنوان
+                "body": body  # متن
+            },  # پایان notification
+            "data": _to_fcm_data(data)  # data رشته‌ای
+        }  # پایان message
+    }  # پایان msg
+
+    url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"  # آدرس v1 با project id
+
+    async with httpx.AsyncClient(timeout=10.0) as client:  # کلاینت async
+        resp = await client.post(url, headers=headers, json=msg)  # ارسال POST
+
+    if resp.status_code not in (200, 201):  # وضعیت ناموفق
+        logger.error(f"FCM v1 send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ خطا
+
+async def push_notify_user(user_phone: str, title: str, body: str, data: dict):  # ارسال پوش به کاربر بر اساس توکن‌های ذخیره‌شده
+    phone = _normalize_phone(user_phone)  # نرمال‌سازی شماره
+    tokens = await get_user_tokens(phone)  # گرفتن توکن‌های کاربر
+    if not tokens:  # نبود توکن
+        logger.info(f"no user tokens for phone={phone}")  # لاگ عدم وجود توکن
+        return  # خروج
+
+    if PUSH_BACKEND == "fcm":  # انتخاب بک‌اند FCM
+        if FCM_PROJECT_ID and (_load_service_account() is not None):  # امکان v1
+            for t in tokens:  # حلقه روی توکن‌ها
+                await _send_fcm_v1_single(t, title, body, data)  # ارسال v1 تک‌به‌تک
+            return  # خروج
+        await _send_fcm_legacy(tokens, title, body, data)  # ارسال legacy
+        return  # خروج
+
+    if PUSH_BACKEND == "ntfy":  # بک‌اند ntfy
+        base = (NTFY_BASE_URL or "https://ntfy.sh").strip()  # آدرس پایه
+        headers = {}  # هدرها
+        if NTFY_AUTH:  # داشتن auth
+            headers["Authorization"] = NTFY_AUTH  # ست کردن هدر auth
+        async with httpx.AsyncClient(timeout=10.0) as client:  # کلاینت async
+            for topic in tokens:  # در ntfy توکن به‌عنوان topic استفاده می‌شود
+                await client.post(  # ارسال POST
+                    f"{base}/{topic}",  # مسیر topic
+                    headers=headers,  # هدرها
+                    data=body.encode("utf-8")  # متن
+                )  # پایان post
+        return  # خروج
+
+    logger.error(f"unknown PUSH_BACKEND={PUSH_BACKEND}")  # لاگ بک‌اند ناشناخته
+    
 # -------------------- App & CORS --------------------
 
 app = FastAPI()
@@ -595,36 +701,37 @@ async def logout_user(body: LogoutRequest):
 # -------------------- Push endpoints --------------------
 
 @app.post("/push/register")  # ثبت توکن پوش
-async def register_push_token(body: PushRegister, request: Request):
-    now = datetime.now(timezone.utc)
-    sel = DeviceTokenTable.__table__.select().where(
-        DeviceTokenTable.token == body.token
-    )
-    row = await database.fetch_one(sel)
+async def register_push_token(body: PushRegister, request: Request):  # تابع ثبت توکن
+    now = datetime.now(timezone.utc)  # زمان فعلی UTC
+    norm_phone = _normalize_phone(body.user_phone) if body.user_phone else None  # نرمال‌سازی شماره (nullable)
+    sel = DeviceTokenTable.__table__.select().where(  # کوئری انتخاب بر اساس token
+        DeviceTokenTable.token == body.token  # شرط=توکن برابر
+    )  # پایان where
+    row = await database.fetch_one(sel)  # اجرای کوئری و گرفتن ردیف
 
-    if row is None:
-        ins = DeviceTokenTable.__table__.insert().values(
-            token=body.token,
-            role=body.role,
-            platform=body.platform,
-            user_phone=body.user_phone,
-            created_at=now,
-            updated_at=now
-        )
-        await database.execute(ins)
-    else:
-        upd = DeviceTokenTable.__table__.update().where(
-            DeviceTokenTable.id == row["id"]
-        ).values(
-            role=body.role,
-            platform=body.platform,
-            user_phone=body.user_phone or row["user_phone"],
-            updated_at=now
-        )
-        await database.execute(upd)
+    if row is None:  # نبودن رکورد قبلی
+        ins = DeviceTokenTable.__table__.insert().values(  # ساخت insert
+            token=body.token,  # توکن
+            role=body.role,  # نقش
+            platform=body.platform,  # پلتفرم
+            user_phone=norm_phone,  # شماره نرمال (یا None)
+            created_at=now,  # زمان ایجاد
+            updated_at=now  # زمان به‌روزرسانی
+        )  # پایان values
+        await database.execute(ins)  # اجرای insert
+    else:  # داشتن رکورد قبلی
+        upd = DeviceTokenTable.__table__.update().where(  # ساخت update
+            DeviceTokenTable.id == row["id"]  # شرط=همان رکورد
+        ).values(  # values=مقادیر جدید
+            role=body.role,  # نقش جدید
+            platform=body.platform,  # پلتفرم
+            user_phone=(norm_phone or row["user_phone"]),  # شماره نرمال یا حفظ قبلی
+            updated_at=now  # زمان به‌روزرسانی
+        )  # پایان values
+        await database.execute(upd)  # اجرای update
 
-    return unified_response("ok", "TOKEN_REGISTERED", "registered", {"role": body.role})
-
+    return unified_response("ok", "TOKEN_REGISTERED", "registered", {"role": body.role})  # پاسخ
+    
 @app.post("/push/unregister")  # لغو ثبت توکن پوش
 async def unregister_push_token(body: PushUnregister):
     delq = DeviceTokenTable.__table__.delete().where(
@@ -1109,4 +1216,5 @@ async def debug_users():
     return out
 
 # -------------------- End of server/main.py --------------------
+
 
