@@ -979,7 +979,7 @@ async def get_free_hours(  # تابع=گرفتن اسلات‌های آزاد
         cur += timedelta(hours=1)  # گام=یک ساعت جلو
 
     return unified_response("ok", "FREE_HOURS", "free hourly slots", {"items": results})  # پاسخ=لیست اسلات‌ها
-    
+
 @app.get("/busy_slots")  # ساعات مشغول
 async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optional[int] = None):  # تابع
     d = datetime.fromisoformat(date).date()  # تاریخ
@@ -1060,7 +1060,13 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
                     phone=req["user_phone"],
                     title="پیشنهاد زمان",
                     body="زمان‌های پیشنهادی برای سفارش شما ثبت شد. لطفاً یکی را تأیید کنید.",
-                    data={"order_id": int(order_id), "status": "WAITING", "accepted": ",".join(accepted), "provider_phone": _normalize_phone(provider)}
+                    data={  # data=داده‌های لازم برای کلاینت (به همراه type جهت تریگر رفرش)
+                        "type": "visit_slots",  # type=سیگنال رویداد به کلاینت برای صفحه انتظار
+                        "order_id": int(order_id),  # order_id=شناسه سفارش
+                        "status": "WAITING",  # status=وضعیت سفارش
+                        "accepted": ",".join(accepted),  # accepted=لیست زمان‌ها به‌صورت رشته
+                        "provider_phone": _normalize_phone(provider)  # provider_phone=شماره سرویس‌دهنده
+                    }
                 )
         except Exception as e:  # خطا
             logger.error(f"notify_user(propose_slots) failed: {e}")  # لاگ
@@ -1231,6 +1237,65 @@ async def finish_order(order_id: int, request: Request):  # تابع
 
     return unified_response("ok", "ORDER_FINISHED", "order finished", {"order_id": order_id, "status": "FINISH"})  # پاسخ
 
+# -------------------- New endpoints for user app scheduling --------------------
+
+@app.get("/order/{order_id}/proposed_slots")  # اندپوینت=گرفتن لیست زمان‌های پیشنهادی کاربر
+async def get_proposed_slots(order_id: int, request: Request):  # تابع=بازگرداندن لیست ISO
+    sel_req = RequestTable.__table__.select().where(RequestTable.id == order_id)  # select=سفارش
+    req = await database.fetch_one(sel_req)  # اجرا=خواندن
+    if not req:  # اگر=سفارشی نبود
+        raise HTTPException(status_code=404, detail="order not found")  # 404=یافت نشد
+    _ = get_auth_phone(request, fallback_phone=req["user_phone"], enforce=False)  # احراز=تطبیق کاربر
+    if _ != req["user_phone"]:  # تطابق=بررسی
+        raise HTTPException(status_code=403, detail="forbidden")  # 403=عدم دسترسی
+
+    sel = ScheduleSlotTable.__table__.select().where(  # select=اسلات‌ها
+        (ScheduleSlotTable.request_id == order_id) &  # شرط=شناسه سفارش
+        (ScheduleSlotTable.status == "PROPOSED")  # شرط=وضعیت پیشنهادی
+    ).order_by(ScheduleSlotTable.slot_start.asc())  # مرتب‌سازی=صعودی بر اساس زمان
+    rows = await database.fetch_all(sel)  # اجرا
+    items = [r["slot_start"].isoformat() for r in rows]  # لیست=ISO
+    return unified_response("ok", "PROPOSED_SLOTS", "proposed slots", {"items": items})  # پاسخ=داده
+
+@app.post("/order/{order_id}/reject_all_and_cancel")  # اندپوینت=رد همه اسلات‌ها و کنسل سفارش توسط کاربر
+async def reject_all_and_cancel(order_id: int, request: Request):  # تابع=لغو
+    sel_req = RequestTable.__table__.select().where(RequestTable.id == order_id)  # select=سفارش
+    req = await database.fetch_one(sel_req)  # اجرا=گرفتن سفارش
+    if not req:  # نبودن سفارش
+        raise HTTPException(status_code=404, detail="order not found")  # 404
+    authed = get_auth_phone(request, fallback_phone=req["user_phone"], enforce=False)  # احراز=شماره
+    if authed != req["user_phone"]:  # تطبیق=بررسی
+        raise HTTPException(status_code=403, detail="forbidden")  # 403
+
+    # رد کردن تمام اسلات‌های درحال پیشنهاد یا پذیرفته‌شده (پاکسازی)
+    await database.execute(  # update=REJECTED
+        ScheduleSlotTable.__table__.update()
+        .where(
+            (ScheduleSlotTable.request_id == order_id) &
+            (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))
+        )
+        .values(status="REJECTED")
+    )
+
+    # کنسل کردن خود سفارش
+    await database.execute(  # update=سفارش
+        RequestTable.__table__.update()
+        .where(RequestTable.id == order_id)
+        .values(status="CANCELED", scheduled_start=None)
+    )
+
+    # اعلان‌ها برای مدیر/سرویس‌دهنده (اختیاری)
+    try:  # try=محافظ
+        await notify_managers(  # اعلان به مدیر
+            title="لغو سفارش",  # عنوان
+            body=f"سفارش {order_id} توسط کاربر لغو شد.",  # متن
+            data={"order_id": int(order_id), "status": "CANCELED", "user_phone": _normalize_phone(req["user_phone"])}  # دیتا
+        )
+    except Exception as e:  # catch=خطا
+        logger.error(f"notify_managers(reject_all_and_cancel) failed: {e}")  # لاگ
+
+    return unified_response("ok", "ORDER_CANCELED", "order canceled", {"order_id": int(order_id)})  # پاسخ=موفق
+
 # -------------------- Profile --------------------
 
 @app.post("/user/profile")  # ذخیره پروفایل
@@ -1275,4 +1340,3 @@ async def debug_users():  # تابع
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن
     return out  # بازگشت
 # -------------------- End of server/main.py --------------------
-
