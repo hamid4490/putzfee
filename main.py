@@ -88,7 +88,7 @@ if not logger.handlers:  # اگر هندلر ثبت نشده
 logger.setLevel(logging.INFO)  # سطح لاگ
 
 # -------------------- Database --------------------
-database = Database(DATABASE_URL)  # اتصال async
+database = Database(DATABASE_URL)  # اتصال async DB
 Base = declarative_base()  # Base ORM
 
 # -------------------- Time helpers (UTC ONLY) --------------------
@@ -1109,14 +1109,25 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # 
                 phone=req_row["user_phone"],
                 title="توافق قیمت",
                 body=f"قیمت {int(body.price)} ثبت شد. زمان اجرا: {exec_dt.isoformat() if exec_dt else ''}",
-                data={"order_id": int(order_id), "status": new_status, "price": int(body.price), "execution_start": exec_dt.isoformat() if exec_dt else ""}
+                data={  # data=دیتا برای کلاینت
+                    "type": "execution_time",  # type=برای کلاینت (نمایش زمان اجرا/قیمت در انتظار)
+                    "order_id": int(order_id),  # order_id=شناسه سفارش
+                    "status": new_status,  # status=وضعیت جدید
+                    "price": int(body.price),  # price=قیمت
+                    "execution_start": exec_dt.isoformat() if exec_dt else ""  # execution_start=زمان اجرا ISO
+                }  # پایان data
             )
         else:  # عدم توافق
             await notify_user(
                 phone=req_row["user_phone"],
                 title="عدم توافق قیمت",
                 body="قیمت مورد توافق قرار نگرفت.",
-                data={"order_id": int(order_id), "status": new_status, "price": int(body.price)}
+                data={  # data=دیتا برای کلاینت
+                    "type": "price_set",  # type=برای کلاینت (رفرش/نمایش پیام در انتظار)
+                    "order_id": int(order_id),  # order_id=شناسه سفارش
+                    "status": new_status,  # status=وضعیت جدید
+                    "price": int(body.price)  # price=قیمت
+                }  # پایان data
             )
     except Exception as e:  # خطا
         logger.error(f"notify_user(admin_set_price) failed: {e}")  # لاگ
@@ -1189,7 +1200,13 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest):  # تابع
                 phone=req["user_phone"],
                 title="زمان تأیید شد",
                 body="زمان انتخابی شما ثبت شد.",
-                data={"order_id": int(order_id), "status": "ASSIGNED", "scheduled_start": start.isoformat(), "provider_phone": _normalize_phone(slot["provider_phone"])}
+                data={  # data=دیتا برای کلاینت
+                    "type": "time_confirm",  # type=برای کلاینت (تأیید زمان)
+                    "order_id": int(order_id),  # order_id=شناسه
+                    "status": "ASSIGNED",  # status=وضعیت
+                    "scheduled_start": start.isoformat(),  # scheduled_start=زمان تایید شده
+                    "provider_phone": _normalize_phone(slot["provider_phone"])  # provider_phone=شماره سرویس‌دهنده
+                }  # پایان data
             )
         await notify_managers(  # اعلان به مدیر/سرویس‌دهنده
             title="تأیید زمان توسط کاربر",
@@ -1224,7 +1241,7 @@ async def finish_order(order_id: int, request: Request):  # تابع
             phone=req["user_phone"],
             title="اتمام کار",
             body="سفارش شما انجام شد.",
-            data={"order_id": int(order_id), "status": "FINISH"}
+            data={"type": "work_finished", "order_id": int(order_id), "status": "FINISH"}  # data=افزودن type برای کلاینت
         )
         await notify_managers(  # اعلان به مدیرها
             title="اتمام کار ثبت شد",
@@ -1247,7 +1264,6 @@ async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغ�
     if not req:  # نبودن سفارش
         raise HTTPException(status_code=404, detail="order not found")  # 404
 
-    # آپدیت وضعیت سفارش
     upd_req = (  # update=سفارش
         RequestTable.__table__.update()  # update
         .where(RequestTable.id == order_id)  # where=id
@@ -1256,7 +1272,6 @@ async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغ�
     )  # پایان upd_req
     saved = await database.fetch_one(upd_req)  # اجرا=آپدیت و گرفتن خروجی
 
-    # رد کردن اسلات‌های پیشنهادی/پذیرفته‌شده مربوط به این سفارش
     await database.execute(  # اجرا=آپدیت اسلات‌ها
         ScheduleSlotTable.__table__.update()  # update
         .where(  # where
@@ -1266,7 +1281,6 @@ async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغ�
         .values(status="REJECTED")  # values=رد شده
     )  # پایان execute
 
-    # آزاد کردن وقت رزرو شده (appointment) با تغییر وضعیت از BOOKED
     await database.execute(  # اجرا=آپدیت appointment
         AppointmentTable.__table__.update()  # update
         .where(  # where
@@ -1276,7 +1290,6 @@ async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغ�
         .values(status="CANCELED")  # values=لغو
     )  # پایان execute
 
-    # اعلان‌ها
     try:  # try=محافظ
         user_phone = (saved["user_phone"] if saved else req["user_phone"])  # user_phone=شماره کاربر
         driver_phone = (saved["driver_phone"] if saved else req.get("driver_phone")) or ""  # driver_phone=شماره سرویس‌دهنده
@@ -1286,7 +1299,7 @@ async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغ�
             phone=user_phone,  # phone=کاربر
             title="لغو سفارش",  # title=عنوان
             body="سفارش شما توسط مدیر لغو شد.",  # body=متن
-            data={"order_id": int(order_id), "status": "CANCELED", "service_type": str(service_type)}  # data=داده
+            data={"type": "order_canceled", "order_id": int(order_id), "status": "CANCELED", "service_type": str(service_type)}  # data=افزودن type برای کلاینت
         )  # پایان notify_user
 
         await notify_managers(  # اعلان به مدیر/سرویس‌دهنده
@@ -1299,6 +1312,7 @@ async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغ�
         logger.error(f"notify(admin_cancel_order) failed: {e}")  # لاگ
 
     return unified_response("ok", "ORDER_CANCELED", "order canceled by admin", {"order_id": int(order_id), "status": "CANCELED"})  # پاسخ
+
 # -------------------- New endpoints for user app scheduling --------------------
 
 @app.get("/order/{order_id}/proposed_slots")  # اندپوینت=گرفتن لیست زمان‌های پیشنهادی کاربر
@@ -1329,7 +1343,6 @@ async def reject_all_and_cancel(order_id: int, request: Request):  # تابع=ل
     if authed != req["user_phone"]:  # تطبیق=بررسی
         raise HTTPException(status_code=403, detail="forbidden")  # 403
 
-    # رد کردن تمام اسلات‌های درحال پیشنهاد یا پذیرفته‌شده (پاکسازی)
     await database.execute(  # update=REJECTED
         ScheduleSlotTable.__table__.update()
         .where(
@@ -1339,14 +1352,12 @@ async def reject_all_and_cancel(order_id: int, request: Request):  # تابع=ل
         .values(status="REJECTED")
     )
 
-    # کنسل کردن خود سفارش
     await database.execute(  # update=سفارش
         RequestTable.__table__.update()
         .where(RequestTable.id == order_id)
         .values(status="CANCELED", scheduled_start=None)
     )
 
-    # اعلان‌ها برای مدیر/سرویس‌دهنده (اختیاری)
     try:  # try=محافظ
         await notify_managers(  # اعلان به مدیر
             title="لغو سفارش",  # عنوان
@@ -1401,5 +1412,5 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن
     return out  # بازگشت
-# -------------------- End of server/main.py --------------------
 
+# -------------------- End of server/main.py --------------------
