@@ -666,6 +666,24 @@ app.add_middleware(  # افزودن middleware
     allow_methods=["*"],  # همه متدها
     allow_headers=["*"],  # همه هدرها
 )  # پایان middleware
+# ------------------# -------------------- Admin workflow (alias fix) --------------------  # بخش=ادمین (رفع 404 با alias)
+@app.get("/admin/requests/active")  # مسیر=لیست درخواست‌های فعال مدیر (بدون اسلش)
+@app.get("/admin/requests/active/")  # مسیر=لیست درخواست‌های فعال مدیر (با اسلش)  # توضیح=پوشش هر دو حالت
+async def admin_active_requests(request: Request):  # تابع=درخواست‌های فعال
+    require_admin(request)  # احراز=مدیر
+    active = ["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]  # active=وضعیت‌های فعال
+    sel = RequestTable.__table__.select().where(RequestTable.status.in_(active)).order_by(RequestTable.id.desc())  # sel=کوئری انتخاب
+    rows = await database.fetch_all(sel)  # rows=اجرای کوئری
+    return unified_response("ok", "ACTIVE_REQUESTS", "active requests", {"items": [dict(r) for r in rows]})  # پاسخ=لیست-- Debug: list routes --------------------  # بخش=دیباگ لیست مسیرها
+@app.get("/debug/routes")  # مسیر=لیست مسیرهای ثبت‌شده
+def debug_routes():  # تابع=بازگرداندن مسیرها
+    out = []  # out=لیست خروجی
+    for r in app.router.routes:  # حلقه=روی تمام routeها
+        path = getattr(r, "path", "")  # path=مسیر
+        methods = sorted(list(getattr(r, "methods", []) or []))  # methods=متدها
+        name = getattr(r, "name", "")  # name=نام
+        out.append({"path": path, "methods": methods, "name": name})  # افزودن=آیتم
+    return {"items": out}  # پاسخ=لیست
 
 # -------------------- Startup / Shutdown --------------------
 
@@ -1454,6 +1472,7 @@ async def debug_users():  # تابع
     return out  # بازگشت
 
 # -------------------- End of server/main.py --------------------
+
 
 
 
