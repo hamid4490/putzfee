@@ -843,6 +843,39 @@ async def login_user(user: UserLoginRequest, request: Request):  # تابع
         }  # پایان user
     }  # پایان پاسخ
 
+# -------------------- Cars --------------------  # بخش=مدیریت ماشین‌ها
+
+@app.get("/user_cars/{user_phone}")  # مسیر=گرفتن لیست ماشین‌های کاربر
+async def get_user_cars(user_phone: str, request: Request):  # تابع=گرفتن ماشین‌ها
+    auth_phone = get_auth_phone(request, fallback_phone=user_phone, enforce=False)  # احراز=گرفتن شماره از توکن یا سازگاری
+    if auth_phone != user_phone:  # شرط=عدم تطابق شماره
+        raise HTTPException(status_code=403, detail="forbidden")  # خطا=عدم دسترسی
+
+    sel = UserTable.__table__.select().where(UserTable.phone == user_phone)  # select=یافتن کاربر با شماره
+    user = await database.fetch_one(sel)  # اجرا=گرفتن یک رکورد
+    if not user:  # شرط=کاربر نبود
+        raise HTTPException(status_code=404, detail="User not found")  # خطا=یافت نشد
+
+    cars = user["car_list"] or []  # cars=لیست ماشین‌ها یا لیست خالی
+    return unified_response("ok", "USER_CARS", "cars list", {"items": cars})  # پاسخ=لیست ماشین‌ها
+
+@app.post("/")  # مسیر=به‌روزرسانی لیست ماشین‌های کاربر
+async def update_user_cars(body: CarListUpdateRequest, request: Request):  # تابع=آپدیت ماشین‌ها
+    auth_phone = get_auth_phone(request, fallback_phone=body.user_phone, enforce=False)  # احراز=تطبیق شماره کاربر
+    if auth_phone != body.user_phone:  # شرط=عدم تطابق شماره
+        raise HTTPException(status_code=403, detail="forbidden")  # خطا=عدم دسترسی
+
+    sel = UserTable.__table__.select().where(UserTable.phone == body.user_phone)  # select=یافتن کاربر
+    user = await database.fetch_one(sel)  # اجرا=گرفتن رکورد
+    if not user:  # شرط=کاربر نبود
+        raise HTTPException(status_code=404, detail="User not found")  # خطا=یافت نشد
+
+    cars_payload = [c.dict() for c in body.car_list]  # تبدیل=لیست مدل‌ها به دیکشنری‌های قابل ذخیره
+    upd = UserTable.__table__.update().where(UserTable.phone == body.user_phone).values(car_list=cars_payload)  # update=ست کردن car_list جدید
+    await database.execute(upd)  # اجرا=آپدیت دیتابیس
+
+    return unified_response("ok", "USER_CARS_UPDATED", "cars updated", {"count": len(cars_payload)})  # پاسخ=موفق + تعداد
+    
 # -------------------- Orders --------------------
 
 @app.post("/order")  # ثبت سفارش
@@ -1458,3 +1491,4 @@ async def debug_users():  # تابع
     return out  # بازگشت
 
 # -------------------- End of server/main.py --------------------
+
