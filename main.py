@@ -1238,66 +1238,67 @@ async def finish_order(order_id: int, request: Request):  # تابع
     return unified_response("ok", "ORDER_FINISHED", "order finished", {"order_id": order_id, "status": "FINISH"})  # پاسخ
 
 # -------------------- Admin cancel order (NEW) --------------------
-
 @app.post("/admin/order/{order_id}/cancel")  # اندپوینت=لغو سفارش توسط مدیر
-async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغو مدیر
+async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغو سفارش
     require_admin(request)  # احراز=مدیر
 
     sel_req = RequestTable.__table__.select().where(RequestTable.id == order_id)  # select=سفارش
-    req = await database.fetch_one(sel_req)  # اجرا=خواندن سفارش
-    if not req:  # اگر نبود
+    req = await database.fetch_one(sel_req)  # اجرا=گرفتن سفارش
+    if not req:  # نبودن سفارش
         raise HTTPException(status_code=404, detail="order not found")  # 404
 
-    # رد کردن تمام اسلات‌های پیشنهادی/پذیرفته‌شده برای این سفارش
-    await database.execute(  # update=ScheduleSlot
-        ScheduleSlotTable.__table__.update()  # update=جدول اسلات‌ها
-        .where(  # where=شرط‌ها
-            (ScheduleSlotTable.request_id == order_id) &  # شرط=شناسه سفارش
-            (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))  # شرط=وضعیت‌های فعال
+    # آپدیت وضعیت سفارش
+    upd_req = (  # update=سفارش
+        RequestTable.__table__.update()  # update
+        .where(RequestTable.id == order_id)  # where=id
+        .values(status="CANCELED", scheduled_start=None, execution_start=None)  # values=لغو + پاکسازی زمان‌ها
+        .returning(RequestTable.user_phone, RequestTable.driver_phone, RequestTable.service_type)  # returning=اطلاعات لازم
+    )  # پایان upd_req
+    saved = await database.fetch_one(upd_req)  # اجرا=آپدیت و گرفتن خروجی
+
+    # رد کردن اسلات‌های پیشنهادی/پذیرفته‌شده مربوط به این سفارش
+    await database.execute(  # اجرا=آپدیت اسلات‌ها
+        ScheduleSlotTable.__table__.update()  # update
+        .where(  # where
+            (ScheduleSlotTable.request_id == order_id) &  # شرط=این سفارش
+            (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))  # شرط=فعال
         )  # پایان where
         .values(status="REJECTED")  # values=رد شده
-    )  # پایان update
+    )  # پایان execute
 
-    # کنسل کردن appointment رزرو شده (در صورت وجود)
-    await database.execute(  # update=Appointment
-        AppointmentTable.__table__.update()  # update=جدول رزرو
-        .where(  # where=شرط‌ها
-            (AppointmentTable.request_id == order_id) &  # شرط=شناسه سفارش
-            (AppointmentTable.status == "BOOKED")  # شرط=رزرو فعال
+    # آزاد کردن وقت رزرو شده (appointment) با تغییر وضعیت از BOOKED
+    await database.execute(  # اجرا=آپدیت appointment
+        AppointmentTable.__table__.update()  # update
+        .where(  # where
+            (AppointmentTable.request_id == order_id) &  # شرط=این سفارش
+            (AppointmentTable.status == "BOOKED")  # شرط=رزرو شده
         )  # پایان where
-        .values(status="CANCELED")  # values=کنسل
-    )  # پایان update
-
-    # آپدیت خود سفارش
-    await database.execute(  # update=Request
-        RequestTable.__table__.update()  # update=جدول سفارش‌ها
-        .where(RequestTable.id == order_id)  # where=شناسه سفارش
-        .values(  # values=مقادیر جدید
-            status="CANCELED",  # status=لغو شده
-            scheduled_start=None,  # scheduled_start=پاکسازی
-            execution_start=None  # execution_start=پاکسازی
-        )  # پایان values
-    )  # پایان update
+        .values(status="CANCELED")  # values=لغو
+    )  # پایان execute
 
     # اعلان‌ها
     try:  # try=محافظ
-        await notify_user(  # notify_user=اعلان به کاربر
-            phone=req["user_phone"],  # phone=شماره کاربر
+        user_phone = (saved["user_phone"] if saved else req["user_phone"])  # user_phone=شماره کاربر
+        driver_phone = (saved["driver_phone"] if saved else req.get("driver_phone")) or ""  # driver_phone=شماره سرویس‌دهنده
+        service_type = (saved["service_type"] if saved else req.get("service_type")) or ""  # service_type=نوع سرویس
+
+        await notify_user(  # اعلان به کاربر
+            phone=user_phone,  # phone=کاربر
             title="لغو سفارش",  # title=عنوان
             body="سفارش شما توسط مدیر لغو شد.",  # body=متن
-            data={"order_id": int(order_id), "status": "CANCELED"}  # data=اطلاعات
+            data={"order_id": int(order_id), "status": "CANCELED", "service_type": str(service_type)}  # data=داده
         )  # پایان notify_user
-        await notify_managers(  # notify_managers=اعلان به مدیرها/سرویس‌دهنده
+
+        await notify_managers(  # اعلان به مدیر/سرویس‌دهنده
             title="لغو سفارش توسط مدیر",  # title=عنوان
             body=f"سفارش {order_id} لغو شد.",  # body=متن
-            data={"order_id": int(order_id), "status": "CANCELED", "user_phone": _normalize_phone(req["user_phone"])},  # data=اطلاعات
-            target_phone=_normalize_phone(req.get("driver_phone") or "")  # target_phone=ارسال هدفمند به سرویس‌دهنده
+            data={"order_id": int(order_id), "status": "CANCELED", "service_type": str(service_type)},  # data=داده
+            target_phone=_normalize_phone(driver_phone)  # target_phone=هدف (سرویس‌دهنده)
         )  # پایان notify_managers
     except Exception as e:  # خطا
         logger.error(f"notify(admin_cancel_order) failed: {e}")  # لاگ
 
     return unified_response("ok", "ORDER_CANCELED", "order canceled by admin", {"order_id": int(order_id), "status": "CANCELED"})  # پاسخ
-
 # -------------------- New endpoints for user app scheduling --------------------
 
 @app.get("/order/{order_id}/proposed_slots")  # اندپوینت=گرفتن لیست زمان‌های پیشنهادی کاربر
@@ -1401,3 +1402,4 @@ async def debug_users():  # تابع
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن
     return out  # بازگشت
 # -------------------- End of server/main.py --------------------
+
