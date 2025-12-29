@@ -88,7 +88,7 @@ if not logger.handlers:  # اگر هندلر ثبت نشده
 logger.setLevel(logging.INFO)  # سطح لاگ
 
 # -------------------- Database --------------------
-database = Database(DATABASE_URL)  # اتصال async DB
+database = Database(DATABASE_URL)  # اتصال async
 Base = declarative_base()  # Base ORM
 
 # -------------------- Time helpers (UTC ONLY) --------------------
@@ -886,20 +886,44 @@ async def cancel_order(cancel: CancelRequest, request: Request):  # تابع
     if auth_phone != cancel.user_phone:  # اگر mismatch
         raise HTTPException(status_code=403, detail="forbidden")  # 403
 
+    # مرحله ۵: اجازه لغو فقط قبل از تعیین execution_start (پس از توافق قیمت لغو کاربر ممنوع)  # توضیح=قفل لغو
     upd = (  # update
         RequestTable.__table__.update()  # update
         .where(  # where
             (RequestTable.user_phone == cancel.user_phone) &  # user_phone
             (RequestTable.service_type == cancel.service_type) &  # service_type
-            (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]))  # فعال‌ها
+            (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED"])) &  # فعال‌های قابل لغو
+            (RequestTable.execution_start.is_(None))  # execution_start=None یعنی هنوز زمان اجرا ثبت نشده
         )  # پایان where
-        .values(status="CANCELED", scheduled_start=None)  # values
+        .values(status="CANCELED", scheduled_start=None, execution_start=None)  # values=لغو + پاکسازی زمان‌ها
         .returning(RequestTable.id, RequestTable.driver_phone)  # returning
     )  # پایان upd
     rows = await database.fetch_all(upd)  # اجرا
     if rows:  # اگر داشت
         ids = [int(r["id"]) for r in rows]  # لیست id
         driver_phones = list({(r["driver_phone"] or "").strip() for r in rows if r["driver_phone"]})  # شماره‌های سرویس‌دهنده
+
+        # مرحله ۵: پاکسازی اسلات‌ها و appointment برای جلوگیری از بلوکه شدن زمان‌ها  # توضیح=رفع تداخل زمان
+        try:  # try
+            await database.execute(  # آپدیت اسلات‌ها
+                ScheduleSlotTable.__table__.update()  # update
+                .where(  # where
+                    (ScheduleSlotTable.request_id.in_(ids)) &  # شرط=request_id در ids
+                    (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))  # شرط=فعال
+                )  # پایان where
+                .values(status="REJECTED")  # values=رد شده
+            )  # پایان execute
+            await database.execute(  # آپدیت appointment
+                AppointmentTable.__table__.update()  # update
+                .where(  # where
+                    (AppointmentTable.request_id.in_(ids)) &  # شرط=request_id در ids
+                    (AppointmentTable.status == "BOOKED")  # شرط=رزرو شده
+                )  # پایان where
+                .values(status="CANCELED")  # values=لغو شده
+            )  # پایان execute
+        except Exception as e:  # خطا
+            logger.error(f"cleanup(cancel_order) failed: {e}")  # لاگ
+
         try:  # محافظ نوتیف مدیر
             await notify_managers(  # ارسال به مدیرها
                 title="لغو سفارش",  # عنوان
@@ -917,7 +941,8 @@ async def cancel_order(cancel: CancelRequest, request: Request):  # تابع
             logger.error(f"notify_managers(cancel_order) failed: {e}")  # لاگ
         return unified_response("ok", "ORDER_CANCELED", "canceled", {"count": len(rows)})  # پاسخ
 
-    raise HTTPException(status_code=404, detail="active order not found")  # 404
+    # مرحله ۵: حالت عدم امکان لغو را 409 برگردان تا کلاینت بفهمد لغو مجاز نیست  # توضیح=قفل لغو
+    raise HTTPException(status_code=409, detail={"code": "CANNOT_CANCEL", "message": "order cannot be canceled at this stage"})  # 409
 
 @app.get("/user_active_services/{user_phone}")  # سرویس‌های فعال کاربر
 async def get_user_active_services(user_phone: str, request: Request):  # تابع
@@ -1060,11 +1085,11 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
                     phone=req["user_phone"],
                     title="پیشنهاد زمان",
                     body="زمان‌های پیشنهادی برای سفارش شما ثبت شد. لطفاً یکی را تأیید کنید.",
-                    data={  # data=داده‌های لازم برای کلاینت (به همراه type جهت تریگر رفرش)
-                        "type": "visit_slots",  # type=سیگنال رویداد به کلاینت برای صفحه انتظار
+                    data={  # data=داده‌های لازم برای کلاینت
+                        "type": "visit_slots",  # type=سیگنال رویداد
                         "order_id": int(order_id),  # order_id=شناسه سفارش
                         "status": "WAITING",  # status=وضعیت سفارش
-                        "accepted": ",".join(accepted),  # accepted=لیست زمان‌ها به‌صورت رشته
+                        "accepted": ",".join(accepted),  # accepted=لیست زمان‌ها رشته‌ای
                         "provider_phone": _normalize_phone(provider)  # provider_phone=شماره سرویس‌دهنده
                     }
                 )
@@ -1109,25 +1134,25 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # 
                 phone=req_row["user_phone"],
                 title="توافق قیمت",
                 body=f"قیمت {int(body.price)} ثبت شد. زمان اجرا: {exec_dt.isoformat() if exec_dt else ''}",
-                data={  # data=دیتا برای کلاینت
-                    "type": "execution_time",  # type=برای کلاینت (نمایش زمان اجرا/قیمت در انتظار)
+                data={  # data=داده‌های لازم برای کلاینت
+                    "type": "execution_time",  # type=نمایش زمان اجرا/قیمت در انتظار
                     "order_id": int(order_id),  # order_id=شناسه سفارش
                     "status": new_status,  # status=وضعیت جدید
                     "price": int(body.price),  # price=قیمت
                     "execution_start": exec_dt.isoformat() if exec_dt else ""  # execution_start=زمان اجرا ISO
-                }  # پایان data
+                }
             )
         else:  # عدم توافق
             await notify_user(
                 phone=req_row["user_phone"],
                 title="عدم توافق قیمت",
                 body="قیمت مورد توافق قرار نگرفت.",
-                data={  # data=دیتا برای کلاینت
-                    "type": "price_set",  # type=برای کلاینت (رفرش/نمایش پیام در انتظار)
+                data={  # data=داده‌های لازم برای کلاینت
+                    "type": "price_set",  # type=رفرش/نمایش پیام
                     "order_id": int(order_id),  # order_id=شناسه سفارش
                     "status": new_status,  # status=وضعیت جدید
                     "price": int(body.price)  # price=قیمت
-                }  # پایان data
+                }
             )
     except Exception as e:  # خطا
         logger.error(f"notify_user(admin_set_price) failed: {e}")  # لاگ
@@ -1200,13 +1225,13 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest):  # تابع
                 phone=req["user_phone"],
                 title="زمان تأیید شد",
                 body="زمان انتخابی شما ثبت شد.",
-                data={  # data=دیتا برای کلاینت
-                    "type": "time_confirm",  # type=برای کلاینت (تأیید زمان)
-                    "order_id": int(order_id),  # order_id=شناسه
-                    "status": "ASSIGNED",  # status=وضعیت
+                data={  # data=داده‌های لازم برای کلاینت
+                    "type": "time_confirm",  # type=تأیید زمان
+                    "order_id": int(order_id),  # order_id=شناسه سفارش
+                    "status": "ASSIGNED",  # status=وضعیت جدید
                     "scheduled_start": start.isoformat(),  # scheduled_start=زمان تایید شده
                     "provider_phone": _normalize_phone(slot["provider_phone"])  # provider_phone=شماره سرویس‌دهنده
-                }  # پایان data
+                }
             )
         await notify_managers(  # اعلان به مدیر/سرویس‌دهنده
             title="تأیید زمان توسط کاربر",
@@ -1241,7 +1266,7 @@ async def finish_order(order_id: int, request: Request):  # تابع
             phone=req["user_phone"],
             title="اتمام کار",
             body="سفارش شما انجام شد.",
-            data={"type": "work_finished", "order_id": int(order_id), "status": "FINISH"}  # data=افزودن type برای کلاینت
+            data={"type": "work_finished", "order_id": int(order_id), "status": "FINISH"}  # data=type برای کلاینت
         )
         await notify_managers(  # اعلان به مدیرها
             title="اتمام کار ثبت شد",
@@ -1299,7 +1324,7 @@ async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغ�
             phone=user_phone,  # phone=کاربر
             title="لغو سفارش",  # title=عنوان
             body="سفارش شما توسط مدیر لغو شد.",  # body=متن
-            data={"type": "order_canceled", "order_id": int(order_id), "status": "CANCELED", "service_type": str(service_type)}  # data=افزودن type برای کلاینت
+            data={"type": "order_canceled", "order_id": int(order_id), "status": "CANCELED", "service_type": str(service_type)}  # data=type برای کلاینت
         )  # پایان notify_user
 
         await notify_managers(  # اعلان به مدیر/سرویس‌دهنده
@@ -1343,6 +1368,15 @@ async def reject_all_and_cancel(order_id: int, request: Request):  # تابع=ل
     if authed != req["user_phone"]:  # تطبیق=بررسی
         raise HTTPException(status_code=403, detail="forbidden")  # 403
 
+    # مرحله ۵: قفل لغو بعد از ثبت execution_start  # توضیح=جلوگیری از لغو بعد از توافق قیمت/زمان اجرا
+    if req.get("execution_start") is not None:  # اگر زمان اجرا ثبت شده
+        raise HTTPException(status_code=409, detail={"code": "CANNOT_CANCEL", "message": "order cannot be canceled at this stage"})  # 409
+
+    # مرحله ۵: قفل لغو بر اساس وضعیت  # توضیح=فقط تا قبل از شروع/اتمام
+    st = str(req.get("status") or "").strip().upper()  # st=وضعیت نرمال
+    if st not in ["NEW", "WAITING", "ASSIGNED"]:  # اگر وضعیت خارج از قابل لغو
+        raise HTTPException(status_code=409, detail={"code": "CANNOT_CANCEL", "message": "order cannot be canceled at this stage"})  # 409
+
     await database.execute(  # update=REJECTED
         ScheduleSlotTable.__table__.update()
         .where(
@@ -1352,10 +1386,20 @@ async def reject_all_and_cancel(order_id: int, request: Request):  # تابع=ل
         .values(status="REJECTED")
     )
 
+    # مرحله ۵: آزاد کردن appointment در صورت وجود (ASSIGNED)  # توضیح=رفع بلوکه شدن تایم سرویس‌دهنده
+    await database.execute(  # update=appointment
+        AppointmentTable.__table__.update()
+        .where(
+            (AppointmentTable.request_id == order_id) &
+            (AppointmentTable.status == "BOOKED")
+        )
+        .values(status="CANCELED")
+    )
+
     await database.execute(  # update=سفارش
         RequestTable.__table__.update()
         .where(RequestTable.id == order_id)
-        .values(status="CANCELED", scheduled_start=None)
+        .values(status="CANCELED", scheduled_start=None, execution_start=None)
     )
 
     try:  # try=محافظ
