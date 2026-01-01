@@ -352,6 +352,12 @@ def extract_bearer_token(request: Request) -> Optional[str]:  # استخراج B
         return None  # None
     return auth.split(" ", 1)[1].strip()  # توکن
 
+def get_client_ip(request: Request) -> str:  # گرفتن IP کلاینت
+    xff = request.headers.get("x-forwarded-for", "")  # xff
+    if xff:  # اگر بود
+        return xff.split(",")[0].strip()  # اولین ip
+    return request.client.host or "unknown"  # ip
+    
 def decode_access_token(token: str) -> Optional[dict]:  # دیکود JWT
     try:  # try
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])  # decode
@@ -1472,6 +1478,7 @@ async def debug_users():  # تابع
     return out  # بازگشت
 
 # -------------------- End of server/main.py --------------------
+
 
 
 
