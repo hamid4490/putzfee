@@ -404,6 +404,8 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime) 
     if not provider:  # شرط=شماره خالی
         return False  # خروجی=غیرآزاد
 
+    one_hour = text("interval '1 hour'")  # one_hour=اینترول یک‌ساعته در PostgreSQL (جایگزین make_interval(hours=1))
+
     # 1) چک appointmentهای رزرو شده  # توضیح=رزروهای قطعی
     q_app = select(func.count()).select_from(AppointmentTable).where(  # query=count از appointments
         (AppointmentTable.provider_phone == provider) &  # شرط=همان سرویس‌دهنده
@@ -416,7 +418,7 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime) 
         return False  # خروجی=غیرآزاد
 
     # 2) چک اسلات‌های پیشنهادی/پذیرفته‌شده  # توضیح=برای جلوگیری از پیشنهاد همزمان یک زمان به چند سفارش
-    slot_end = ScheduleSlotTable.slot_start + func.make_interval(hours=1)  # slot_end=پایان اسلات (۱ ساعت)
+    slot_end = ScheduleSlotTable.slot_start + one_hour  # slot_end=پایان اسلات (۱ ساعت) با interval
     q_slot = select(func.count()).select_from(ScheduleSlotTable).where(  # query=count از schedule_slots
         (ScheduleSlotTable.provider_phone == provider) &  # شرط=همان سرویس‌دهنده
         (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=اسلات فعال
@@ -428,7 +430,7 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime) 
         return False  # خروجی=غیرآزاد
 
     # 3) چک زمان اجرای کار (execution_start) در requests  # توضیح=زمان اجرا هم باید مشغول حساب شود
-    exec_end = RequestTable.execution_start + func.make_interval(hours=1)  # exec_end=پایان اجرای کار (۱ ساعت)
+    exec_end = RequestTable.execution_start + one_hour  # exec_end=پایان اجرای کار (۱ ساعت) با interval
     q_exec = select(func.count()).select_from(RequestTable).where(  # query=count از requests
         (RequestTable.driver_phone == provider) &  # شرط=همان سرویس‌دهنده روی سفارش
         (RequestTable.execution_start.is_not(None)) &  # شرط=زمان اجرا ثبت شده
@@ -1571,6 +1573,7 @@ async def debug_users():  # تابع
     return out  # بازگشت
 
 # -------------------- End of server/main.py --------------------
+
 
 
 
