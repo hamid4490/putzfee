@@ -1108,7 +1108,100 @@ async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optio
 
     return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": sorted(busy)})  # پاسخ=لیست زمان‌ها
 
+# -------------------- Propose slots (Manager) --------------------  # بخش=ارسال زمان‌های پیشنهادی توسط مدیر
 
+@app.post("/order/{order_id}/propose_slots")  # مسیر=ثبت زمان‌های پیشنهادی (بدون اسلش)
+@app.post("/order/{order_id}/propose_slots/")  # مسیر=ثبت زمان‌های پیشنهادی (با اسلش)  # توضیح=رفع 404 در حالت اسلش
+async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Request):  # تابع=ثبت اسلات‌های پیشنهادی برای یک سفارش
+    require_admin(request)  # احراز=فقط مدیر اجازه دارد
+
+    provider = _normalize_phone(body.provider_phone or "")  # provider=نرمال‌سازی شماره سرویس‌دهنده/مدیر
+    if not provider:  # شرط=شماره سرویس‌دهنده خالی
+        raise HTTPException(status_code=400, detail="provider_phone required")  # خطا=شماره لازم است
+
+    sel_req = RequestTable.__table__.select().where(RequestTable.id == order_id)  # select=خواندن سفارش
+    req_row = await database.fetch_one(sel_req)  # اجرا=گرفتن سفارش
+    if not req_row:  # شرط=سفارش وجود ندارد
+        raise HTTPException(status_code=404, detail="order not found")  # خطا=یافت نشد
+
+    raw_slots = body.slots or []  # raw_slots=لیست خام اسلات‌ها
+    cleaned: List[str] = []  # cleaned=لیست پاک‌سازی شده
+    seen: set[str] = set()  # seen=برای جلوگیری از تکرار
+
+    for s in raw_slots:  # حلقه=روی اسلات‌های ورودی
+        ss = str(s or "").strip()  # ss=رشته trim
+        if not ss:  # شرط=خالی
+            continue  # ادامه=رد
+        if ss in seen:  # شرط=تکراری
+            continue  # ادامه=رد
+        seen.add(ss)  # افزودن=به مجموعه
+        cleaned.append(ss)  # افزودن=به لیست
+        if len(cleaned) >= 3:  # شرط=حداکثر ۳ تا
+            break  # خروج از حلقه
+
+    if not cleaned:  # شرط=هیچ زمانی انتخاب نشده
+        raise HTTPException(status_code=400, detail="slots required")  # خطا=اسلات لازم است
+
+    slot_dts = [parse_iso(x) for x in cleaned]  # slot_dts=پارس ISO به datetime UTC
+    slot_dts.sort()  # مرتب‌سازی=برای نظم
+
+    accepted: List[str] = []  # accepted=لیست ISO های ثبت‌شده
+
+    async with database.transaction():  # transaction=اتمیک بودن (rollback در خطا)
+        await database.execute(  # اجرا=رد کردن اسلات‌های قبلی همین سفارش
+            ScheduleSlotTable.__table__.update()  # update=schedule_slots
+            .where(  # where=شرایط
+                (ScheduleSlotTable.request_id == order_id) &  # شرط=همین سفارش
+                (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))  # شرط=اسلات‌های فعال قبلی
+            )  # پایان where
+            .values(status="REJECTED")  # values=رد شده
+        )  # پایان execute
+
+        await database.execute(  # اجرا=ثبت سرویس‌دهنده و تغییر وضعیت سفارش به WAITING
+            RequestTable.__table__.update()  # update=requests
+            .where(RequestTable.id == order_id)  # where=شناسه سفارش
+            .values(driver_phone=provider, status="WAITING")  # values=ثبت شماره سرویس‌دهنده + وضعیت منتظر تأیید کاربر
+        )  # پایان execute
+
+        for dt in slot_dts:  # حلقه=روی زمان‌های پیشنهادی
+            end_dt = dt + timedelta(hours=1)  # end_dt=پایان بازه (۱ ساعت)
+            free = await provider_is_free(provider, dt, end_dt)  # free=بررسی آزاد بودن سرویس‌دهنده
+            if not free:  # شرط=تداخل زمان
+                raise HTTPException(status_code=409, detail="slot overlaps with existing schedule")  # خطا=تداخل
+
+            await database.execute(  # اجرا=درج اسلات جدید
+                ScheduleSlotTable.__table__.insert().values(  # insert=schedule_slots
+                    request_id=order_id,  # request_id=شناسه سفارش
+                    provider_phone=provider,  # provider_phone=شماره سرویس‌دهنده
+                    slot_start=dt,  # slot_start=شروع اسلات (UTC)
+                    status="PROPOSED",  # status=پیشنهادی
+                    created_at=datetime.now(timezone.utc)  # created_at=زمان ایجاد
+                )  # پایان values
+            )  # پایان execute
+
+            accepted.append(dt.isoformat())  # افزودن=به لیست خروجی (ISO)
+
+    try:  # try=محافظ اعلان
+        await notify_user(  # اعلان به کاربر
+            phone=req_row["user_phone"],  # phone=شماره کاربر
+            title="پیشنهاد زمان بازدید",  # title=عنوان
+            body="زمان‌های پیشنهادی برای بازدید ارسال شد.",  # body=متن
+            data={  # data=داده‌های اعلان
+                "type": "proposed_slots",  # type=نوع پیام
+                "order_id": int(order_id),  # order_id=شناسه سفارش
+                "status": "WAITING"  # status=وضعیت جدید
+            }  # پایان data
+        )  # پایان notify_user
+    except Exception as e:  # خطا=اعلان
+        logger.error(f"notify_user(propose_slots) failed: {e}")  # لاگ=خطا
+
+    return unified_response(  # پاسخ=خروجی استاندارد
+        "ok",  # status=ok
+        "SLOTS_PROPOSED",  # code=کد
+        "slots proposed",  # message=پیام
+        {"accepted": accepted}  # data=لیست زمان‌های ثبت‌شده
+    )  # پایان پاسخ
+    
 # -------------------- Admin workflow --------------------  # بخش=گردش کار مدیر
 
 @app.post("/admin/order/{order_id}/price")  # مسیر=ثبت قیمت/توافق توسط مدیر
@@ -1478,6 +1571,7 @@ async def debug_users():  # تابع
     return out  # بازگشت
 
 # -------------------- End of server/main.py --------------------
+
 
 
 
