@@ -55,8 +55,35 @@ GOOGLE_APPLICATION_CREDENTIALS_JSON_B64 = os.getenv("GOOGLE_APPLICATION_CREDENTI
 ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")  # کلید ادمین قدیمی
 ADMIN_PHONES_ENV = os.getenv("ADMIN_PHONES", "").strip()  # شماره مدیران
 
-def _normalize_phone(p: str) -> str:  # نرمال‌سازی شماره
-    return "".join(ch for ch in str(p or "") if ch.isdigit() or ch == "+")  # نگه‌داشتن رقم و +
+def _normalize_phone(p: str) -> str:  # نرمال‌سازی شماره (یکسان‌سازی 09.. و +98.. و 0098..)
+    raw = str(p or "").strip()  # raw=رشته ورودی تمیز
+    if not raw:  # شرط=خالی بودن ورودی
+        return ""  # خروجی=خالی
+
+    # نگه داشتن فقط رقم‌ها و +  # توضیح=حذف فاصله/خط/کاراکترهای اضافی
+    cleaned = "".join(ch for ch in raw if ch.isdigit() or ch == "+")  # cleaned=فقط رقم و +
+    if not cleaned:  # شرط=پس از پاکسازی خالی شد
+        return ""  # خروجی=خالی
+
+    # حذف + ابتدای شماره  # توضیح=یکسان‌سازی
+    if cleaned.startswith("+"):  # شرط=داشتن +
+        cleaned = cleaned[1:]  # cleaned=حذف +
+
+    # حذف 00 ابتدای شماره  # توضیح=تبدیل 0098... به 98...
+    if cleaned.startswith("00"):  # شرط=پیشوند 00
+        cleaned = cleaned[2:]  # cleaned=حذف 00
+
+    digits = "".join(ch for ch in cleaned if ch.isdigit())  # digits=فقط رقم‌ها
+    if not digits:  # شرط=خالی
+        return ""  # خروجی=خالی
+
+    # یکسان‌سازی ایران: 98 + 10digits → 0 + 10digits  # توضیح=+98919... و 0919... یکسان شوند
+    if digits.startswith("98") and len(digits) >= 12:  # شرط=شروع با 98 و طول کافی
+        tail10 = digits[-10:]  # tail10=آخرین ۱۰ رقم (شماره موبایل بدون پیشوند)
+        if tail10.startswith("9"):  # شرط=موبایل ایران با 9 شروع می‌شود
+            return "0" + tail10  # خروجی=۰ + ۱۰ رقم (مثل 0919...)
+
+    return digits  # خروجی=شماره نهایی به صورت فقط رقم
 
 def _parse_admin_phones(s: str) -> set[str]:  # پارس شماره مدیران
     out = set()  # مجموعه خروجی
@@ -540,57 +567,67 @@ def order_push_data(  # تابع=ساخت دیتای استاندارد برای
         data["price"] = str(int(price))  # price=به رشته (برای FCM)
     return data  # بازگشت=data
 
-async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict):  # ارسال FCM legacy
-    if not tokens:  # بدون توکن
+async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict):  # ارسال FCM legacy (Data-only)
+    if not tokens:  # شرط=بدون توکن
         return  # خروج
-    if not FCM_SERVER_KEY:  # نبود کلید
-        logger.error("FCM_SERVER_KEY is empty")  # لاگ
+    if not FCM_SERVER_KEY:  # شرط=نبود کلید
+        logger.error("FCM_SERVER_KEY is empty")  # لاگ=نبود کلید
         return  # خروج
-    headers = {  # هدرها
-        "Authorization": f"key={FCM_SERVER_KEY}",  # کلید
-        "Content-Type": "application/json"  # json
-    }  # پایان headers
-    payload = {  # payload
-        "registration_ids": tokens,  # توکن‌ها
-        "notification": {  # notification
-            "title": title,  # عنوان
-            "body": body  # متن
-        },  # پایان notification
-        "data": _to_fcm_data(data)  # data رشته‌ای
-    }  # پایان payload
-    async with httpx.AsyncClient(timeout=10.0) as client:  # کلاینت async
-        resp = await client.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload)  # ارسال
-    if resp.status_code != 200:  # اگر ok نبود
-        logger.error(f"FCM legacy send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ
 
-async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict):  # ارسال FCM v1 تک‌توکن
-    access = _get_oauth2_token_for_fcm()  # oauth token
-    if not access:  # نبود
-        logger.error("FCM v1 oauth token not available")  # لاگ
-        return  # خروج
-    if not FCM_PROJECT_ID:  # نبود project
-        logger.error("FCM_PROJECT_ID is empty")  # لاگ
-        return  # خروج
-    headers = {  # هدرها
-        "Authorization": f"Bearer {access}",  # bearer
-        "Content-Type": "application/json"  # json
+    headers = {  # headers=هدرها
+        "Authorization": f"key={FCM_SERVER_KEY}",  # Authorization=کلید legacy
+        "Content-Type": "application/json"  # Content-Type=json
     }  # پایان headers
-    msg = {  # message
-        "message": {  # message
-            "token": token,  # توکن
-            "notification": {  # notification
-                "title": title,  # عنوان
-                "body": body  # متن
-            },  # پایان notification
-            "data": _to_fcm_data(data)  # data رشته‌ای
+
+    merged = dict(data or {})  # merged=کپی دیتا
+    merged["title"] = str(title or "")  # title=قرار دادن عنوان داخل data
+    merged["body"] = str(body or "")  # body=قرار دادن متن داخل data
+
+    payload = {  # payload=بدنه ارسال
+        "registration_ids": tokens,  # registration_ids=توکن‌ها
+        "priority": "high",  # priority=اولویت بالا برای دریافت در بک‌گراند
+        "data": _to_fcm_data(merged)  # data=دیتای رشته‌ای (Data-only)
+    }  # پایان payload
+
+    async with httpx.AsyncClient(timeout=10.0) as client:  # client=کلاینت async
+        resp = await client.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload)  # ارسال
+    if resp.status_code != 200:  # شرط=عدم موفقیت
+        logger.error(f"FCM legacy send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ=خطا
+        
+async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict):  # ارسال FCM v1 تک‌توکن (Data-only)
+    access = _get_oauth2_token_for_fcm()  # access=توکن OAuth
+    if not access:  # شرط=نبود توکن OAuth
+        logger.error("FCM v1 oauth token not available")  # لاگ=نبود OAuth
+        return  # خروج
+    if not FCM_PROJECT_ID:  # شرط=نبود project
+        logger.error("FCM_PROJECT_ID is empty")  # لاگ=نبود project
+        return  # خروج
+
+    headers = {  # headers=هدرها
+        "Authorization": f"Bearer {access}",  # Authorization=Bearer
+        "Content-Type": "application/json"  # Content-Type=json
+    }  # پایان headers
+
+    merged = dict(data or {})  # merged=کپی دیتا
+    merged["title"] = str(title or "")  # title=عنوان داخل data
+    merged["body"] = str(body or "")  # body=متن داخل data
+
+    msg = {  # msg=بدنه پیام
+        "message": {  # message=پیام
+            "token": token,  # token=توکن مقصد
+            "android": {  # android=تنظیمات اندروید
+                "priority": "HIGH"  # priority=اولویت بالا
+            },  # پایان android
+            "data": _to_fcm_data(merged)  # data=Data-only رشته‌ای
         }  # پایان message
     }  # پایان msg
-    url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"  # url v1
-    async with httpx.AsyncClient(timeout=10.0) as client:  # کلاینت
-        resp = await client.post(url, headers=headers, json=msg)  # ارسال
-    if resp.status_code not in (200, 201):  # اگر ok نبود
-        logger.error(f"FCM v1 send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ
 
+    url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"  # url=آدرس v1
+    async with httpx.AsyncClient(timeout=10.0) as client:  # client=کلاینت async
+        resp = await client.post(url, headers=headers, json=msg)  # ارسال
+    if resp.status_code not in (200, 201):  # شرط=عدم موفقیت
+        logger.error(f"FCM v1 send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ=خطا
+        
 async def push_notify_tokens(tokens: List[str], title: str, body: str, data: dict):  # ارسال پوش به لیست توکن‌ها
     if not tokens:  # بدون توکن
         return  # خروج
@@ -1091,7 +1128,10 @@ async def get_user_orders(user_phone: str, request: Request):  # تابع
 @app.get("/busy_slots")  # مسیر=ساعات مشغول
 async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optional[int] = None):  # تابع=لیست مشغول
     d = datetime.fromisoformat(date).date()  # d=تاریخ
-    provider = provider_phone.strip()  # provider=شماره سرویس‌دهنده
+    provider = _normalize_phone(provider_phone)  # provider=شماره نرمال‌شده سرویس‌دهنده
+
+    if not provider:  # شرط=شماره نامعتبر/خالی
+        raise HTTPException(status_code=400, detail="provider_phone required")  # خطا=۴۰۰
 
     day_start = datetime(d.year, d.month, d.day, 0, 0, tzinfo=timezone.utc)  # day_start=شروع روز UTC
     day_end = day_start + timedelta(days=1)  # day_end=پایان روز UTC
@@ -1100,18 +1140,17 @@ async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optio
         (ScheduleSlotTable.slot_start >= day_start) &  # شرط=از
         (ScheduleSlotTable.slot_start < day_end) &  # شرط=تا
         (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=فعال
-        (ScheduleSlotTable.provider_phone == provider)  # شرط=provider
+        (ScheduleSlotTable.provider_phone == provider)  # شرط=provider نرمال
     )  # پایان where
     if exclude_order_id is not None:  # شرط=exclude
         sel_sched = sel_sched.where(ScheduleSlotTable.request_id != exclude_order_id)  # افزودن شرط=حذف سفارش جاری
-
     rows_sched = await database.fetch_all(sel_sched)  # rows_sched=اجرا
 
     sel_app = AppointmentTable.__table__.select().where(  # sel_app=appointmentها
         (AppointmentTable.start_time >= day_start) &  # شرط=از
         (AppointmentTable.start_time < day_end) &  # شرط=تا
         (AppointmentTable.status == "BOOKED") &  # شرط=رزرو
-        (AppointmentTable.provider_phone == provider)  # شرط=provider
+        (AppointmentTable.provider_phone == provider)  # شرط=provider نرمال
     )  # پایان where
     if exclude_order_id is not None:  # شرط=exclude
         sel_app = sel_app.where(AppointmentTable.request_id != exclude_order_id)  # افزودن شرط
@@ -1122,7 +1161,7 @@ async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optio
         (RequestTable.execution_start < day_end) &  # شرط=تا
         (RequestTable.execution_start.is_not(None)) &  # شرط=ثبت شده
         (RequestTable.status.in_(["IN_PROGRESS", "STARTED"])) &  # شرط=در حال انجام/شروع
-        (RequestTable.driver_phone == provider)  # شرط=provider
+        (RequestTable.driver_phone == provider)  # شرط=provider نرمال
     )  # پایان where
     if exclude_order_id is not None:  # شرط=exclude
         sel_exec = sel_exec.where(RequestTable.id != exclude_order_id)  # افزودن شرط
@@ -1137,7 +1176,7 @@ async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optio
         busy.add(r["execution_start"].isoformat())  # افزودن=زمان
 
     return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": sorted(busy)})  # پاسخ
-
+    
 # -------------------- Propose slots (Manager) --------------------
 
 @app.post("/order/{order_id}/propose_slots")  # مسیر=ثبت زمان‌های پیشنهادی (بدون اسلش)
@@ -1706,3 +1745,4 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن=آیتم
     return out  # بازگشت
+
