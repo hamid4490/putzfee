@@ -590,39 +590,39 @@ async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict)
     if resp.status_code != 200:  # شرط=عدم موفقیت
         logger.error(f"FCM legacy send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ=خطا
         
-async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict):  # ارسال FCM v1 تک‌توکن به صورت Data-only
-    access = _get_oauth2_token_for_fcm()  # access=توکن OAuth
-    if not access:  # شرط=نبود OAuth
-        logger.error("FCM v1 oauth token not available")  # لاگ=نبود OAuth
+async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict):  # تابع=ارسال FCM v1 تک‌توکن به صورت Data-only
+    access = _get_oauth2_token_for_fcm()  # access=گرفتن توکن OAuth برای FCM v1
+    if not access:  # شرط=توکن OAuth موجود نیست
+        logger.error("FCM v1 oauth token not available")  # لاگ=عدم دسترسی به OAuth
         return  # خروج
-    if not FCM_PROJECT_ID:  # شرط=نبود project
-        logger.error("FCM_PROJECT_ID is empty")  # لاگ=نبود project
+    if not FCM_PROJECT_ID:  # شرط=شناسه پروژه Firebase تنظیم نشده
+        logger.error("FCM_PROJECT_ID is empty")  # لاگ=شناسه پروژه خالی است
         return  # خروج
 
-    headers = {  # headers=هدرها
-        "Authorization": f"Bearer {access}",  # Authorization=Bearer
-        "Content-Type": "application/json"  # Content-Type=json
+    headers = {  # headers=هدرهای درخواست HTTP
+        "Authorization": f"Bearer {access}",  # Authorization=توکن Bearer
+        "Content-Type": "application/json"  # Content-Type=نوع محتوا JSON
     }  # پایان headers
 
-    merged = dict(data or {})  # merged=کپی دیتا
-    merged["title"] = str(title or "")  # title=عنوان داخل دیتا
-    merged["body"] = str(body or "")  # body=متن داخل دیتا
+    merged = dict(data or {})  # merged=کپی از data برای دستکاری امن
+    merged["title"] = str(title or "")  # title=قرار دادن عنوان داخل data (برای Data-only)
+    merged["body"] = str(body or "")  # body=قرار دادن متن داخل data (برای Data-only)
 
-    msg = {  # msg=بدنه پیام
-        "message": {  # message=پیام
-            "token": token,  # token=توکن مقصد
+    msg = {  # msg=بدنه پیام برای FCM v1
+        "message": {  # message=شیء پیام
+            "token": str(token or "").strip(),  # token=توکن دستگاه مقصد
             "android": {  # android=تنظیمات اندروید
-                "priority": "HIGH"  # priority=اولویت بالا
+                "priority": "HIGH"  # priority=اولویت بالا برای دریافت سریع/پس‌زمینه
             },  # پایان android
-            "data": _to_fcm_data(merged)  # data=فقط دیتا (بدون notification)
+            "data": _to_fcm_data(merged)  # data=ارسال فقط data (بدون notification) برای اجرای onMessageReceived
         }  # پایان message
     }  # پایان msg
 
-    url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"  # url=آدرس v1
-    async with httpx.AsyncClient(timeout=10.0) as client:  # client=کلاینت async
-        resp = await client.post(url, headers=headers, json=msg)  # ارسال
-    if resp.status_code not in (200, 201):  # شرط=عدم موفقیت
-        logger.error(f"FCM v1 send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ=خطا
+    url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"  # url=آدرس endpoint ارسال پیام v1
+    async with httpx.AsyncClient(timeout=10.0) as client:  # client=کلاینت HTTP async
+        resp = await client.post(url, headers=headers, json=msg)  # resp=ارسال درخواست POST با بدنه JSON
+    if resp.status_code not in (200, 201):  # شرط=موفق نبودن ارسال
+        logger.error(f"FCM v1 send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ=خطا با بدنه پاسخ
         
 async def push_notify_tokens(tokens: List[str], title: str, body: str, data: dict):  # ارسال پوش به لیست توکن‌ها
     if not tokens:  # بدون توکن
@@ -1743,5 +1743,6 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن=آیتم
     return out  # بازگشت
+
 
 
