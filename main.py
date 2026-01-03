@@ -55,36 +55,32 @@ GOOGLE_APPLICATION_CREDENTIALS_JSON_B64 = os.getenv("GOOGLE_APPLICATION_CREDENTI
 ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN")  # کلید ادمین قدیمی
 ADMIN_PHONES_ENV = os.getenv("ADMIN_PHONES", "").strip()  # شماره مدیران
 
-def _normalize_phone(p: str) -> str:  # نرمال‌سازی شماره (یکسان‌سازی 09.. و +98.. و 0098..)
-    raw = str(p or "").strip()  # raw=رشته ورودی تمیز
-    if not raw:  # شرط=خالی بودن ورودی
+def _normalize_phone(p: str) -> str:  # نرمال‌سازی شماره (یکسان‌سازی برای جلوگیری از رزرو دوباره)
+    raw = str(p or "").strip()  # raw=رشته ورودی + trim
+    if not raw:  # شرط=ورودی خالی است
+        return ""  # خروجی=رشته خالی
+
+    cleaned = "".join(ch for ch in raw if ch.isdigit() or ch == "+")  # cleaned=فقط رقم‌ها و + باقی بماند
+    if not cleaned:  # شرط=بعد از پاکسازی خالی شد
         return ""  # خروجی=خالی
 
-    # نگه داشتن فقط رقم‌ها و +  # توضیح=حذف فاصله/خط/کاراکترهای اضافی
-    cleaned = "".join(ch for ch in raw if ch.isdigit() or ch == "+")  # cleaned=فقط رقم و +
-    if not cleaned:  # شرط=پس از پاکسازی خالی شد
-        return ""  # خروجی=خالی
+    if cleaned.startswith("+"):  # شرط=شماره با + شروع شده
+        cleaned = cleaned[1:]  # cleaned=حذف + ابتدای شماره
 
-    # حذف + ابتدای شماره  # توضیح=یکسان‌سازی
-    if cleaned.startswith("+"):  # شرط=داشتن +
-        cleaned = cleaned[1:]  # cleaned=حذف +
-
-    # حذف 00 ابتدای شماره  # توضیح=تبدیل 0098... به 98...
-    if cleaned.startswith("00"):  # شرط=پیشوند 00
+    if cleaned.startswith("00"):  # شرط=شماره با 00 شروع شده (مثل 0098...)
         cleaned = cleaned[2:]  # cleaned=حذف 00
 
-    digits = "".join(ch for ch in cleaned if ch.isdigit())  # digits=فقط رقم‌ها
+    digits = "".join(ch for ch in cleaned if ch.isdigit())  # digits=فقط رقم‌ها (بدون +)
     if not digits:  # شرط=خالی
         return ""  # خروجی=خالی
 
-    # یکسان‌سازی ایران: 98 + 10digits → 0 + 10digits  # توضیح=+98919... و 0919... یکسان شوند
-    if digits.startswith("98") and len(digits) >= 12:  # شرط=شروع با 98 و طول کافی
-        tail10 = digits[-10:]  # tail10=آخرین ۱۰ رقم (شماره موبایل بدون پیشوند)
+    if digits.startswith("98") and len(digits) >= 12:  # شرط=پیشوند ایران 98 و طول کافی
+        tail10 = digits[-10:]  # tail10=آخرین ۱۰ رقم شماره
         if tail10.startswith("9"):  # شرط=موبایل ایران با 9 شروع می‌شود
-            return "0" + tail10  # خروجی=۰ + ۱۰ رقم (مثل 0919...)
+            return "0" + tail10  # خروجی=فرمت واحد ایران مثل 0919...
 
     return digits  # خروجی=شماره نهایی به صورت فقط رقم
-
+    
 def _parse_admin_phones(s: str) -> set[str]:  # پارس شماره مدیران
     out = set()  # مجموعه خروجی
     for part in (s or "").split(","):  # جداکردن با کاما
@@ -426,54 +422,54 @@ def require_admin(request: Request):  # احراز مدیر
 
 # -------------------- Utils --------------------  # بخش=ابزارها
 
-async def provider_is_free(provider_phone: str, start: datetime, end: datetime, exclude_order_id: Optional[int] = None) -> bool:  # تابع=بررسی آزاد بودن سرویس‌دهنده با قابلیت نادیده گرفتن یک سفارش
-    provider = (provider_phone or "").strip()  # provider=شماره سرویس‌دهنده (trim)
-    if not provider:  # شرط=شماره خالی
+async def provider_is_free(provider_phone: str, start: datetime, end: datetime, exclude_order_id: Optional[int] = None) -> bool:  # تابع=بررسی آزاد بودن سرویس‌دهنده
+    provider = _normalize_phone(provider_phone or "")  # provider=شماره سرویس‌دهنده نرمال‌شده
+    if not provider:  # شرط=شماره خالی/نامعتبر
         return False  # خروجی=غیرآزاد
 
-    one_hour = text("interval '1 hour'")  # one_hour=اینترول یک‌ساعته در PostgreSQL (بدون make_interval)
+    one_hour = text("interval '1 hour'")  # one_hour=اینترول یک ساعت در PostgreSQL
 
-    q_app = select(func.count()).select_from(AppointmentTable).where(  # q_app=کوئری شمارش appointmentهای رزرو شده
-        (AppointmentTable.provider_phone == provider) &  # شرط=سرویس‌دهنده یکسان
+    q_app = select(func.count()).select_from(AppointmentTable).where(  # q_app=شمارش رزروهای قطعی
+        (AppointmentTable.provider_phone == provider) &  # شرط=شماره سرویس‌دهنده
         (AppointmentTable.status == "BOOKED") &  # شرط=رزرو شده
         (AppointmentTable.start_time < end) &  # شرط=شروع قبل از پایان بازه
         (AppointmentTable.end_time > start)  # شرط=پایان بعد از شروع بازه
     )  # پایان q_app
-    if exclude_order_id is not None:  # شرط=نادیده گرفتن سفارش
-        q_app = q_app.where(AppointmentTable.request_id != exclude_order_id)  # where=حذف سفارش جاری
-    app_count = await database.fetch_val(q_app)  # app_count=تعداد تداخل appointment
-    if app_count and int(app_count) > 0:  # شرط=تداخل وجود دارد
+    if exclude_order_id is not None:  # شرط=نادیده گرفتن یک سفارش
+        q_app = q_app.where(AppointmentTable.request_id != exclude_order_id)  # افزودن=حذف سفارش جاری
+    app_count = await database.fetch_val(q_app)  # app_count=تعداد تداخل رزرو
+    if app_count and int(app_count) > 0:  # شرط=تداخل دارد
         return False  # خروجی=غیرآزاد
 
-    slot_end = ScheduleSlotTable.slot_start + one_hour  # slot_end=پایان اسلات (۱ ساعت)
-    q_slot = select(func.count()).select_from(ScheduleSlotTable).where(  # q_slot=کوئری شمارش اسلات‌های فعال
-        (ScheduleSlotTable.provider_phone == provider) &  # شرط=سرویس‌دهنده یکسان
-        (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=اسلات فعال
+    slot_end = ScheduleSlotTable.slot_start + one_hour  # slot_end=پایان اسلات پیشنهادی (۱ ساعت)
+    q_slot = select(func.count()).select_from(ScheduleSlotTable).where(  # q_slot=شمارش زمان‌های رزرو-موقت
+        (ScheduleSlotTable.provider_phone == provider) &  # شرط=شماره سرویس‌دهنده
+        (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=پیشنهادی/پذیرفته (برای دیگران مشغول)
         (ScheduleSlotTable.slot_start < end) &  # شرط=شروع اسلات قبل از پایان بازه
         (slot_end > start)  # شرط=پایان اسلات بعد از شروع بازه
     )  # پایان q_slot
-    if exclude_order_id is not None:  # شرط=نادیده گرفتن سفارش
-        q_slot = q_slot.where(ScheduleSlotTable.request_id != exclude_order_id)  # where=حذف اسلات‌های سفارش جاری
+    if exclude_order_id is not None:  # شرط=نادیده گرفتن یک سفارش
+        q_slot = q_slot.where(ScheduleSlotTable.request_id != exclude_order_id)  # افزودن=حذف سفارش جاری
     slot_count = await database.fetch_val(q_slot)  # slot_count=تعداد تداخل اسلات
-    if slot_count and int(slot_count) > 0:  # شرط=تداخل وجود دارد
+    if slot_count and int(slot_count) > 0:  # شرط=تداخل دارد
         return False  # خروجی=غیرآزاد
 
     exec_end = RequestTable.execution_start + one_hour  # exec_end=پایان اجرای کار (۱ ساعت)
-    q_exec = select(func.count()).select_from(RequestTable).where(  # q_exec=کوئری شمارش زمان‌های اجرای فعال
-        (RequestTable.driver_phone == provider) &  # شرط=سرویس‌دهنده یکسان
-        (RequestTable.execution_start.is_not(None)) &  # شرط=execution_start ثبت شده
+    q_exec = select(func.count()).select_from(RequestTable).where(  # q_exec=شمارش اجرای فعال
+        (RequestTable.driver_phone == provider) &  # شرط=شماره سرویس‌دهنده
+        (RequestTable.execution_start.is_not(None)) &  # شرط=زمان اجرا ثبت شده
         (RequestTable.status.in_(["IN_PROGRESS", "STARTED"])) &  # شرط=در حال انجام/شروع
-        (RequestTable.execution_start < end) &  # شرط=شروع اجرا قبل از پایان بازه
-        (exec_end > start)  # شرط=پایان اجرا بعد از شروع بازه
+        (RequestTable.execution_start < end) &  # شرط=شروع قبل از پایان بازه
+        (exec_end > start)  # شرط=پایان بعد از شروع بازه
     )  # پایان q_exec
     if exclude_order_id is not None:  # شرط=نادیده گرفتن سفارش
-        q_exec = q_exec.where(RequestTable.id != exclude_order_id)  # where=حذف سفارش جاری
+        q_exec = q_exec.where(RequestTable.id != exclude_order_id)  # افزودن=حذف سفارش جاری
     exec_count = await database.fetch_val(q_exec)  # exec_count=تعداد تداخل اجرا
-    if exec_count and int(exec_count) > 0:  # شرط=تداخل وجود دارد
+    if exec_count and int(exec_count) > 0:  # شرط=تداخل دارد
         return False  # خروجی=غیرآزاد
 
     return True  # خروجی=آزاد
-
+    
 # -------------------- Push helpers --------------------
 
 _FCM_OAUTH_TOKEN = ""  # کش توکن OAuth
@@ -567,11 +563,11 @@ def order_push_data(  # تابع=ساخت دیتای استاندارد برای
         data["price"] = str(int(price))  # price=به رشته (برای FCM)
     return data  # بازگشت=data
 
-async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict):  # ارسال FCM legacy (Data-only)
-    if not tokens:  # شرط=بدون توکن
+async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict):  # ارسال FCM legacy به صورت Data-only
+    if not tokens:  # شرط=توکن‌ها خالی
         return  # خروج
-    if not FCM_SERVER_KEY:  # شرط=نبود کلید
-        logger.error("FCM_SERVER_KEY is empty")  # لاگ=نبود کلید
+    if not FCM_SERVER_KEY:  # شرط=کلید FCM خالی
+        logger.error("FCM_SERVER_KEY is empty")  # لاگ=کلید خالی
         return  # خروج
 
     headers = {  # headers=هدرها
@@ -580,13 +576,13 @@ async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict)
     }  # پایان headers
 
     merged = dict(data or {})  # merged=کپی دیتا
-    merged["title"] = str(title or "")  # title=قرار دادن عنوان داخل data
-    merged["body"] = str(body or "")  # body=قرار دادن متن داخل data
+    merged["title"] = str(title or "")  # title=عنوان داخل دیتا
+    merged["body"] = str(body or "")  # body=متن داخل دیتا
 
-    payload = {  # payload=بدنه ارسال
+    payload = {  # payload=بدنه درخواست
         "registration_ids": tokens,  # registration_ids=توکن‌ها
-        "priority": "high",  # priority=اولویت بالا برای دریافت در بک‌گراند
-        "data": _to_fcm_data(merged)  # data=دیتای رشته‌ای (Data-only)
+        "priority": "high",  # priority=اولویت بالا
+        "data": _to_fcm_data(merged)  # data=فقط دیتا (بدون notification)
     }  # پایان payload
 
     async with httpx.AsyncClient(timeout=10.0) as client:  # client=کلاینت async
@@ -594,9 +590,9 @@ async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict)
     if resp.status_code != 200:  # شرط=عدم موفقیت
         logger.error(f"FCM legacy send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ=خطا
         
-async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict):  # ارسال FCM v1 تک‌توکن (Data-only)
+async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict):  # ارسال FCM v1 تک‌توکن به صورت Data-only
     access = _get_oauth2_token_for_fcm()  # access=توکن OAuth
-    if not access:  # شرط=نبود توکن OAuth
+    if not access:  # شرط=نبود OAuth
         logger.error("FCM v1 oauth token not available")  # لاگ=نبود OAuth
         return  # خروج
     if not FCM_PROJECT_ID:  # شرط=نبود project
@@ -609,8 +605,8 @@ async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict):  #
     }  # پایان headers
 
     merged = dict(data or {})  # merged=کپی دیتا
-    merged["title"] = str(title or "")  # title=عنوان داخل data
-    merged["body"] = str(body or "")  # body=متن داخل data
+    merged["title"] = str(title or "")  # title=عنوان داخل دیتا
+    merged["body"] = str(body or "")  # body=متن داخل دیتا
 
     msg = {  # msg=بدنه پیام
         "message": {  # message=پیام
@@ -618,7 +614,7 @@ async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict):  #
             "android": {  # android=تنظیمات اندروید
                 "priority": "HIGH"  # priority=اولویت بالا
             },  # پایان android
-            "data": _to_fcm_data(merged)  # data=Data-only رشته‌ای
+            "data": _to_fcm_data(merged)  # data=فقط دیتا (بدون notification)
         }  # پایان message
     }  # پایان msg
 
@@ -1128,7 +1124,7 @@ async def get_user_orders(user_phone: str, request: Request):  # تابع
 @app.get("/busy_slots")  # مسیر=ساعات مشغول
 async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optional[int] = None):  # تابع=لیست مشغول
     d = datetime.fromisoformat(date).date()  # d=تاریخ
-    provider = _normalize_phone(provider_phone)  # provider=شماره نرمال‌شده سرویس‌دهنده
+    provider = _normalize_phone(provider_phone)  # provider=شماره سرویس‌دهنده نرمال
 
     if not provider:  # شرط=شماره نامعتبر/خالی
         raise HTTPException(status_code=400, detail="provider_phone required")  # خطا=۴۰۰
@@ -1139,7 +1135,7 @@ async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optio
     sel_sched = ScheduleSlotTable.__table__.select().where(  # sel_sched=اسلات‌ها
         (ScheduleSlotTable.slot_start >= day_start) &  # شرط=از
         (ScheduleSlotTable.slot_start < day_end) &  # شرط=تا
-        (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=فعال
+        (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=فعال (برای دیگران مشغول)
         (ScheduleSlotTable.provider_phone == provider)  # شرط=provider نرمال
     )  # پایان where
     if exclude_order_id is not None:  # شرط=exclude
@@ -1167,12 +1163,12 @@ async def get_busy_slots(provider_phone: str, date: str, exclude_order_id: Optio
         sel_exec = sel_exec.where(RequestTable.id != exclude_order_id)  # افزودن شرط
     rows_exec = await database.fetch_all(sel_exec)  # rows_exec=اجرا
 
-    busy: set[str] = set()  # busy=مجموعه
+    busy: set[str] = set()  # busy=مجموعه خروجی
     for r in rows_sched:  # حلقه=اسلات‌ها
         busy.add(r["slot_start"].isoformat())  # افزودن=زمان
-    for r in rows_app:  # حلقه=appointmentها
+    for r in rows_app:  # حلقه=رزروها
         busy.add(r["start_time"].isoformat())  # افزودن=زمان
-    for r in rows_exec:  # حلقه=execution
+    for r in rows_exec:  # حلقه=اجرای فعال
         busy.add(r["execution_start"].isoformat())  # افزودن=زمان
 
     return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": sorted(busy)})  # پاسخ
@@ -1190,6 +1186,7 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
 
     sel_req = RequestTable.__table__.select().where(RequestTable.id == order_id)  # sel_req=کوئری سفارش
     req_row = await database.fetch_one(sel_req)  # req_row=سفارش
+    req_row = dict(req_row)  # تبدیل=Record به dict برای استفاده از .get
     if not req_row:  # شرط=سفارش نبود
         raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
 
@@ -1527,6 +1524,7 @@ async def get_proposed_slots(order_id: int, request: Request):  # تابع
 async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request):  # تابع
     sel_req = RequestTable.__table__.select().where(RequestTable.id == order_id)  # sel_req=کوئری سفارش
     req = await database.fetch_one(sel_req)  # req=سفارش
+    req = dict(req)  # تبدیل=Record به dict برای استفاده از .get
     if not req:  # شرط=نبود
         raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
 
@@ -1745,4 +1743,5 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن=آیتم
     return out  # بازگشت
+
 
