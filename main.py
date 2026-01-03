@@ -307,6 +307,7 @@ class LogoutRequest(BaseModel):  # خروج
 
 class RefreshAccessRequest(BaseModel):  # درخواست رفرش اکسس
     refresh_token: str  # رفرش توکن
+
 # -------------------- Security helpers --------------------
 
 def bcrypt_hash_password(password: str) -> str:  # هش رمز
@@ -356,7 +357,7 @@ def get_client_ip(request: Request) -> str:  # گرفتن IP کلاینت
     if xff:  # اگر بود
         return xff.split(",")[0].strip()  # اولین ip
     return request.client.host or "unknown"  # ip
-    
+
 def decode_access_token(token: str) -> Optional[dict]:  # دیکود JWT
     try:  # try
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])  # decode
@@ -445,7 +446,7 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime, 
         return False  # خروجی=غیرآزاد
 
     return True  # خروجی=آزاد
-    
+
 # -------------------- Push helpers --------------------
 
 _FCM_OAUTH_TOKEN = ""  # کش توکن OAuth
@@ -1153,6 +1154,8 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
     if not req_row:  # شرط=سفارش نبود
         raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
 
+    req_row = dict(req_row)  # FIX=تبدیل Record به dict تا .get کار کند
+
     cur_status = str(req_row.get("status") or "").strip().upper()  # cur_status=وضعیت نرمال
     if cur_status in ["FINISH", "CANCELED"]:  # شرط=سفارش بسته
         raise HTTPException(status_code=409, detail="order cannot accept new proposed slots")  # خطا=۴۰۹
@@ -1192,7 +1195,7 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
             .values(status="REJECTED")  # values=رد شده
         )  # پایان execute
 
-        await database.execute(  # لغو=رزروهای قبلی BOOKED همین سفارش (برای آزاد شدن زمان قبلی هنگام ارسال زمان جدید)
+        await database.execute(  # لغو=رزروهای قبلی BOOKED همین سفارش
             AppointmentTable.__table__.update()  # update=appointments
             .where(  # where
                 (AppointmentTable.request_id == order_id) &  # شرط=همین سفارش
@@ -1360,6 +1363,8 @@ async def finish_order(order_id: int, request: Request):  # تابع=اتمام 
     if not req:  # شرط=نبود
         raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
 
+    req = dict(req)  # FIX=تبدیل Record به dict تا .get کار کند
+
     now_iso = datetime.now(timezone.utc).isoformat()  # now_iso=زمان پایان
 
     async with database.transaction():  # transaction=اتمیک
@@ -1404,6 +1409,8 @@ async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغ�
     req = await database.fetch_one(sel_req)  # req=سفارش
     if not req:  # شرط=نبود
         raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
+
+    req = dict(req)  # FIX=تبدیل Record به dict تا .get کار کند
 
     upd_req = (  # upd_req=آپدیت سفارش
         RequestTable.__table__.update()  # update=requests
@@ -1454,76 +1461,6 @@ async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغ�
 
     return unified_response("ok", "ORDER_CANCELED", "order canceled by admin", {"order_id": int(order_id), "status": "CANCELED"})  # پاسخ
 
-# -------------------- Notifications (User) --------------------
-
-def _notif_row_to_dict(r) -> dict:  # تابع=تبدیل رکورد اعلان به dict
-    created = r["created_at"]  # created=زمان ایجاد
-    read_at = r["read_at"]  # read_at=زمان خواندن
-    return {  # خروجی
-        "id": int(r["id"]),  # id=شناسه
-        "user_phone": str(r["user_phone"] or ""),  # user_phone=شماره
-        "title": str(r["title"] or ""),  # title=عنوان
-        "body": str(r["body"] or ""),  # body=متن
-        "data": (r["data"] or {}),  # data=داده
-        "read": bool(r["read"]),  # read=خوانده؟
-        "created_at": (created.astimezone(timezone.utc).isoformat() if isinstance(created, datetime) else None),  # created_at=ISO
-        "read_at": (read_at.astimezone(timezone.utc).isoformat() if isinstance(read_at, datetime) else None)  # read_at=ISO
-    }  # پایان dict
-
-@app.get("/user/{phone}/notifications")  # مسیر=لیست اعلان‌ها
-async def get_notifications(phone: str, request: Request, only_unread: bool = True, limit: int = 20, offset: int = 0):  # تابع
-    norm = _normalize_phone(phone)  # norm=نرمال شماره
-    authed = _normalize_phone(get_auth_phone(request, fallback_phone=norm, enforce=True))  # authed=احراز
-    if authed != norm:  # شرط=عدم دسترسی
-        raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
-
-    lim = int(limit) if int(limit) > 0 else 20  # lim=limit
-    lim = 100 if lim > 100 else lim  # lim=سقف
-    off = int(offset) if int(offset) >= 0 else 0  # off=offset
-
-    sel = NotificationTable.__table__.select().where(  # sel=کوئری
-        NotificationTable.user_phone == norm  # شرط=کاربر
-    )  # پایان where
-    if only_unread:  # شرط=فقط unread
-        sel = sel.where(NotificationTable.read == False)  # افزودن شرط
-    sel = sel.order_by(NotificationTable.created_at.desc()).limit(lim).offset(off)  # ترتیب+limit+offset
-
-    rows = await database.fetch_all(sel)  # rows=اجرا
-    items = [_notif_row_to_dict(r) for r in rows]  # items=تبدیل
-    return unified_response("ok", "NOTIFICATIONS", "notifications", {"items": items})  # پاسخ
-
-@app.post("/user/{phone}/notifications/mark_all_read")  # مسیر=خوانده‌شدن همه
-async def mark_all_notifications_read(phone: str, request: Request):  # تابع
-    norm = _normalize_phone(phone)  # norm=نرمال
-    authed = _normalize_phone(get_auth_phone(request, fallback_phone=norm, enforce=True))  # authed=احراز
-    if authed != norm:  # شرط=عدم دسترسی
-        raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
-
-    now = datetime.now(timezone.utc)  # now=اکنون
-    upd = NotificationTable.__table__.update().where(  # upd=کوئری update
-        (NotificationTable.user_phone == norm) &  # شرط=کاربر
-        (NotificationTable.read == False)  # شرط=unread
-    ).values(read=True, read_at=now)  # values=read+time
-    count = await database.execute(upd)  # count=اجرا
-
-    return unified_response("ok", "ALL_READ", "all notifications marked as read", {"updated": count})  # پاسخ
-
-@app.post("/user/{phone}/notifications/{notif_id}/read")  # مسیر=خوانده‌شدن یکی
-async def mark_notification_read(phone: str, notif_id: int, request: Request):  # تابع
-    norm = _normalize_phone(phone)  # norm=نرمال
-    authed = _normalize_phone(get_auth_phone(request, fallback_phone=norm, enforce=True))  # authed=احراز
-    if authed != norm:  # شرط=عدم دسترسی
-        raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
-
-    now = datetime.now(timezone.utc)  # now=اکنون
-    upd = NotificationTable.__table__.update().where(  # upd=کوئری
-        (NotificationTable.id == int(notif_id)) &  # شرط=id
-        (NotificationTable.user_phone == norm)  # شرط=کاربر
-    ).values(read=True, read_at=now)  # values=read+time
-    await database.execute(upd)  # اجرا
-
-    return unified_response("ok", "READ", "notification marked as read", {"id": int(notif_id)})  # پاسخ
-
 # -------------------- New endpoints for user app scheduling --------------------
 
 @app.get("/order/{order_id}/proposed_slots")  # مسیر=اسلات‌های پیشنهادی کاربر
@@ -1553,6 +1490,8 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request
     req = await database.fetch_one(sel_req)  # req=سفارش
     if not req:  # شرط=نبود
         raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
+
+    req = dict(req)  # FIX=تبدیل Record به dict تا .get کار کند
 
     authed = get_auth_phone(request, fallback_phone=req["user_phone"], enforce=False)  # authed=احراز
     if authed != req["user_phone"]:  # شرط=عدم دسترسی
@@ -1681,6 +1620,9 @@ async def reject_all_and_cancel(order_id: int, request: Request):  # تابع
     req = await database.fetch_one(sel_req)  # req=سفارش
     if not req:  # شرط=نبود
         raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
+
+    req = dict(req)  # FIX=تبدیل Record به dict تا .get کار کند
+
     authed = get_auth_phone(request, fallback_phone=req["user_phone"], enforce=False)  # authed=احراز
     if authed != req["user_phone"]:  # شرط=عدم دسترسی
         raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
