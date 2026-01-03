@@ -435,55 +435,6 @@ def require_admin(request: Request):  # احراز مدیر
         return  # ok
     raise HTTPException(status_code=401, detail="admin auth required")  # 401
 
-# -------------------- Utils --------------------  # بخش=ابزارها
-
-async def provider_is_free(provider_phone: str, start: datetime, end: datetime, exclude_order_id: Optional[int] = None) -> bool:  # تابع=بررسی آزاد بودن سرویس‌دهنده
-    provider = _normalize_phone(provider_phone or "")  # provider=شماره سرویس‌دهنده نرمال‌شده
-    if not provider:  # شرط=شماره خالی/نامعتبر
-        return False  # خروجی=غیرآزاد
-
-    one_hour = text("interval '1 hour'")  # one_hour=اینترول یک ساعت در PostgreSQL
-
-    q_app = select(func.count()).select_from(AppointmentTable).where(  # q_app=شمارش رزروهای قطعی
-        (AppointmentTable.provider_phone == provider) &  # شرط=شماره سرویس‌دهنده
-        (AppointmentTable.status == "BOOKED") &  # شرط=رزرو شده
-        (AppointmentTable.start_time < end) &  # شرط=شروع قبل از پایان بازه
-        (AppointmentTable.end_time > start)  # شرط=پایان بعد از شروع بازه
-    )  # پایان q_app
-    if exclude_order_id is not None:  # شرط=نادیده گرفتن یک سفارش
-        q_app = q_app.where(AppointmentTable.request_id != exclude_order_id)  # افزودن=حذف سفارش جاری
-    app_count = await database.fetch_val(q_app)  # app_count=تعداد تداخل رزرو
-    if app_count and int(app_count) > 0:  # شرط=تداخل دارد
-        return False  # خروجی=غیرآزاد
-
-    slot_end = ScheduleSlotTable.slot_start + one_hour  # slot_end=پایان اسلات پیشنهادی (۱ ساعت)
-    q_slot = select(func.count()).select_from(ScheduleSlotTable).where(  # q_slot=شمارش زمان‌های رزرو-موقت
-        (ScheduleSlotTable.provider_phone == provider) &  # شرط=شماره سرویس‌دهنده
-        (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=پیشنهادی/پذیرفته (برای دیگران مشغول)
-        (ScheduleSlotTable.slot_start < end) &  # شرط=شروع اسلات قبل از پایان بازه
-        (slot_end > start)  # شرط=پایان اسلات بعد از شروع بازه
-    )  # پایان q_slot
-    if exclude_order_id is not None:  # شرط=نادیده گرفتن یک سفارش
-        q_slot = q_slot.where(ScheduleSlotTable.request_id != exclude_order_id)  # افزودن=حذف سفارش جاری
-    slot_count = await database.fetch_val(q_slot)  # slot_count=تعداد تداخل اسلات
-    if slot_count and int(slot_count) > 0:  # شرط=تداخل دارد
-        return False  # خروجی=غیرآزاد
-
-    exec_end = RequestTable.execution_start + one_hour  # exec_end=پایان اجرای کار (۱ ساعت)
-    q_exec = select(func.count()).select_from(RequestTable).where(  # q_exec=شمارش اجرای فعال
-        (RequestTable.driver_phone == provider) &  # شرط=شماره سرویس‌دهنده
-        (RequestTable.execution_start.is_not(None)) &  # شرط=زمان اجرا ثبت شده
-        (RequestTable.status.in_(["IN_PROGRESS", "STARTED"])) &  # شرط=در حال انجام/شروع
-        (RequestTable.execution_start < end) &  # شرط=شروع قبل از پایان بازه
-        (exec_end > start)  # شرط=پایان بعد از شروع بازه
-    )  # پایان q_exec
-    if exclude_order_id is not None:  # شرط=نادیده گرفتن سفارش
-        q_exec = q_exec.where(RequestTable.id != exclude_order_id)  # افزودن=حذف سفارش جاری
-    exec_count = await database.fetch_val(q_exec)  # exec_count=تعداد تداخل اجرا
-    if exec_count and int(exec_count) > 0:  # شرط=تداخل دارد
-        return False  # خروجی=غیرآزاد
-
-    return True  # خروجی=آزاد
     
 # -------------------- Push helpers --------------------
 
@@ -1134,6 +1085,72 @@ async def get_user_orders(user_phone: str, request: Request):  # تابع
     items = [dict(r) for r in result]  # items=تبدیل
     return unified_response("ok", "USER_ORDERS", "orders list", {"items": items})  # پاسخ
 
+# -------------------- Utils --------------------  # بخش=ابزارها
+
+async def provider_is_free(provider_phone: str, start: datetime, end: datetime, exclude_order_id: Optional[int] = None) -> bool:  # تابع=بررسی آزاد بودن سرویس‌دهنده
+    provider = _normalize_phone(provider_phone or "")  # provider=شماره سرویس‌دهنده نرمال‌شده
+    if not provider:  # شرط=شماره خالی/نامعتبر
+        return False  # خروجی=غیرآزاد
+
+    one_hour = text("interval '1 hour'")  # one_hour=اینترول یک ساعت در PostgreSQL
+
+    q_app = select(func.count()).select_from(AppointmentTable).where(  # q_app=شمارش رزروهای قطعی
+        (AppointmentTable.provider_phone == provider) &  # شرط=شماره سرویس‌دهنده
+        (AppointmentTable.status == "BOOKED") &  # شرط=رزرو شده
+        (AppointmentTable.start_time < end) &  # شرط=شروع قبل از پایان بازه
+        (AppointmentTable.end_time > start)  # شرط=پایان بعد از شروع بازه
+    )  # پایان q_app
+    if exclude_order_id is not None:  # شرط=نادیده گرفتن یک سفارش
+        q_app = q_app.where(AppointmentTable.request_id != exclude_order_id)  # افزودن=حذف سفارش جاری
+    app_count = await database.fetch_val(q_app)  # app_count=تعداد تداخل رزرو
+    if app_count and int(app_count) > 0:  # شرط=تداخل دارد
+        return False  # خروجی=غیرآزاد
+
+    slot_end = ScheduleSlotTable.slot_start + one_hour  # slot_end=پایان اسلات پیشنهادی (۱ ساعت)
+    q_slot = select(func.count()).select_from(ScheduleSlotTable).where(  # q_slot=شمارش زمان‌های رزرو-موقت
+        (ScheduleSlotTable.provider_phone == provider) &  # شرط=شماره سرویس‌دهنده
+        (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=پیشنهادی/پذیرفته (برای دیگران مشغول)
+        (ScheduleSlotTable.slot_start < end) &  # شرط=شروع اسلات قبل از پایان بازه
+        (slot_end > start)  # شرط=پایان اسلات بعد از شروع بازه
+    )  # پایان q_slot
+    if exclude_order_id is not None:  # شرط=نادیده گرفتن یک سفارش
+        q_slot = q_slot.where(ScheduleSlotTable.request_id != exclude_order_id)  # افزودن=حذف سفارش جاری
+    slot_count = await database.fetch_val(q_slot)  # slot_count=تعداد تداخل اسلات
+    if slot_count and int(slot_count) > 0:  # شرط=تداخل دارد
+        return False  # خروجی=غیرآزاد
+
+    exec_end = RequestTable.execution_start + one_hour  # exec_end=پایان اجرای کار (۱ ساعت)
+    q_exec = select(func.count()).select_from(RequestTable).where(  # q_exec=شمارش اجرای فعال
+        (RequestTable.driver_phone == provider) &  # شرط=شماره سرویس‌دهنده
+        (RequestTable.execution_start.is_not(None)) &  # شرط=زمان اجرا ثبت شده
+        (RequestTable.status.in_(["IN_PROGRESS", "STARTED"])) &  # شرط=در حال انجام/شروع
+        (RequestTable.execution_start < end) &  # شرط=شروع قبل از پایان بازه
+        (exec_end > start)  # شرط=پایان بعد از شروع بازه
+    )  # پایان q_exec
+    if exclude_order_id is not None:  # شرط=نادیده گرفتن سفارش
+        q_exec = q_exec.where(RequestTable.id != exclude_order_id)  # افزودن=حذف سفارش جاری
+    exec_count = await database.fetch_val(q_exec)  # exec_count=تعداد تداخل اجرا
+    if exec_count and int(exec_count) > 0:  # شرط=تداخل دارد
+        return False  # خروجی=غیرآزاد
+
+    # --- FIX: scheduled_start هم زمان رزرو شده است (WAITING/ASSIGNED/...) ---  # توضیح=پوشش داده‌های قدیمی/ناهماهنگ که appointment ندارند
+    visit_end = RequestTable.scheduled_start + one_hour  # visit_end=پایان زمان بازدید قطعی (۱ ساعت)
+    q_visit = select(func.count()).select_from(RequestTable).where(  # q_visit=شمارش تداخل زمان‌های scheduled_start
+        (RequestTable.driver_phone == provider) &  # شرط=شماره سرویس‌دهنده
+        (RequestTable.scheduled_start.is_not(None)) &  # شرط=زمان بازدید قطعی وجود دارد
+        (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"])) &  # شرط=وضعیت‌های فعال/در انتظار/تأیید
+        (RequestTable.scheduled_start < end) &  # شرط=شروع بازدید قبل از پایان بازه
+        (visit_end > start)  # شرط=پایان بازدید بعد از شروع بازه
+    )  # پایان q_visit
+    if exclude_order_id is not None:  # شرط=نادیده گرفتن سفارش
+        q_visit = q_visit.where(RequestTable.id != exclude_order_id)  # افزودن=حذف سفارش جاری
+    visit_count = await database.fetch_val(q_visit)  # visit_count=تعداد تداخل بازدید
+    if visit_count and int(visit_count) > 0:  # شرط=تداخل دارد
+        return False  # خروجی=غیرآزاد
+
+    return True  # خروجی=آزاد
+
+
 # -------------------- Scheduling --------------------
 
 @app.get("/busy_slots")  # مسیر=ساعات مشغول (بدون نیاز به provider_phone از UI)
@@ -1182,6 +1199,18 @@ async def get_busy_slots(  # تابع=لیست زمان‌های مشغول
         sel_exec = sel_exec.where(RequestTable.id != exclude_order_id)  # افزودن شرط=حذف سفارش جاری
     rows_exec = await database.fetch_all(sel_exec)  # rows_exec=نتیجه اجراها
 
+    # --- FIX: scheduled_start هم باید به عنوان زمان مشغول برگردد ---  # توضیح=رزروهای WAITING/ASSIGNED که ممکن است appointment نداشته باشند
+    sel_visit = RequestTable.__table__.select().where(  # sel_visit=کوئری زمان‌های بازدید قطعی/فعال
+        (RequestTable.scheduled_start >= day_start) &  # شرط=از شروع روز
+        (RequestTable.scheduled_start < day_end) &  # شرط=تا پایان روز
+        (RequestTable.scheduled_start.is_not(None)) &  # شرط=scheduled_start موجود
+        (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"])) &  # شرط=وضعیت‌های فعال/در انتظار/تأیید
+        (RequestTable.driver_phone == provider)  # شرط=شماره سرویس‌دهنده
+    )  # پایان where
+    if exclude_order_id is not None:  # شرط=exclude فعال است
+        sel_visit = sel_visit.where(RequestTable.id != exclude_order_id)  # افزودن شرط=حذف سفارش جاری
+    rows_visit = await database.fetch_all(sel_visit)  # rows_visit=نتیجه بازدیدها
+
     busy: set[str] = set()  # busy=مجموعه زمان‌های مشغول
     for r in rows_sched:  # حلقه=اسلات‌ها
         busy.add(r["slot_start"].isoformat())  # افزودن=زمان اسلات
@@ -1189,9 +1218,10 @@ async def get_busy_slots(  # تابع=لیست زمان‌های مشغول
         busy.add(r["start_time"].isoformat())  # افزودن=زمان رزرو
     for r in rows_exec:  # حلقه=اجراها
         busy.add(r["execution_start"].isoformat())  # افزودن=زمان اجرا
+    for r in rows_visit:  # حلقه=بازدیدهای قطعی
+        busy.add(r["scheduled_start"].isoformat())  # افزودن=زمان بازدید قطعی
 
-    return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": sorted(busy)})  # پاسخ=لیست زمان‌های مشغول
-    
+    return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": sorted(busy)})  # پاسخ=لیست زمان‌های مشغول    
 # -------------------- Propose slots (Manager) --------------------
 
 @app.post("/order/{order_id}/propose_slots")  # مسیر=ثبت زمان‌های پیشنهادی (بدون اسلش)
@@ -1761,6 +1791,7 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن=آیتم
     return out  # بازگشت
+
 
 
 
