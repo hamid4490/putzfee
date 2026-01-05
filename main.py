@@ -1577,55 +1577,54 @@ async def get_proposed_slots(order_id: int, request: Request):  # تابع
 
 @app.post("/order/{order_id}/confirm_slot")  # مسیر=تأیید زمان (بدون اسلش)
 @app.post("/order/{order_id}/confirm_slot/")  # مسیر=تأیید زمان (با اسلش)
-async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request):  # تابع
+async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request):  # تابع=تأیید زمان بازدید توسط کاربر
     sel_req = RequestTable.__table__.select().where(RequestTable.id == order_id)  # sel_req=کوئری سفارش
-    req = await database.fetch_one(sel_req)  # req=سفارش
-    req = dict(req)  # تبدیل=Record به dict برای استفاده از .get
-    if not req:  # شرط=نبود
+    req_row = await database.fetch_one(sel_req)  # req_row=گرفتن سفارش از دیتابیس
+    if not req_row:  # شرط=سفارش وجود ندارد
         raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
 
-    req = dict(req)  # FIX=تبدیل Record به dict تا .get کار کند
+    req = dict(req_row)  # req=تبدیل Record به dict برای دسترسی امن با .get
 
-    authed = get_auth_phone(request, fallback_phone=req["user_phone"], enforce=False)  # authed=احراز
+    authed = get_auth_phone(request, fallback_phone=req["user_phone"], enforce=False)  # authed=شماره احراز شده
     if authed != req["user_phone"]:  # شرط=عدم دسترسی
         raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
 
-    if req.get("execution_start") is not None:  # شرط=زمان اجرا ثبت شده
+    if req.get("execution_start") is not None:  # شرط=زمان اجرا قبلاً ثبت شده
         raise HTTPException(status_code=409, detail={"code": "CANNOT_CONFIRM", "message": "cannot confirm slot after execution time is set"})  # خطا=۴۰۹
 
-    st = str(req.get("status") or "").strip().upper()  # st=وضعیت نرمال
-    if st not in ["WAITING", "ASSIGNED", "NEW"]:  # شرط=قابل تأیید
+    st = str(req.get("status") or "").strip().upper()  # st=وضعیت سفارش نرمال
+    if st not in ["WAITING", "ASSIGNED", "NEW"]:  # شرط=وضعیت نامعتبر برای تأیید
         raise HTTPException(status_code=409, detail={"code": "CANNOT_CONFIRM", "message": "order is not in schedulable state"})  # خطا=۴۰۹
 
-    slot_dt = parse_iso(body.slot)  # slot_dt=پارس زمان
-    end_dt = slot_dt + timedelta(hours=1)  # end_dt=پایان ۱ ساعت
+    slot_dt = parse_iso(body.slot)  # slot_dt=پارس زمان انتخابی (UTC)
+    end_dt = slot_dt + timedelta(hours=1)  # end_dt=پایان بازه یک‌ساعته
 
-    service_type = str(req.get("service_type") or "")  # service_type=نوع سرویس
-    provider = ""  # provider=شماره سرویس‌دهنده
+    service_type = str(req.get("service_type") or "")  # service_type=نوع سرویس سفارش
+    provider = ""  # provider=شماره سرویس‌دهنده (از اسلات)
 
     async with database.transaction():  # transaction=اتمیک
         sel_slot = ScheduleSlotTable.__table__.select().where(  # sel_slot=کوئری اسلات انتخابی
-            (ScheduleSlotTable.request_id == order_id) &  # شرط=سفارش
-            (ScheduleSlotTable.slot_start == slot_dt) &  # شرط=زمان
-            (ScheduleSlotTable.status == "PROPOSED")  # شرط=پیشنهادی
+            (ScheduleSlotTable.request_id == order_id) &  # شرط=همین سفارش
+            (ScheduleSlotTable.slot_start == slot_dt) &  # شرط=همین زمان
+            (ScheduleSlotTable.status == "PROPOSED")  # شرط=اسلات پیشنهادی
         )  # پایان where
-        slot_row = await database.fetch_one(sel_slot)  # slot_row=اسلات
-        if not slot_row:  # شرط=نبود
+        slot_row = await database.fetch_one(sel_slot)  # slot_row=گرفتن اسلات
+        if not slot_row:  # شرط=اسلات یافت نشد
             raise HTTPException(status_code=404, detail="slot not found for this order")  # خطا=۴۰۴
 
-        provider = _normalize_phone(slot_row["provider_phone"] or "")  # provider=نرمال شماره
-        if not provider:  # شرط=خالی
+        provider = _normalize_phone(slot_row["provider_phone"] or "")  # provider=نرمال شماره سرویس‌دهنده
+        if not provider:  # شرط=شماره سرویس‌دهنده خالی
             raise HTTPException(status_code=400, detail="provider_phone missing on slot")  # خطا=۴۰۰
 
-        free = await provider_is_free(provider, slot_dt, end_dt, exclude_order_id=order_id)  # free=آزاد بودن
-        if not free:  # شرط=تداخل
+        free = await provider_is_free(provider, slot_dt, end_dt, exclude_order_id=order_id)  # free=بررسی تداخل برنامه
+        if not free:  # شرط=تداخل زمان
             raise HTTPException(status_code=409, detail="selected slot overlaps with existing schedule")  # خطا=۴۰۹
 
-        await database.execute(  # لغو=همه رزروهای BOOKED قبلی این سفارش غیر از اسلات جدید
+        await database.execute(  # لغو=رزروهای BOOKED قبلی این سفارش غیر از زمان جدید
             AppointmentTable.__table__.update()  # update=appointments
             .where(  # where
-                (AppointmentTable.request_id == order_id) &  # شرط=سفارش
-                (AppointmentTable.status == "BOOKED") &  # شرط=رزرو
+                (AppointmentTable.request_id == order_id) &  # شرط=همین سفارش
+                (AppointmentTable.status == "BOOKED") &  # شرط=رزرو فعال
                 ((AppointmentTable.start_time != slot_dt) | (AppointmentTable.end_time != end_dt))  # شرط=غیر از انتخاب جدید
             )  # پایان where
             .values(status="CANCELED")  # values=لغو
@@ -1634,20 +1633,20 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request
         await database.execute(  # رد=سایر اسلات‌های فعال
             ScheduleSlotTable.__table__.update()  # update=schedule_slots
             .where(  # where
-                (ScheduleSlotTable.request_id == order_id) &  # شرط=سفارش
+                (ScheduleSlotTable.request_id == order_id) &  # شرط=همین سفارش
                 (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=فعال
                 (ScheduleSlotTable.slot_start != slot_dt)  # شرط=غیر از انتخابی
             )  # پایان where
-            .values(status="REJECTED")  # values=REJECTED
+            .values(status="REJECTED")  # values=رد شده
         )  # پایان execute
 
         await database.execute(  # قبول=اسلات انتخابی
             ScheduleSlotTable.__table__.update()  # update=schedule_slots
             .where(  # where
-                (ScheduleSlotTable.request_id == order_id) &  # شرط=سفارش
-                (ScheduleSlotTable.slot_start == slot_dt)  # شرط=زمان
+                (ScheduleSlotTable.request_id == order_id) &  # شرط=همین سفارش
+                (ScheduleSlotTable.slot_start == slot_dt)  # شرط=همین زمان
             )  # پایان where
-            .values(status="ACCEPTED")  # values=ACCEPTED
+            .values(status="ACCEPTED")  # values=پذیرفته
         )  # پایان execute
 
         sel_exist = AppointmentTable.__table__.select().where(  # sel_exist=بررسی رزرو موجود برای همین زمان
@@ -1657,56 +1656,44 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request
             (AppointmentTable.end_time == end_dt) &  # شرط=پایان
             (AppointmentTable.status == "BOOKED")  # شرط=رزرو
         )  # پایان where
-        exist = await database.fetch_one(sel_exist)  # exist=گرفتن
-        if not exist:  # شرط=وجود ندارد
+        exist = await database.fetch_one(sel_exist)  # exist=گرفتن رزرو
+        if not exist:  # شرط=رزرو وجود ندارد
             await database.execute(  # insert=رزرو جدید
-                AppointmentTable.__table__.insert().values(  # values
-                    provider_phone=provider,  # provider_phone=شماره
-                    request_id=order_id,  # request_id=سفارش
+                AppointmentTable.__table__.insert().values(  # values=داده‌ها
+                    provider_phone=provider,  # provider_phone=شماره سرویس‌دهنده
+                    request_id=order_id,  # request_id=شناسه سفارش
                     start_time=slot_dt,  # start_time=شروع
                     end_time=end_dt,  # end_time=پایان
                     status="BOOKED",  # status=رزرو
-                    created_at=datetime.now(timezone.utc)  # created_at=اکنون
+                    created_at=datetime.now(timezone.utc)  # created_at=اکنون UTC
                 )  # پایان values
             )  # پایان execute
 
         await database.execute(  # آپدیت=سفارش با زمان قطعی
             RequestTable.__table__.update()  # update=requests
             .where(RequestTable.id == order_id)  # where=id
-            .values(scheduled_start=slot_dt, status="ASSIGNED", driver_phone=provider)  # values=زمان قطعی+وضعیت+سرویس‌دهنده
+            .values(scheduled_start=slot_dt, status="ASSIGNED", driver_phone=provider)  # values=زمان قطعی + وضعیت + سرویس‌دهنده
         )  # پایان execute
 
-    try:  # try=اعلان‌ها
-        await notify_user(  # اعلان=به کاربر
-            phone=req["user_phone"],  # phone=شماره کاربر
-            title="زمان بازدید تأیید شد",  # title=عنوان
-            body="زمان بازدید توسط شما تأیید شد.",  # body=متن
-            data=order_push_data(  # data=دیتای استاندارد
-                msg_type="time_confirm",  # type=تأیید زمان
-                order_id=order_id,  # order_id=شناسه
-                status="ASSIGNED",  # status=وضعیت
-                service_type=service_type,  # service_type=نوع سرویس
-                scheduled_start=slot_dt  # scheduled_start=زمان قطعی
-            )  # پایان data
-        )  # پایان notify_user
-
+    # --- تغییر اصلی: اعلان کاربر حذف شد؛ فقط مدیر اعلان می‌گیرد ---  # توضیح=طبق خواسته جدید
+    try:  # try=محافظ اعلان مدیر
         await notify_managers(  # اعلان=به مدیر/سرویس‌دهنده
             title="تأیید زمان بازدید",  # title=عنوان
             body=f"کاربر زمان بازدید را تأیید کرد (order_id={order_id}).",  # body=متن
-            data=order_push_data(  # data=دیتا
-                msg_type="time_confirm",  # type=تأیید زمان
-                order_id=order_id,  # order_id=شناسه
-                status="ASSIGNED",  # status=وضعیت
+            data=order_push_data(  # data=دیتای استاندارد
+                msg_type="time_confirm",  # msg_type=نوع پیام
+                order_id=order_id,  # order_id=شناسه سفارش
+                status="ASSIGNED",  # status=وضعیت جدید
                 service_type=service_type,  # service_type=نوع سرویس
-                scheduled_start=slot_dt  # scheduled_start=زمان
+                scheduled_start=slot_dt  # scheduled_start=زمان قطعی بازدید
             ),  # پایان data
-            target_phone=_normalize_phone(provider)  # target_phone=هدف
+            target_phone=_normalize_phone(provider)  # target_phone=شماره مدیر هدف (سرویس‌دهنده)
         )  # پایان notify_managers
     except Exception as e:  # خطا
-        logger.error(f"notify(confirm_slot) failed: {e}")  # لاگ=خطا
+        logger.error(f"notify(confirm_slot->manager_only) failed: {e}")  # لاگ=خطا
 
-    return unified_response("ok", "SLOT_CONFIRMED", "slot confirmed", {"start": slot_dt.isoformat(), "end": end_dt.isoformat()})  # پاسخ
-
+    return unified_response("ok", "SLOT_CONFIRMED", "slot confirmed", {"start": slot_dt.isoformat(), "end": end_dt.isoformat()})  # پاسخ=موفقیت
+    
 @app.post("/order/{order_id}/reject_all_and_cancel")  # مسیر=رد همه و کنسل
 async def reject_all_and_cancel(order_id: int, request: Request):  # تابع
     sel_req = RequestTable.__table__.select().where(RequestTable.id == order_id)  # sel_req=کوئری سفارش
@@ -1799,6 +1786,7 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن=آیتم
     return out  # بازگشت
+
 
 
 
