@@ -1346,10 +1346,13 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # 
     if not req_row:  # شرط=سفارش نبود
         raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
 
-    exec_dt: Optional[datetime] = None  # exec_dt=زمان اجرا
-    new_status = "PRICE_REJECTED"  # new_status=پیش‌فرض
+    req_row = dict(req_row)  # تبدیل=Record به dict برای دسترسی با .get
 
-    provider = (req_row["driver_phone"] or "").strip()  # provider=شماره سرویس‌دهنده
+    exec_dt: Optional[datetime] = None  # exec_dt=زمان اجرا
+    new_status = "PRICE_REJECTED"  # new_status=پیش‌فرض وضعیت
+
+    provider = (req_row.get("driver_phone") or "").strip()  # provider=شماره سرویس‌دهنده
+    service_type = str(req_row.get("service_type") or "").strip()  # service_type=نوع سرویس (برای ارسال در پوش)
 
     async with database.transaction():  # transaction=اتمیک
         if body.agree:  # شرط=توافق
@@ -1401,25 +1404,30 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # 
                 phone=req_row["user_phone"],  # phone=شماره کاربر
                 title="توافق قیمت",  # title=عنوان
                 body=f"قیمت {int(body.price)} ثبت شد. زمان اجرا: {exec_dt.isoformat() if exec_dt else ''}",  # body=متن
-                data={  # data=داده
-                    "type": "execution_time",  # type=زمان اجرا
-                    "order_id": int(order_id),  # order_id=شناسه
-                    "status": new_status,  # status=وضعیت
-                    "price": int(body.price),  # price=قیمت
-                    "execution_start": exec_dt.isoformat() if exec_dt else ""  # execution_start=زمان اجرا
-                }  # پایان data
+                data=order_push_data(  # data=دیتای استاندارد (دارای service_type)
+                    msg_type="execution_time",  # msg_type=نوع پیام قبلی (سازگاری)
+                    order_id=int(order_id),  # order_id=شناسه
+                    status=str(new_status),  # status=وضعیت
+                    service_type=service_type,  # service_type=نوع سرویس (رفع مشکل رفتن به نظافت کلی)
+                    scheduled_start=req_row.get("scheduled_start"),  # scheduled_start=ارسال در صورت وجود (برای سازگاری)
+                    execution_start=exec_dt,  # execution_start=زمان اجرا
+                    price=int(body.price)  # price=قیمت
+                )  # پایان data
             )  # پایان notify_user
         else:  # حالت=عدم توافق
             await notify_user(  # اعلان=به کاربر
                 phone=req_row["user_phone"],  # phone=شماره کاربر
                 title="عدم توافق قیمت",  # title=عنوان
                 body="قیمت مورد توافق قرار نگرفت.",  # body=متن
-                data={  # data=داده
-                    "type": "price_set",  # type=قیمت
-                    "order_id": int(order_id),  # order_id=شناسه
-                    "status": new_status,  # status=وضعیت
-                    "price": int(body.price)  # price=قیمت
-                }  # پایان data
+                data=order_push_data(  # data=دیتای استاندارد (دارای service_type)
+                    msg_type="price_set",  # msg_type=نوع پیام قبلی (سازگاری)
+                    order_id=int(order_id),  # order_id=شناسه
+                    status=str(new_status),  # status=وضعیت
+                    service_type=service_type,  # service_type=نوع سرویس
+                    scheduled_start=req_row.get("scheduled_start"),  # scheduled_start=ارسال در صورت وجود
+                    execution_start=None,  # execution_start=ندارد
+                    price=int(body.price)  # price=قیمت
+                )  # پایان data
             )  # پایان notify_user
     except Exception as e:  # خطا
         logger.error(f"notify_user(admin_set_price) failed: {e}")  # لاگ=خطا
@@ -1435,7 +1443,7 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # 
             "execution_start": (saved["execution_start"].isoformat() if (saved and saved["execution_start"]) else None)  # execution_start=زمان اجرا
         }  # پایان data
     )  # پایان پاسخ
-
+    
 # -------------------- Confirm / Finish workflow --------------------
 
 @app.post("/order/{order_id}/finish")  # مسیر=اتمام کار
@@ -1791,6 +1799,7 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن=آیتم
     return out  # بازگشت
+
 
 
 
