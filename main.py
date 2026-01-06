@@ -1547,6 +1547,8 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
     
 # -------------------- Admin workflow --------------------
 
+# -------------------- Admin workflow --------------------
+
 @app.post("/admin/order/{order_id}/price")  # مسیر=ثبت قیمت/توافق توسط مدیر
 async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # تابع=ثبت قیمت/زمان اجرا
     require_admin(request)  # احراز=مدیر
@@ -1578,25 +1580,56 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # 
             if not free:  # شرط=تداخل
                 raise HTTPException(status_code=409, detail="execution time overlaps with existing schedule")  # خطا=۴۰۹
 
-            sel_exist = AppointmentTable.__table__.select().where(  # sel_exist=بررسی رزرو موجود
+            # --- FIX: به‌جای INSERT، اگر رکورد همان بازه قبلاً وجود دارد UPDATE می‌کنیم ---  # توضیح=رفع خطای uq_provider_slot
+            sel_any = AppointmentTable.__table__.select().where(  # sel_any=جستجوی رکورد appointment با همان بازه
                 (AppointmentTable.provider_phone == provider) &  # شرط=provider
-                (AppointmentTable.request_id == order_id) &  # شرط=سفارش
-                (AppointmentTable.start_time == exec_dt) &  # شرط=شروع
-                (AppointmentTable.end_time == end_dt) &  # شرط=پایان
-                (AppointmentTable.status == "BOOKED")  # شرط=رزرو
-            )  # پایان where
-            exist = await database.fetch_one(sel_exist)  # exist=گرفتن
-            if not exist:  # شرط=وجود ندارد
-                await database.execute(  # insert=appointment
-                    AppointmentTable.__table__.insert().values(  # values
-                        provider_phone=provider,  # provider_phone=شماره
-                        request_id=order_id,  # request_id=سفارش
-                        start_time=exec_dt,  # start_time=شروع
-                        end_time=end_dt,  # end_time=پایان
-                        status="BOOKED",  # status=رزرو
-                        created_at=datetime.now(timezone.utc)  # created_at=اکنون
-                    )  # پایان values
-                )  # پایان execute
+                (AppointmentTable.start_time == exec_dt) &  # شرط=start
+                (AppointmentTable.end_time == end_dt)  # شرط=end
+            ).limit(1)  # limit=۱
+            any_row = await database.fetch_one(sel_any)  # any_row=نتیجه
+
+            if any_row:  # شرط=رکورد وجود دارد
+                # اگر رکورد برای سفارش دیگری BOOKED است، تداخل واقعی است  # توضیح=محافظت در برابر race
+                if (str(any_row["status"] or "").strip().upper() == "BOOKED") and (int(any_row["request_id"] or 0) != int(order_id)):  # شرط=BOOKED برای سفارش دیگر
+                    raise HTTPException(status_code=409, detail="execution time overlaps with existing schedule")  # خطا=۴۰۹
+
+                upd_app = AppointmentTable.__table__.update().where(  # upd_app=آپدیت رکورد موجود
+                    AppointmentTable.id == any_row["id"]  # شرط=id
+                ).values(  # values=مقادیر جدید
+                    request_id=order_id,  # request_id=این سفارش
+                    status="BOOKED"  # status=رزرو شده
+                )  # پایان values
+                await database.execute(upd_app)  # اجرا=آپدیت
+            else:  # حالت=رکورد وجود ندارد
+                try:  # try=محافظ برخورد همزمان
+                    await database.execute(  # insert=appointment جدید
+                        AppointmentTable.__table__.insert().values(  # values
+                            provider_phone=provider,  # provider_phone=شماره
+                            request_id=order_id,  # request_id=سفارش
+                            start_time=exec_dt,  # start_time=شروع
+                            end_time=end_dt,  # end_time=پایان
+                            status="BOOKED",  # status=رزرو
+                            created_at=datetime.now(timezone.utc)  # created_at=اکنون
+                        )  # پایان values
+                    )  # پایان execute
+                except Exception as e:  # catch=خطا
+                    msg = str(e)  # msg=متن خطا
+                    if ("uq_provider_slot" in msg) or ("duplicate key value" in msg):  # شرط=برخورد یکتا
+                        # در برخورد یکتا، مجدد رکورد را گرفته و UPDATE می‌کنیم  # توضیح=رفع خطای ثبت تکراری
+                        any_row2 = await database.fetch_one(sel_any)  # any_row2=خواندن مجدد
+                        if any_row2:  # شرط=پیدا شد
+                            if (str(any_row2["status"] or "").strip().upper() == "BOOKED") and (int(any_row2["request_id"] or 0) != int(order_id)):  # شرط=BOOKED برای سفارش دیگر
+                                raise HTTPException(status_code=409, detail="execution time overlaps with existing schedule")  # خطا=۴۰۹
+                            await database.execute(  # اجرا=آپدیت
+                                AppointmentTable.__table__.update().where(AppointmentTable.id == any_row2["id"]).values(  # update by id
+                                    request_id=order_id,  # request_id=این سفارش
+                                    status="BOOKED"  # status=رزرو
+                                )  # پایان values
+                            )  # پایان execute
+                        else:  # حالت=باز هم پیدا نشد
+                            raise  # raise=پرتاب مجدد
+                    else:  # حالت=خطای دیگر
+                        raise  # raise=پرتاب مجدد
 
             new_status = "IN_PROGRESS"  # new_status=در حال انجام
 
@@ -1614,12 +1647,12 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # 
                 phone=req_row["user_phone"],  # phone=شماره کاربر
                 title="توافق قیمت",  # title=عنوان
                 body=f"قیمت {int(body.price)} ثبت شد. زمان اجرا: {exec_dt.isoformat() if exec_dt else ''}",  # body=متن
-                data=order_push_data(  # data=دیتای استاندارد (دارای service_type)
-                    msg_type="execution_time",  # msg_type=نوع پیام قبلی (سازگاری)
+                data=order_push_data(  # data=دیتای استاندارد
+                    msg_type="execution_time",  # msg_type=نوع پیام
                     order_id=int(order_id),  # order_id=شناسه
                     status=str(new_status),  # status=وضعیت
-                    service_type=service_type,  # service_type=نوع سرویس (رفع مشکل رفتن به نظافت کلی)
-                    scheduled_start=req_row.get("scheduled_start"),  # scheduled_start=ارسال در صورت وجود (برای سازگاری)
+                    service_type=service_type,  # service_type=نوع سرویس
+                    scheduled_start=req_row.get("scheduled_start"),  # scheduled_start=برای سازگاری
                     execution_start=exec_dt,  # execution_start=زمان اجرا
                     price=int(body.price)  # price=قیمت
                 )  # پایان data
@@ -1629,12 +1662,12 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # 
                 phone=req_row["user_phone"],  # phone=شماره کاربر
                 title="عدم توافق قیمت",  # title=عنوان
                 body="قیمت مورد توافق قرار نگرفت.",  # body=متن
-                data=order_push_data(  # data=دیتای استاندارد (دارای service_type)
-                    msg_type="price_set",  # msg_type=نوع پیام قبلی (سازگاری)
+                data=order_push_data(  # data=دیتای استاندارد
+                    msg_type="price_set",  # msg_type=نوع پیام
                     order_id=int(order_id),  # order_id=شناسه
                     status=str(new_status),  # status=وضعیت
                     service_type=service_type,  # service_type=نوع سرویس
-                    scheduled_start=req_row.get("scheduled_start"),  # scheduled_start=ارسال در صورت وجود
+                    scheduled_start=req_row.get("scheduled_start"),  # scheduled_start=برای سازگاری
                     execution_start=None,  # execution_start=ندارد
                     price=int(body.price)  # price=قیمت
                 )  # پایان data
@@ -1653,6 +1686,155 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # 
             "execution_start": (saved["execution_start"].isoformat() if (saved and saved["execution_start"]) else None)  # execution_start=زمان اجرا
         }  # پایان data
     )  # پایان پاسخ
+
+
+# -------------------- Confirm slot (User) --------------------
+
+@app.post("/order/{order_id}/confirm_slot")  # مسیر=تأیید زمان (بدون اسلش)
+@app.post("/order/{order_id}/confirm_slot/")  # مسیر=تأیید زمان (با اسلش)
+async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request):  # تابع=تأیید زمان بازدید توسط کاربر
+    sel_req = RequestTable.__table__.select().where(RequestTable.id == order_id)  # sel_req=کوئری سفارش
+    req_row = await database.fetch_one(sel_req)  # req_row=گرفتن سفارش
+    if not req_row:  # شرط=سفارش وجود ندارد
+        raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
+
+    req = dict(req_row)  # req=تبدیل Record به dict
+
+    authed = get_auth_phone(request, fallback_phone=req["user_phone"], enforce=False)  # authed=شماره احراز شده
+    if authed != req["user_phone"]:  # شرط=عدم دسترسی
+        raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
+
+    if req.get("execution_start") is not None:  # شرط=زمان اجرا قبلاً ثبت شده
+        raise HTTPException(status_code=409, detail={"code": "CANNOT_CONFIRM", "message": "cannot confirm slot after execution time is set"})  # خطا=۴۰۹
+
+    st = str(req.get("status") or "").strip().upper()  # st=وضعیت سفارش نرمال
+    if st not in ["WAITING", "ASSIGNED", "NEW"]:  # شرط=وضعیت نامعتبر برای تأیید
+        raise HTTPException(status_code=409, detail={"code": "CANNOT_CONFIRM", "message": "order is not in schedulable state"})  # خطا=۴۰۹
+
+    slot_dt = parse_iso(body.slot)  # slot_dt=پارس زمان انتخابی (UTC)
+    end_dt = slot_dt + timedelta(hours=1)  # end_dt=پایان بازه یک‌ساعته
+
+    service_type = str(req.get("service_type") or "")  # service_type=نوع سرویس سفارش
+    provider = ""  # provider=شماره سرویس‌دهنده
+
+    async with database.transaction():  # transaction=اتمیک
+        sel_slot = ScheduleSlotTable.__table__.select().where(  # sel_slot=کوئری اسلات انتخابی
+            (ScheduleSlotTable.request_id == order_id) &  # شرط=همین سفارش
+            (ScheduleSlotTable.slot_start == slot_dt) &  # شرط=همین زمان
+            (ScheduleSlotTable.status == "PROPOSED")  # شرط=اسلات پیشنهادی
+        )  # پایان where
+        slot_row = await database.fetch_one(sel_slot)  # slot_row=گرفتن اسلات
+        if not slot_row:  # شرط=اسلات یافت نشد
+            raise HTTPException(status_code=404, detail="slot not found for this order")  # خطا=۴۰۴
+
+        provider = _normalize_phone(slot_row["provider_phone"] or "")  # provider=نرمال شماره سرویس‌دهنده
+        if not provider:  # شرط=شماره سرویس‌دهنده خالی
+            raise HTTPException(status_code=400, detail="provider_phone missing on slot")  # خطا=۴۰۰
+
+        free = await provider_is_free(provider, slot_dt, end_dt, exclude_order_id=order_id)  # free=بررسی تداخل
+        if not free:  # شرط=تداخل زمان
+            raise HTTPException(status_code=409, detail="selected slot overlaps with existing schedule")  # خطا=۴۰۹
+
+        await database.execute(  # لغو=رزروهای BOOKED قبلی این سفارش غیر از زمان جدید
+            AppointmentTable.__table__.update()
+            .where(
+                (AppointmentTable.request_id == order_id) &
+                (AppointmentTable.status == "BOOKED") &
+                ((AppointmentTable.start_time != slot_dt) | (AppointmentTable.end_time != end_dt))
+            )
+            .values(status="CANCELED")
+        )
+
+        await database.execute(  # رد=سایر اسلات‌های فعال
+            ScheduleSlotTable.__table__.update()
+            .where(
+                (ScheduleSlotTable.request_id == order_id) &
+                (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &
+                (ScheduleSlotTable.slot_start != slot_dt)
+            )
+            .values(status="REJECTED")
+        )
+
+        await database.execute(  # قبول=اسلات انتخابی
+            ScheduleSlotTable.__table__.update()
+            .where(
+                (ScheduleSlotTable.request_id == order_id) &
+                (ScheduleSlotTable.slot_start == slot_dt)
+            )
+            .values(status="ACCEPTED")
+        )
+
+        # --- FIX: به‌جای INSERT، اگر appointment همان بازه قبلاً وجود دارد UPDATE می‌کنیم ---  # توضیح=رفع خطای uq_provider_slot
+        sel_any = AppointmentTable.__table__.select().where(  # sel_any=جستجوی رکورد appointment با همان بازه
+            (AppointmentTable.provider_phone == provider) &
+            (AppointmentTable.start_time == slot_dt) &
+            (AppointmentTable.end_time == end_dt)
+        ).limit(1)
+        any_row = await database.fetch_one(sel_any)  # any_row=نتیجه
+
+        if any_row:  # شرط=رکورد وجود دارد
+            if (str(any_row["status"] or "").strip().upper() == "BOOKED") and (int(any_row["request_id"] or 0) != int(order_id)):  # شرط=BOOKED برای سفارش دیگر
+                raise HTTPException(status_code=409, detail="selected slot overlaps with existing schedule")  # خطا=۴۰۹
+
+            await database.execute(  # اجرا=آپدیت رکورد موجود
+                AppointmentTable.__table__.update().where(AppointmentTable.id == any_row["id"]).values(
+                    request_id=order_id,
+                    status="BOOKED"
+                )
+            )
+        else:  # حالت=رکورد وجود ندارد
+            try:
+                await database.execute(  # insert=رزرو جدید
+                    AppointmentTable.__table__.insert().values(
+                        provider_phone=provider,
+                        request_id=order_id,
+                        start_time=slot_dt,
+                        end_time=end_dt,
+                        status="BOOKED",
+                        created_at=datetime.now(timezone.utc)
+                    )
+                )
+            except Exception as e:
+                msg = str(e)
+                if ("uq_provider_slot" in msg) or ("duplicate key value" in msg):
+                    any_row2 = await database.fetch_one(sel_any)
+                    if any_row2:
+                        if (str(any_row2["status"] or "").strip().upper() == "BOOKED") and (int(any_row2["request_id"] or 0) != int(order_id)):
+                            raise HTTPException(status_code=409, detail="selected slot overlaps with existing schedule")
+                        await database.execute(
+                            AppointmentTable.__table__.update().where(AppointmentTable.id == any_row2["id"]).values(
+                                request_id=order_id,
+                                status="BOOKED"
+                            )
+                        )
+                    else:
+                        raise
+                else:
+                    raise
+
+        await database.execute(  # آپدیت=سفارش با زمان قطعی
+            RequestTable.__table__.update()
+            .where(RequestTable.id == order_id)
+            .values(scheduled_start=slot_dt, status="ASSIGNED", driver_phone=provider)
+        )
+
+    try:  # try=اعلان مدیر
+        await notify_managers(
+            title="تأیید زمان بازدید",
+            body=f"کاربر زمان بازدید را تأیید کرد (order_id={order_id}).",
+            data=order_push_data(
+                msg_type="time_confirm",
+                order_id=order_id,
+                status="ASSIGNED",
+                service_type=service_type,
+                scheduled_start=slot_dt
+            ),
+            target_phone=_normalize_phone(provider)
+        )
+    except Exception as e:
+        logger.error(f"notify(confirm_slot->manager_only) failed: {e}")
+
+    return unified_response("ok", "SLOT_CONFIRMED", "slot confirmed", {"start": slot_dt.isoformat(), "end": end_dt.isoformat()})
     
 # -------------------- Confirm / Finish workflow --------------------
 
@@ -2005,6 +2187,7 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن=آیتم
     return out  # بازگشت
+
 
 
 
