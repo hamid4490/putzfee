@@ -16,8 +16,8 @@ from pydantic import BaseModel  # Pydantic
 
 from sqlalchemy import (  # import=SQLAlchemy
     Column, Integer, String, Float, Boolean, DateTime,  # ستون‌ها
-    ForeignKey, Index, select, func, and_, text, UniqueConstraint  # ابزارها
-)
+    ForeignKey, Index, select, func, and_, or_, text, UniqueConstraint  # ابزارها  # or_=عملگر OR برای جستجو روی raw/norm
+)  # پایان import
 from sqlalchemy.dialects.postgresql import JSONB  # JSONB
 from sqlalchemy.ext.declarative import declarative_base  # Base ORM
 import sqlalchemy  # Engine
@@ -862,87 +862,247 @@ async def unregister_push_token(body: PushUnregister):  # تابع
 
 @app.get("/users/exists")  # بررسی وجود کاربر
 async def user_exists(phone: str):  # تابع
-    q = select(func.count()).select_from(UserTable).where(  # q=count
-        UserTable.phone == phone  # شرط=شماره
-    )  # پایان where
-    count = await database.fetch_val(q)  # count=اجرا
-    exists = bool(count and int(count) > 0)  # exists=بولین
-    return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "user exists check", {"exists": exists})  # پاسخ=exists
+    raw = str(phone or "").strip()  # raw=شماره خام ورودی
+    norm = _normalize_phone(raw)  # norm=شماره نرمال‌شده
 
+    if not raw and not norm:  # شرط=شماره خالی
+        return unified_response("ok", "USER_NOT_FOUND", "user exists check", {"exists": False})  # پاسخ=وجود ندارد
+
+    conds = []  # conds=شرط‌ها
+    if raw:  # شرط=raw موجود
+        conds.append(UserTable.phone == raw)  # افزودن=شماره خام
+    if norm and norm != raw:  # شرط=نرمال معتبر و متفاوت
+        conds.append(UserTable.phone == norm)  # افزودن=شماره نرمال
+
+    q = select(func.count()).select_from(UserTable).where(or_(*conds))  # q=کوئری count روی raw/norm
+    count = await database.fetch_val(q)  # count=اجرای count
+    exists = bool(count and int(count) > 0)  # exists=نتیجه وجود
+
+    return unified_response(  # پاسخ
+        "ok",  # status=ok
+        "USER_EXISTS" if exists else "USER_NOT_FOUND",  # code=کد
+        "user exists check",  # message=پیام
+        {"exists": exists}  # data=نتیجه
+    )  # پایان پاسخ
+    
 @app.post("/register_user")  # ثبت‌نام کاربر
 async def register_user(user: UserRegisterRequest):  # تابع
-    q = select(func.count()).select_from(UserTable).where(  # q=count
-        UserTable.phone == user.phone  # شرط=شماره
-    )  # پایان where
-    count = await database.fetch_val(q)  # count=اجرا
-    if count and int(count) > 0:  # شرط=وجود دارد
+    raw = str(user.phone or "").strip()  # raw=شماره خام
+    norm = _normalize_phone(raw)  # norm=شماره نرمال‌شده
+    canonical = norm or raw  # canonical=شماره نهایی ذخیره‌سازی (اولویت با نرمال)
+
+    if not canonical:  # شرط=شماره خالی
+        raise HTTPException(status_code=400, detail="phone required")  # خطا=۴۰۰
+
+    conds = []  # conds=شرط‌ها
+    if raw:  # شرط=raw موجود
+        conds.append(UserTable.phone == raw)  # افزودن=شماره خام
+    if norm and norm != raw:  # شرط=نرمال معتبر و متفاوت
+        conds.append(UserTable.phone == norm)  # افزودن=شماره نرمال
+
+    q = select(func.count()).select_from(UserTable).where(or_(*conds))  # q=count برای جلوگیری از ثبت تکراری
+    count = await database.fetch_val(q)  # count=اجرای count
+    if count and int(count) > 0:  # شرط=کاربر موجود
         raise HTTPException(status_code=400, detail="User already exists")  # خطا=۴۰۰
 
     password_hash = bcrypt_hash_password(user.password)  # password_hash=هش رمز
     ins = UserTable.__table__.insert().values(  # ins=insert user
-        phone=user.phone,  # phone=شماره
+        phone=canonical,  # phone=شماره ذخیره‌شده (canonical)
         password_hash=password_hash,  # password_hash=هش
         address=(user.address or "").strip(),  # address=آدرس
         name="",  # name=نام
         car_list=[]  # car_list=لیست خالی
     )  # پایان insert
     await database.execute(ins)  # اجرا=insert
-    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": user.phone})  # پاسخ=ثبت شد
 
-@app.post("/login")  # ورود کاربر
-async def login_user(user: UserLoginRequest, request: Request):  # تابع
-    now = datetime.now(timezone.utc)  # now=اکنون
-    client_ip = get_client_ip(request)  # client_ip=آی‌پی (فعلاً استفاده نشده)
+    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": canonical})  # پاسخ=ثبت شد
+    
+@app.post("/login")  # مسیر=ورود کاربر
+async def login_user(user: UserLoginRequest, request: Request):  # تابع=ورود
+    now = datetime.now(timezone.utc)  # now=زمان فعلی UTC
+    client_ip = get_client_ip(request)  # client_ip=آی‌پی کلاینت
 
-    sel_user = UserTable.__table__.select().where(UserTable.phone == user.phone)  # sel_user=کوئری کاربر
+    raw_phone = str(user.phone or "").strip()  # raw_phone=شماره خام ورودی
+    phone_norm = _normalize_phone(raw_phone)  # phone_norm=شماره نرمال‌شده برای یکسان‌سازی
+
+    # --- Login attempts: load or create row ---  # توضیح=مدیریت تعداد تلاش ورود بر اساس phone+ip
+    sel_att = LoginAttemptTable.__table__.select().where(  # sel_att=کوئری تلاش ورود
+        (LoginAttemptTable.phone == phone_norm) &  # شرط=شماره نرمال
+        (LoginAttemptTable.ip == client_ip)  # شرط=آی‌پی
+    )  # پایان where
+    att = await database.fetch_one(sel_att)  # att=ردیف تلاش ورود
+
+    if not att:  # شرط=اگر ردیف وجود ندارد
+        ins_att = LoginAttemptTable.__table__.insert().values(  # ins_att=ایجاد ردیف جدید
+            phone=phone_norm,  # phone=شماره نرمال
+            ip=client_ip,  # ip=آی‌پی
+            attempt_count=0,  # attempt_count=شروع از صفر
+            window_start=now,  # window_start=شروع پنجره زمانی
+            locked_until=None,  # locked_until=بدون قفل
+            last_attempt_at=now,  # last_attempt_at=اکنون
+            created_at=now  # created_at=اکنون
+        )  # پایان insert
+        await database.execute(ins_att)  # اجرا=insert
+        att = await database.fetch_one(sel_att)  # att=خواندن مجدد ردیف
+    else:  # حالت=ردیف موجود است
+        locked_until = att["locked_until"]  # locked_until=زمان پایان قفل
+        if locked_until is not None and locked_until > now:  # شرط=هنوز قفل است
+            lock_remaining = int((locked_until - now).total_seconds())  # lock_remaining=ثانیه باقی‌مانده قفل
+            raise HTTPException(  # خطا=۴۲۹
+                status_code=429,  # status_code=Too Many Requests
+                detail={"code": "RATE_LIMITED", "lock_remaining": lock_remaining},  # detail=کد و زمان باقی‌مانده
+                headers={  # headers=هدرهای کمکی
+                    "Retry-After": str(lock_remaining),  # Retry-After=زمان انتظار
+                    "X-Remaining-Attempts": "0"  # X-Remaining-Attempts=۰
+                }  # پایان headers
+            )  # پایان raise
+
+        # اگر قفل گذشته باشد یا پنجره زمانی تمام شده باشد، شمارنده را ریست می‌کنیم  # توضیح=همگام با LOGIN_WINDOW_SECONDS
+        window_start = att["window_start"] or now  # window_start=شروع پنجره یا اکنون
+        window_age = (now - window_start).total_seconds()  # window_age=سن پنجره به ثانیه
+        if window_age > LOGIN_WINDOW_SECONDS or (locked_until is not None and locked_until <= now):  # شرط=پایان پنجره یا پایان قفل
+            upd_reset = LoginAttemptTable.__table__.update().where(  # upd_reset=آپدیت ریست تلاش‌ها
+                LoginAttemptTable.id == att["id"]  # شرط=id ردیف
+            ).values(  # values=مقادیر جدید
+                attempt_count=0,  # attempt_count=صفر
+                window_start=now,  # window_start=اکنون
+                locked_until=None,  # locked_until=بدون قفل
+                last_attempt_at=now  # last_attempt_at=اکنون
+            )  # پایان values
+            await database.execute(upd_reset)  # اجرا=ریست
+            att = await database.fetch_one(sel_att)  # att=خواندن مجدد ردیف بعد ریست
+
+    # --- Load user (compat: try raw and normalized) ---  # توضیح=سازگاری با داده‌های قدیمی که ممکن است نرمال نشده باشند
+    sel_user = UserTable.__table__.select().where(  # sel_user=کوئری کاربر
+        or_(  # or_=یکی از این دو شماره
+            UserTable.phone == raw_phone,  # شرط=شماره خام
+            UserTable.phone == phone_norm  # شرط=شماره نرمال
+        )  # پایان or_
+    )  # پایان where
     db_user = await database.fetch_one(sel_user)  # db_user=گرفتن کاربر
     if not db_user:  # شرط=کاربر نبود
-        raise HTTPException(status_code=404, detail={"code": "USER_NOT_FOUND"})  # خطا=۴۰۴
+        # اینجا تلاش ناموفق را هم حساب می‌کنیم  # توضیح=جلوگیری از brute-force / enumeration
+        cur_count = int(att["attempt_count"] or 0) + 1  # cur_count=تلاش جدید
+        remaining = max(0, LOGIN_MAX_ATTEMPTS - cur_count)  # remaining=تلاش باقی‌مانده
+        lock_remaining = None  # lock_remaining=پیش‌فرض
 
-    if not verify_password_secure(user.password, db_user["password_hash"]):  # شرط=رمز غلط
-        raise HTTPException(status_code=401, detail={"code": "WRONG_PASSWORD"})  # خطا=۴۰۱
+        if cur_count >= LOGIN_MAX_ATTEMPTS:  # شرط=رسیدن به سقف
+            locked_until_new = now + timedelta(seconds=LOGIN_LOCK_SECONDS)  # locked_until_new=زمان قفل جدید
+            lock_remaining = int((locked_until_new - now).total_seconds())  # lock_remaining=ثانیه قفل
+            await database.execute(  # اجرا=آپدیت قفل
+                LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == att["id"]).values(  # update=login_attempts
+                    attempt_count=cur_count,  # attempt_count=تلاش جدید
+                    locked_until=locked_until_new,  # locked_until=قفل
+                    last_attempt_at=now  # last_attempt_at=اکنون
+                )  # پایان values
+            )  # پایان execute
+            raise HTTPException(  # خطا=۴۲۹
+                status_code=429,  # status_code=Too Many Requests
+                detail={"code": "RATE_LIMITED", "lock_remaining": lock_remaining},  # detail=قفل
+                headers={"Retry-After": str(lock_remaining), "X-Remaining-Attempts": "0"}  # headers=هدرها
+            )  # پایان raise
 
-    access_token = create_access_token(db_user["phone"])  # access_token=ساخت access
-    refresh_token = create_refresh_token()  # refresh_token=ساخت refresh
-    refresh_hash = hash_refresh_token(refresh_token)  # refresh_hash=هش refresh
-    refresh_exp = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)  # refresh_exp=انقضا
+        await database.execute(  # اجرا=ثبت تلاش ناموفق بدون قفل
+            LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == att["id"]).values(  # update=login_attempts
+                attempt_count=cur_count,  # attempt_count=تلاش جدید
+                last_attempt_at=now  # last_attempt_at=اکنون
+            )  # پایان values
+        )  # پایان execute
 
-    ins_rt = RefreshTokenTable.__table__.insert().values(  # ins_rt=insert refresh
-        user_id=db_user["id"],  # user_id=شناسه
-        token_hash=refresh_hash,  # token_hash=هش
+        raise HTTPException(  # خطا=۴۰۴
+            status_code=404,  # status_code=Not Found
+            detail={"code": "USER_NOT_FOUND"}  # detail=کد کاربر یافت نشد
+        )  # پایان raise
+
+    # --- Password check ---  # توضیح=بررسی رمز
+    if not verify_password_secure(user.password, db_user["password_hash"]):  # شرط=رمز اشتباه
+        cur_count = int(att["attempt_count"] or 0) + 1  # cur_count=تلاش جدید
+        remaining = max(0, LOGIN_MAX_ATTEMPTS - cur_count)  # remaining=تلاش باقی‌مانده
+
+        if cur_count >= LOGIN_MAX_ATTEMPTS:  # شرط=رسیدن به سقف
+            locked_until_new = now + timedelta(seconds=LOGIN_LOCK_SECONDS)  # locked_until_new=زمان قفل
+            lock_remaining = int((locked_until_new - now).total_seconds())  # lock_remaining=ثانیه قفل
+            await database.execute(  # اجرا=قفل کردن
+                LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == att["id"]).values(  # update=login_attempts
+                    attempt_count=cur_count,  # attempt_count=ثبت تلاش
+                    locked_until=locked_until_new,  # locked_until=قفل
+                    last_attempt_at=now  # last_attempt_at=اکنون
+                )  # پایان values
+            )  # پایان execute
+
+            raise HTTPException(  # خطا=۴۲۹
+                status_code=429,  # status_code=Too Many Requests
+                detail={"code": "RATE_LIMITED", "lock_remaining": lock_remaining},  # detail=قفل
+                headers={  # headers=هدرها
+                    "Retry-After": str(lock_remaining),  # Retry-After=زمان انتظار
+                    "X-Remaining-Attempts": "0"  # Remaining=۰
+                }  # پایان headers
+            )  # پایان raise
+
+        await database.execute(  # اجرا=ثبت تلاش ناموفق
+            LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == att["id"]).values(  # update=login_attempts
+                attempt_count=cur_count,  # attempt_count=تلاش جدید
+                last_attempt_at=now  # last_attempt_at=اکنون
+            )  # پایان values
+        )  # پایان execute
+
+        raise HTTPException(  # خطا=۴۰۱
+            status_code=401,  # status_code=Unauthorized
+            detail={"code": "WRONG_PASSWORD", "remaining_attempts": int(remaining)},  # detail=کد + تلاش باقی‌مانده
+            headers={"X-Remaining-Attempts": str(int(remaining))}  # headers=ارسال باقی‌مانده
+        )  # پایان raise
+
+    # --- Success: reset attempts ---  # توضیح=در ورود موفق، ریست تلاش‌ها
+    await database.execute(  # اجرا=ریست تلاش‌ها
+        LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == att["id"]).values(  # update=login_attempts
+            attempt_count=0,  # attempt_count=صفر
+            window_start=now,  # window_start=اکنون
+            locked_until=None,  # locked_until=بدون قفل
+            last_attempt_at=now  # last_attempt_at=اکنون
+        )  # پایان values
+    )  # پایان execute
+
+    access_token = create_access_token(db_user["phone"])  # access_token=ساخت access token
+    refresh_token = create_refresh_token()  # refresh_token=ساخت refresh token
+    refresh_hash = hash_refresh_token(refresh_token)  # refresh_hash=هش refresh token
+    refresh_exp = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)  # refresh_exp=انقضای refresh token
+
+    ins_rt = RefreshTokenTable.__table__.insert().values(  # ins_rt=ثبت refresh token
+        user_id=db_user["id"],  # user_id=شناسه کاربر
+        token_hash=refresh_hash,  # token_hash=هش توکن
         expires_at=refresh_exp,  # expires_at=انقضا
-        revoked=False  # revoked=خیر
+        revoked=False  # revoked=ابطال نشده
     )  # پایان insert
-    await database.execute(ins_rt)  # اجرا=insert
+    await database.execute(ins_rt)  # اجرا=insert refresh token
 
-    return {  # پاسخ
+    return {  # پاسخ=موفق
         "status": "ok",  # status=ok
-        "access_token": access_token,  # access_token=توکن
-        "refresh_token": refresh_token,  # refresh_token=توکن
-        "user": {  # user
+        "access_token": access_token,  # access_token=توکن دسترسی
+        "refresh_token": refresh_token,  # refresh_token=توکن نوسازی
+        "user": {  # user=اطلاعات کاربر
             "phone": db_user["phone"],  # phone=شماره
             "address": db_user["address"] or "",  # address=آدرس
             "name": db_user["name"] or ""  # name=نام
         }  # پایان user
     }  # پایان پاسخ
-
 # -------------------- Cars --------------------
 
 @app.get("/user_cars/{user_phone}")  # مسیر=گرفتن لیست ماشین‌های کاربر
 async def get_user_cars(user_phone: str, request: Request):  # تابع=گرفتن ماشین‌ها
-    phone = _normalize_phone(user_phone)  # phone=نرمال‌سازی
-    auth_phone = _normalize_phone(get_auth_phone(request, fallback_phone=phone, enforce=False))  # auth_phone=احراز نرمال
-    if auth_phone != phone:  # شرط=عدم تطابق
+    raw = str(user_phone or "").strip()  # raw=شماره خام مسیر
+    norm = _normalize_phone(raw)  # norm=شماره نرمال مسیر
+
+    auth_phone = _normalize_phone(get_auth_phone(request, fallback_phone=raw, enforce=False))  # auth_phone=شماره احراز شده نرمال
+    if auth_phone != norm:  # شرط=عدم تطابق (همیشه با نرمال مقایسه می‌شود)
         raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
 
-    sel = UserTable.__table__.select().where(UserTable.phone == phone)  # sel=کوئری کاربر
-    user = await database.fetch_one(sel)  # user=گرفتن
+    user = await fetch_user_by_phone_any(raw)  # user=یافتن کاربر با raw/norm
     if not user:  # شرط=کاربر نبود
         raise HTTPException(status_code=404, detail="User not found")  # خطا=۴۰۴
 
-    cars = user["car_list"] or []  # cars=لیست خودروها
+    cars = user.get("car_list") or []  # cars=لیست خودروها
     return unified_response("ok", "USER_CARS", "cars list", {"items": cars})  # پاسخ=لیست
-
+    
 @app.post("/user_cars")  # مسیر=آپدیت لیست ماشین‌ها (بدون اسلش)
 @app.post("/user_cars/")  # مسیر=آپدیت لیست ماشین‌ها (با اسلش)
 async def update_user_cars(body: CarListUpdateRequest, request: Request):  # تابع=آپدیت ماشین‌ها
@@ -966,49 +1126,63 @@ async def update_user_cars(body: CarListUpdateRequest, request: Request):  # ت�
 
 @app.post("/order")  # ثبت سفارش
 async def create_order(order: OrderRequest, request: Request):  # تابع
-    auth_phone = get_auth_phone(request, fallback_phone=order.user_phone, enforce=False)  # auth_phone=احراز
-    if auth_phone != order.user_phone:  # شرط=mismatch
+    raw = str(order.user_phone or "").strip()  # raw=شماره خام کاربر
+    norm = _normalize_phone(raw)  # norm=شماره نرمال کاربر
+    if not norm:  # شرط=شماره نامعتبر
+        raise HTTPException(status_code=400, detail="invalid user_phone")  # خطا=۴۰۰
+
+    auth_phone = _normalize_phone(get_auth_phone(request, fallback_phone=raw, enforce=False))  # auth_phone=شماره احراز نرمال
+    if auth_phone != norm:  # شرط=عدم تطابق
         raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
 
     ins = RequestTable.__table__.insert().values(  # insert=ثبت سفارش
-        user_phone=order.user_phone,  # user_phone=شماره
+        user_phone=norm,  # user_phone=شماره نرمال ذخیره می‌شود
         latitude=order.location.latitude,  # latitude=عرض
         longitude=order.location.longitude,  # longitude=طول
         car_list=[car.dict() for car in order.car_list],  # car_list=لیست خودرو
         address=order.address.strip(),  # address=آدرس
         home_number=(order.home_number or "").strip(),  # home_number=پلاک
-        service_type=order.service_type,  # service_type=سرویس
-        price=order.price,  # price=قیمت
-        request_datetime=order.request_datetime,  # request_datetime=زمان ثبت
+        service_type=str(order.service_type or "").strip(),  # service_type=سرویس
+        price=int(order.price),  # price=قیمت
+        request_datetime=str(order.request_datetime or "").strip(),  # request_datetime=زمان ثبت
         status="NEW",  # status=NEW
-        payment_type=order.payment_type.strip().lower(),  # payment_type=پرداخت
-        service_place=order.service_place.strip().lower()  # service_place=محل
+        payment_type=str(order.payment_type or "").strip().lower(),  # payment_type=پرداخت
+        service_place=str(order.service_place or "").strip().lower()  # service_place=محل
     ).returning(RequestTable.id)  # returning=id
 
     row = await database.fetch_one(ins)  # row=اجرا
     new_id = row["id"] if row else None  # new_id=شناسه
 
     try:  # try=محافظ اعلان مدیر
-        await notify_managers(  # notify_managers=ارسال به مدیر
+        await notify_managers(  # اعلان=به مدیر
             title="سفارش جدید",  # title=عنوان
             body=f"سفارش جدید ثبت شد: {order.service_type}",  # body=متن
-            data={"order_id": int(new_id or 0), "user_phone": _normalize_phone(order.user_phone), "service_type": order.service_type, "status": "NEW"}  # data=داده
+            data={"order_id": int(new_id or 0), "user_phone": norm, "service_type": str(order.service_type or ""), "status": "NEW"}  # data=داده
         )  # پایان notify_managers
     except Exception as e:  # خطا
         logger.error(f"notify_managers(create_order) failed: {e}")  # لاگ=خطا
 
     return unified_response("ok", "REQUEST_CREATED", "request created", {"id": new_id})  # پاسخ=موفق
-
+    
 @app.post("/cancel_order")  # لغو سفارش
 async def cancel_order(cancel: CancelRequest, request: Request):  # تابع
-    auth_phone = get_auth_phone(request, fallback_phone=cancel.user_phone, enforce=False)  # auth_phone=احراز
-    if auth_phone != cancel.user_phone:  # شرط=mismatch
+    raw = str(cancel.user_phone or "").strip()  # raw=شماره خام
+    norm = _normalize_phone(raw)  # norm=شماره نرمال
+    if not norm:  # شرط=نامعتبر
+        raise HTTPException(status_code=400, detail="invalid user_phone")  # خطا=۴۰۰
+
+    auth_phone = _normalize_phone(get_auth_phone(request, fallback_phone=raw, enforce=False))  # auth_phone=احراز نرمال
+    if auth_phone != norm:  # شرط=عدم تطابق
         raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
+
+    phones = [norm]  # phones=لیست شماره‌ها
+    if raw and raw != norm:  # شرط=برای سازگاری با داده‌های قدیمی
+        phones.append(raw)  # افزودن raw
 
     upd = (  # upd=آپدیت لغو
         RequestTable.__table__.update()  # update=requests
         .where(  # where=شرایط
-            (RequestTable.user_phone == cancel.user_phone) &  # شرط=شماره
+            (RequestTable.user_phone.in_(phones)) &  # شرط=شماره (raw/norm)
             (RequestTable.service_type == cancel.service_type) &  # شرط=سرویس
             (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED"])) &  # شرط=قابل لغو
             (RequestTable.execution_start.is_(None))  # شرط=بدون زمان اجرا
@@ -1016,6 +1190,7 @@ async def cancel_order(cancel: CancelRequest, request: Request):  # تابع
         .values(status="CANCELED", scheduled_start=None, execution_start=None)  # values=لغو + پاکسازی زمان‌ها
         .returning(RequestTable.id, RequestTable.driver_phone)  # returning=شناسه‌ها
     )  # پایان upd
+
     rows = await database.fetch_all(upd)  # rows=اجرا
     if rows:  # شرط=لغو شد
         ids = [int(r["id"]) for r in rows]  # ids=لیست id
@@ -1030,6 +1205,7 @@ async def cancel_order(cancel: CancelRequest, request: Request):  # تابع
                 )  # پایان where
                 .values(status="REJECTED")  # values=رد شده
             )  # پایان execute
+
             await database.execute(  # update=appointmentها
                 AppointmentTable.__table__.update()  # update=appointments
                 .where(  # where
@@ -1045,7 +1221,7 @@ async def cancel_order(cancel: CancelRequest, request: Request):  # تابع
             await notify_managers(  # اعلان=به مدیرها
                 title="لغو سفارش",  # title=عنوان
                 body=f"سفارش توسط کاربر لغو شد ({cancel.service_type})",  # body=متن
-                data={"order_ids": ",".join(str(x) for x in ids), "user_phone": _normalize_phone(cancel.user_phone), "service_type": cancel.service_type, "status": "CANCELED"}  # data=داده
+                data={"order_ids": ",".join(str(x) for x in ids), "user_phone": norm, "service_type": cancel.service_type, "status": "CANCELED"}  # data=داده
             )  # پایان notify_managers
             for dp in driver_phones:  # حلقه=روی سرویس‌دهنده‌ها
                 await notify_managers(  # اعلان=هدفمند
@@ -1056,35 +1232,54 @@ async def cancel_order(cancel: CancelRequest, request: Request):  # تابع
                 )  # پایان notify_managers
         except Exception as e:  # خطا
             logger.error(f"notify_managers(cancel_order) failed: {e}")  # لاگ=خطا
+
         return unified_response("ok", "ORDER_CANCELED", "canceled", {"count": len(rows)})  # پاسخ=موفق
 
     raise HTTPException(status_code=409, detail={"code": "CANNOT_CANCEL", "message": "order cannot be canceled at this stage"})  # خطا=۴۰۹
-
+    
 @app.get("/user_active_services/{user_phone}")  # سرویس‌های فعال کاربر
 async def get_user_active_services(user_phone: str, request: Request):  # تابع
-    auth_phone = get_auth_phone(request, fallback_phone=user_phone, enforce=False)  # auth_phone=احراز
-    if auth_phone != user_phone:  # شرط=mismatch
+    raw = str(user_phone or "").strip()  # raw=شماره خام مسیر
+    norm = _normalize_phone(raw)  # norm=شماره نرمال
+    if not norm:  # شرط=نامعتبر
+        raise HTTPException(status_code=400, detail="invalid user_phone")  # خطا=۴۰۰
+
+    auth_phone = _normalize_phone(get_auth_phone(request, fallback_phone=raw, enforce=False))  # auth_phone=احراز نرمال
+    if auth_phone != norm:  # شرط=عدم تطابق
         raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
 
+    phones = [norm]  # phones=لیست شماره‌ها
+    if raw and raw != norm:  # شرط=سازگاری قدیمی
+        phones.append(raw)  # افزودن raw
+
     sel = RequestTable.__table__.select().where(  # sel=کوئری فعال‌ها
-        (RequestTable.user_phone == user_phone) &  # شرط=شماره
+        (RequestTable.user_phone.in_(phones)) &  # شرط=شماره
         (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]))  # شرط=فعال
     )  # پایان where
     result = await database.fetch_all(sel)  # result=اجرا
     items = [dict(r) for r in result]  # items=تبدیل
     return unified_response("ok", "USER_ACTIVE_SERVICES", "active services", {"items": items})  # پاسخ
-
+    
 @app.get("/user_orders/{user_phone}")  # لیست سفارش‌ها
 async def get_user_orders(user_phone: str, request: Request):  # تابع
-    auth_phone = get_auth_phone(request, fallback_phone=user_phone, enforce=False)  # auth_phone=احراز
-    if auth_phone != user_phone:  # شرط=mismatch
+    raw = str(user_phone or "").strip()  # raw=شماره خام مسیر
+    norm = _normalize_phone(raw)  # norm=شماره نرمال
+    if not norm:  # شرط=نامعتبر
+        raise HTTPException(status_code=400, detail="invalid user_phone")  # خطا=۴۰۰
+
+    auth_phone = _normalize_phone(get_auth_phone(request, fallback_phone=raw, enforce=False))  # auth_phone=احراز نرمال
+    if auth_phone != norm:  # شرط=عدم تطابق
         raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
 
-    sel = RequestTable.__table__.select().where(RequestTable.user_phone == user_phone)  # sel=کوئری سفارش‌ها
+    phones = [norm]  # phones=لیست شماره‌ها
+    if raw and raw != norm:  # شرط=سازگاری قدیمی
+        phones.append(raw)  # افزودن raw
+
+    sel = RequestTable.__table__.select().where(RequestTable.user_phone.in_(phones))  # sel=کوئری سفارش‌ها
     result = await database.fetch_all(sel)  # result=اجرا
     items = [dict(r) for r in result]  # items=تبدیل
     return unified_response("ok", "USER_ORDERS", "orders list", {"items": items})  # پاسخ
-
+    
 # -------------------- Utils --------------------  # بخش=ابزارها
 
 async def provider_is_free(provider_phone: str, start: datetime, end: datetime, exclude_order_id: Optional[int] = None) -> bool:  # تابع=بررسی آزاد بودن سرویس‌دهنده
@@ -1150,7 +1345,22 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime, 
 
     return True  # خروجی=آزاد
 
+async def fetch_user_by_phone_any(phone_input: str) -> Optional[dict]:  # تابع=پیدا کردن کاربر با شماره خام یا نرمال (سازگار با داده‌های قدیمی)
+    raw = str(phone_input or "").strip()  # raw=شماره خام ورودی + trim
+    norm = _normalize_phone(raw)  # norm=شماره نرمال‌شده
+    if not raw and not norm:  # شرط=هیچ شماره‌ای نداریم
+        return None  # خروجی=None
 
+    conds = []  # conds=لیست شرط‌ها
+    if raw:  # شرط=raw خالی نیست
+        conds.append(UserTable.phone == raw)  # افزودن=شرط شماره خام
+    if norm and norm != raw:  # شرط=نرمال معتبر و متفاوت
+        conds.append(UserTable.phone == norm)  # افزودن=شرط شماره نرمال
+
+    sel = UserTable.__table__.select().where(or_(*conds)).limit(1)  # sel=کوئری انتخاب اولین کاربر با raw/norm
+    row = await database.fetch_one(sel)  # row=اجرای کوئری
+    return dict(row) if row else None  # خروجی=دیکشنری کاربر یا None
+    
 # -------------------- Scheduling --------------------
 
 @app.get("/busy_slots")  # مسیر=ساعات مشغول (بدون نیاز به provider_phone از UI)
@@ -1747,36 +1957,45 @@ async def reject_all_and_cancel(order_id: int, request: Request):  # تابع
 
 @app.post("/user/profile")  # ذخیره پروفایل
 async def update_profile(body: UserProfileUpdate, request: Request):  # تابع
-    auth_phone = get_auth_phone(request, fallback_phone=body.phone, enforce=False)  # auth_phone=احراز
-    if auth_phone != body.phone:  # شرط=mismatch
+    raw = str(body.phone or "").strip()  # raw=شماره خام
+    norm = _normalize_phone(raw)  # norm=شماره نرمال
+
+    auth_phone = _normalize_phone(get_auth_phone(request, fallback_phone=raw, enforce=False))  # auth_phone=احراز نرمال
+    if auth_phone != norm:  # شرط=عدم تطابق
         raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
 
-    sel = UserTable.__table__.select().where(UserTable.phone == body.phone)  # sel=کوئری کاربر
-    user = await database.fetch_one(sel)  # user=گرفتن
+    user = await fetch_user_by_phone_any(raw)  # user=یافتن کاربر با raw/norm
     if not user:  # شرط=نبود
         raise HTTPException(status_code=404, detail="User not found")  # خطا=۴۰۴
 
-    await database.execute(  # update=پروفایل
+    await database.execute(  # اجرا=update پروفایل
         UserTable.__table__.update()  # update=users
-        .where(UserTable.phone == body.phone)  # where=شماره
+        .where(UserTable.id == user["id"])  # where=id
         .values(name=body.name.strip(), address=body.address.strip())  # values=نام+آدرس
     )  # پایان execute
 
-    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": body.phone})  # پاسخ
-
+    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": user["phone"]})  # پاسخ=موفق
+    
 @app.get("/user/profile/{phone}")  # دریافت پروفایل
 async def get_user_profile(phone: str, request: Request):  # تابع
-    auth_phone = get_auth_phone(request, fallback_phone=phone, enforce=False)  # auth_phone=احراز
-    if auth_phone != phone:  # شرط=mismatch
+    raw = str(phone or "").strip()  # raw=شماره خام
+    norm = _normalize_phone(raw)  # norm=شماره نرمال
+
+    auth_phone = _normalize_phone(get_auth_phone(request, fallback_phone=raw, enforce=False))  # auth_phone=احراز نرمال
+    if auth_phone != norm:  # شرط=عدم تطابق
         raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
 
-    sel = UserTable.__table__.select().where(UserTable.phone == phone)  # sel=کوئری کاربر
-    user = await database.fetch_one(sel)  # user=گرفتن
+    user = await fetch_user_by_phone_any(raw)  # user=یافتن کاربر
     if not user:  # شرط=نبود
         raise HTTPException(status_code=404, detail="User not found")  # خطا=۴۰۴
 
-    return unified_response("ok", "PROFILE_FETCHED", "profile data", {"phone": user["phone"], "name": user["name"] or "", "address": user["address"] or ""})  # پاسخ
-
+    return unified_response(  # پاسخ
+        "ok",  # status=ok
+        "PROFILE_FETCHED",  # code=کد
+        "profile data",  # message=پیام
+        {"phone": user["phone"], "name": user.get("name") or "", "address": user.get("address") or ""}  # data=پروفایل
+    )  # پایان پاسخ
+    
 # -------------------- Debug --------------------
 
 @app.get("/debug/users")  # دیباگ کاربران
@@ -1786,6 +2005,7 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن=آیتم
     return out  # بازگشت
+
 
 
 
