@@ -916,6 +916,24 @@ async def register_user(user: UserRegisterRequest):  # تابع
     await database.execute(ins)  # اجرا=insert
 
     return unified_response("ok", "USER_REGISTERED", "registered", {"phone": canonical})  # پاسخ=ثبت شد
+
+# -------------------- Admin Login (Manager app) --------------------  # بخش=ورود مدیر
+
+@app.post("/admin/login")  # مسیر=ورود مدیر (ویژه برنامه مدیر)
+async def admin_login(user: UserLoginRequest, request: Request):  # تابع=ورود مدیر
+    raw_phone = str(user.phone or "").strip()  # raw_phone=شماره خام ورودی
+    phone_norm = _normalize_phone(raw_phone)  # phone_norm=شماره نرمال‌شده
+
+    # امنیت: فقط شماره‌های داخل env مجاز هستند؛ برای بقیه «رمز اشتباه» برمی‌گردد  # توضیح=عدم افشای لیست مدیران
+    if (not phone_norm) or (phone_norm not in ADMIN_PHONES_SET):  # شرط=شماره مدیر نیست
+        raise HTTPException(  # خطا=Unauthorized
+            status_code=401,  # status_code=401
+            detail={"code": "WRONG_PASSWORD", "remaining_attempts": 0},  # detail=کد خطا مثل رمز اشتباه
+            headers={"X-Remaining-Attempts": "0"}  # headers=سازگاری با کلاینت
+        )  # پایان raise
+
+    # استفاده از همان منطق /login (با قابلیت ساخت خودکار اکانت مدیر که در گام ۱ اضافه شد)  # توضیح=ورود استاندارد
+    return await login_user(user, request)  # return=پاسخ استاندارد ورود (access/refresh/user)
     
 @app.post("/login")  # مسیر=ورود کاربر
 async def login_user(user: UserLoginRequest, request: Request):  # تابع=ورود
@@ -2208,6 +2226,7 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن=آیتم
     return out  # بازگشت
+
 
 
 
