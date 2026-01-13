@@ -979,8 +979,29 @@ async def login_user(user: UserLoginRequest, request: Request):  # تابع=ور
             UserTable.phone == phone_norm  # شرط=شماره نرمال
         )  # پایان or_
     )  # پایان where
-    db_user = await database.fetch_one(sel_user)  # db_user=گرفتن کاربر
-    if not db_user:  # شرط=کاربر نبود
+    db_user = await database.fetch_one(sel_user)  # db_user=گرفتن کاربر از دیتابیس (raw یا norm)
+
+    # --- NEW: ساخت خودکار کاربر مدیر در دیتابیس جدید ---  # توضیح=برای شماره‌هایی که داخل ADMIN_PHONES هستند
+    if not db_user:  # شرط=کاربر پیدا نشد
+        is_admin_phone = bool(phone_norm and (phone_norm in ADMIN_PHONES_SET))  # is_admin_phone=آیا شماره جزو مدیران env است؟
+        if is_admin_phone:  # شرط=شماره مدیر است
+            try:  # try=محافظ خطا برای ثبت‌نام همزمان/تکراری
+                password_hash_new = bcrypt_hash_password(user.password)  # password_hash_new=هش رمز واردشده برای ساخت اکانت مدیر
+                ins_admin = UserTable.__table__.insert().values(  # ins_admin=درج کاربر مدیر
+                    phone=phone_norm,  # phone=ذخیره شماره نرمال مدیر
+                    password_hash=password_hash_new,  # password_hash=هش رمز
+                    address="",  # address=خالی
+                    name="",  # name=خالی
+                    car_list=[]  # car_list=خالی
+                )  # پایان insert
+                await database.execute(ins_admin)  # اجرا=درج کاربر مدیر
+            except Exception:  # خطا=ممکن است به دلیل unique/همزمانی باشد
+                pass  # عبور=ادامه می‌دهیم و دوباره select می‌زنیم
+
+            db_user = await database.fetch_one(sel_user)  # db_user=خواندن مجدد کاربر بعد از تلاش برای ساخت
+
+    # --- مسیر قبلی: اگر هنوز کاربر نداریم همان منطق قدیمی اجرا شود ---  # توضیح=برای کاربران عادی
+    if not db_user:  # شرط=هنوز کاربر نبود
         # اینجا تلاش ناموفق را هم حساب می‌کنیم  # توضیح=جلوگیری از brute-force / enumeration
         cur_count = int(att["attempt_count"] or 0) + 1  # cur_count=تلاش جدید
         remaining = max(0, LOGIN_MAX_ATTEMPTS - cur_count)  # remaining=تلاش باقی‌مانده
@@ -1013,7 +1034,7 @@ async def login_user(user: UserLoginRequest, request: Request):  # تابع=ور
             status_code=404,  # status_code=Not Found
             detail={"code": "USER_NOT_FOUND"}  # detail=کد کاربر یافت نشد
         )  # پایان raise
-
+        
     # --- Password check ---  # توضیح=بررسی رمز
     if not verify_password_secure(user.password, db_user["password_hash"]):  # شرط=رمز اشتباه
         cur_count = int(att["attempt_count"] or 0) + 1  # cur_count=تلاش جدید
@@ -2187,6 +2208,7 @@ async def debug_users():  # تابع
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": r["id"], "phone": r["phone"], "name": r["name"], "address": r["address"]})  # افزودن=آیتم
     return out  # بازگشت
+
 
 
 
