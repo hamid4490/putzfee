@@ -816,6 +816,8 @@ async def admin_active_requests(request: Request):
     active = ["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]
     rows = await database.fetch_all(RequestTable.__table__.select().where(RequestTable.status.in_(active)).order_by(RequestTable.id.desc()))
     return unified_response("ok", "ACTIVE_REQUESTS", "active requests", {"items": [dict(r) for r in rows]})
+    logger.info(f"ADMIN_ACTIVE_REQUESTS: {len(rows)} rows fetched for admin")
+
 
 @app.get("/user_cars/{user_phone}")
 async def get_user_cars(user_phone: str, request: Request):
@@ -1117,3 +1119,4 @@ async def admin_cancel_order(order_id: int, request: Request):
 async def debug_users():
     rows = await database.fetch_all(UserTable.__table__.select().order_by(UserTable.id.asc()))
     return {"items": [{"id": r["id"], "phone": r["phone"]} for r in rows]}
+
