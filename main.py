@@ -265,8 +265,6 @@ def _load_service_account() -> Optional[dict]:  # تابع=خواندن service 
 
 
 
-
-
 # -------------------- ORM models --------------------  # بخش=مدل‌های دیتابیس
 class UserTable(Base):  # کلاس=جدول کاربران
     __tablename__ = "users"  # نام جدول=users
@@ -2134,5 +2132,6 @@ async def debug_users():  # تابع=لیست کاربران
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": int(r["id"]), "phone": str(r["phone"] or ""), "name": str(r["name"] or ""), "address": str(r["address"] or "")})  # افزودن=آیتم
     return {"items": out}  # پاسخ=لیست
+
 
 
