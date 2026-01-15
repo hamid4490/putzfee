@@ -42,15 +42,13 @@ REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))  # 
 BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))  # مقدار=دور bcrypt
 ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*").strip()  # مقدار=CORS origins
 
-FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()  # مقدار=کلید Legacy FCM
-
+# کلیدهای FCM
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()  # مقدار=کلید Legacy (منسوخ)
 FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()  # مقدار=ProjectId FCM v1
 
-GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv(  # مقدار=Service Account JSON
-    "GOOGLE_APPLICATIONS_CREDENTIALS_JSON",  # نام=کلید قدیمی
-    os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")  # نام=کلید صحیح
-).strip()  # trim=پاکسازی
-GOOGLE_APPLICATION_CREDENTIALS_JSON_B64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON_B64", "").strip()  # مقدار=Service Account B64
+# متغیر JSON یا Base64 فایل فایربیس
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+GOOGLE_APPLICATION_CREDENTIALS_JSON_B64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON_B64", "").strip()
 
 ADMIN_KEY = os.getenv("ADMIN_KEY", "CHANGE_ME_ADMIN").strip()  # مقدار=کلید ادمین (fallback)
 ADMIN_PHONES_ENV = os.getenv("ADMIN_PHONES", "").strip()  # مقدار=شماره‌های مدیر
@@ -59,7 +57,7 @@ LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))  # مقدا
 LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))  # مقدار=حداکثر تلاش
 LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "1800"))  # مقدار=قفل موقت
 
-PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()  # مقدار=نوع پوش
+PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()  # مقدار=نوع پوش (fcm/ntfy)
 NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()  # مقدار=آدرس ntfy
 NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()  # مقدار=auth ntfy
 
@@ -79,156 +77,327 @@ Base = declarative_base()  # Base=ریشه ORM
 # -------------------- Helpers: phone --------------------  # بخش=نرمال‌سازی شماره
 def _normalize_phone(p: str) -> str:  # تابع=نرمال‌سازی شماره به فرم یکتا
     raw = str(p or "").strip()  # raw=ورودی trim
-    if not raw:  # شرط=خالی بودن
-        return ""  # خروجی=خالی
+    if not raw: return ""  # خالی
 
-    cleaned = "".join(ch for ch in raw if ch.isdigit() or ch == "+")  # cleaned=فقط رقم و +
-    if not cleaned:  # شرط=خالی شدن
-        return ""  # خروجی=خالی
+    cleaned = "".join(ch for ch in raw if ch.isdigit() or ch == "+")  # فقط رقم و +
+    if not cleaned: return ""
 
-    if cleaned.startswith("+"):  # شرط=شروع با +
-        cleaned = cleaned[1:]  # عمل=حذف +
+    if cleaned.startswith("+"): cleaned = cleaned[1:]
+    if cleaned.startswith("00"): cleaned = cleaned[2:]
 
-    if cleaned.startswith("00"):  # شرط=شروع با 00
-        cleaned = cleaned[2:]  # عمل=حذف 00
+    digits = "".join(ch for ch in cleaned if ch.isdigit())
+    if not digits: return ""
 
-    digits = "".join(ch for ch in cleaned if ch.isdigit())  # digits=فقط رقم
-    if not digits:  # شرط=خالی بودن
-        return ""  # خروجی=خالی
+    if digits.startswith("98") and len(digits) >= 12:
+        tail10 = digits[-10:]
+        if tail10.startswith("9"): return "0" + tail10
 
-    if digits.startswith("98") and len(digits) >= 12:  # شرط=پیشوند ایران
-        tail10 = digits[-10:]  # tail10=ده رقم آخر
-        if tail10.startswith("9"):  # شرط=موبایل
-            return "0" + tail10  # خروجی=فرمت 09...
+    if digits.startswith("9") and len(digits) == 10:
+        return "0" + digits
 
-    if digits.startswith("9") and len(digits) == 10:  # شرط=بدون صفر اول
-        return "0" + digits  # خروجی=افزودن صفر
-
-    return digits  # خروجی=شماره نهایی
+    return digits
 
 def _parse_admin_phones(s: str) -> set[str]:  # تابع=تبدیل env مدیران به set
-    out: set[str] = set()  # out=مجموعه خروجی
-    for part in (s or "").split(","):  # حلقه=روی بخش‌ها
-        vv = _normalize_phone(part.strip())  # vv=نرمال
-        if vv:  # شرط=معتبر
-            out.add(vv)  # add=افزودن
-    return out  # خروجی=set
+    out: set[str] = set()
+    for part in (s or "").split(","):
+        vv = _normalize_phone(part.strip())
+        if vv: out.add(vv)
+    return out
 
 ADMIN_PHONES_SET = _parse_admin_phones(ADMIN_PHONES_ENV)  # مقدار=set مدیران
 
 # -------------------- Helpers: time (UTC only) --------------------  # بخش=زمان UTC
-def parse_iso(ts: str) -> datetime:  # تابع=پارس ISO با timezone و تبدیل به UTC
-    try:  # try=محافظ
-        raw = str(ts or "").strip()  # raw=trim
-        if raw.endswith("Z"):  # شرط=پسوند Z
-            raw = raw.replace("Z", "+00:00")  # عمل=تبدیل Z به آفست
-        dt = datetime.fromisoformat(raw)  # dt=پارس ISO
-        if dt.tzinfo is None:  # شرط=نبود timezone
-            raise ValueError("timezone required")  # خطا=timezone لازم است
-        return dt.astimezone(timezone.utc)  # خروجی=UTC
-    except Exception:  # catch=خطا
-        raise HTTPException(status_code=400, detail=f"invalid UTC datetime: {ts}")  # خطا=۴۰۰
+def parse_iso(ts: str) -> datetime:  # تابع=پارس ISO با timezone
+    try:
+        raw = str(ts or "").strip()
+        if raw.endswith("Z"): raw = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None: raise ValueError("timezone required")
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"invalid UTC datetime: {ts}")
 
 # -------------------- Security helpers --------------------  # بخش=امنیت
-def bcrypt_hash_password(password: str) -> str:  # تابع=هش رمز با bcrypt
-    salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)  # salt=نمک
-    mixed = (str(password) + PASSWORD_PEPPER).encode("utf-8")  # mixed=رمز+pepper
-    return bcrypt.hashpw(mixed, salt).decode("utf-8")  # خروجی=هش
+def bcrypt_hash_password(password: str) -> str:  # تابع=هش رمز
+    salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
+    mixed = (str(password) + PASSWORD_PEPPER).encode("utf-8")
+    return bcrypt.hashpw(mixed, salt).decode("utf-8")
 
-def verify_password_secure(password: str, stored_hash: str) -> bool:  # تابع=بررسی رمز با bcrypt
-    try:  # try=محافظ
-        mixed = (str(password) + PASSWORD_PEPPER).encode("utf-8")  # mixed=رمز+pepper
-        return bcrypt.checkpw(mixed, str(stored_hash or "").encode("utf-8"))  # خروجی=نتیجه
-    except Exception:  # catch=خطا
-        return False  # خروجی=ناموفق
+def verify_password_secure(password: str, stored_hash: str) -> bool:  # تابع=بررسی رمز
+    try:
+        mixed = (str(password) + PASSWORD_PEPPER).encode("utf-8")
+        return bcrypt.checkpw(mixed, str(stored_hash or "").encode("utf-8"))
+    except Exception:
+        return False
 
 def create_access_token(subject_phone: str) -> str:  # تابع=ساخت access token
-    now = datetime.now(timezone.utc)  # now=اکنون UTC
-    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)  # exp=انقضا
-    payload = {  # payload=دیتای JWT
-        "sub": str(subject_phone),  # sub=شماره
-        "type": "access",  # type=نوع توکن
-        "iat": int(now.timestamp()),  # iat=زمان صدور
-        "exp": int(exp.timestamp())  # exp=زمان انقضا
-    }  # پایان payload
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")  # خروجی=JWT
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": str(subject_phone), "type": "access", "iat": int(now.timestamp()), "exp": int(exp.timestamp())}
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def create_refresh_token() -> str:  # تابع=ساخت رفرش توکن خام
-    return secrets.token_urlsafe(48)  # خروجی=توکن امن
+def create_refresh_token() -> str:  # تابع=ساخت refresh token خام
+    return secrets.token_urlsafe(48)
 
-def hash_refresh_token(token: str) -> str:  # تابع=هش رفرش توکن برای ذخیره
-    return hashlib.sha256((str(token) + PASSWORD_PEPPER).encode("utf-8")).hexdigest()  # خروجی=هش
+def hash_refresh_token(token: str) -> str:  # تابع=هش رفرش توکن
+    return hashlib.sha256((str(token) + PASSWORD_PEPPER).encode("utf-8")).hexdigest()
 
 def unified_response(status: str, code: str, message: str, data: Optional[dict] = None):  # تابع=پاسخ واحد
-    return {"status": status, "code": code, "message": message, "data": (data or {})}  # خروجی=دیکشنری
+    return {"status": status, "code": code, "message": message, "data": (data or {})}
 
 def extract_bearer_token(request: Request) -> Optional[str]:  # تابع=استخراج Bearer
-    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""  # auth=هدر
-    if not auth.lower().startswith("bearer "):  # شرط=نبود Bearer
-        return None  # خروجی=None
-    return auth.split(" ", 1)[1].strip()  # خروجی=توکن
+    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    if not auth.lower().startswith("bearer "): return None
+    return auth.split(" ", 1)[1].strip()
 
-def decode_access_token(token: str) -> Optional[dict]:  # تابع=دیکود JWT access
-    try:  # try=محافظ
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])  # payload=decode
-        if payload.get("type") != "access":  # شرط=نوع نادرست
-            return None  # خروجی=None
-        return payload  # خروجی=payload
-    except Exception:  # catch=خطا
-        return None  # خروجی=None
+def decode_access_token(token: str) -> Optional[dict]:  # تابع=دیکود JWT
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("type") != "access": return None
+        return payload
+    except Exception:
+        return None
 
-def require_user_phone(request: Request, expected_phone: str) -> str:  # تابع=الزام Bearer و تطبیق شماره
-    token = extract_bearer_token(request)  # token=توکن
-    if not token:  # شرط=نبود توکن
-        raise HTTPException(status_code=401, detail="missing bearer token")  # خطا=۴۰۱
-    payload = decode_access_token(token)  # payload=دیکود
-    if not payload or not payload.get("sub"):  # شرط=نامعتبر
-        raise HTTPException(status_code=401, detail="invalid token")  # خطا=۴۰۱
-    sub = _normalize_phone(str(payload.get("sub") or ""))  # sub=شماره نرمال از توکن
-    exp = _normalize_phone(expected_phone)  # exp=شماره نرمال مسیر/بدنه
-    if sub != exp:  # شرط=عدم تطابق
-        raise HTTPException(status_code=403, detail="forbidden")  # خطا=۴۰۳
-    return sub  # خروجی=شماره معتبر
+def require_user_phone(request: Request, expected_phone: str) -> str:  # تابع=احراز مالکیت شماره
+    token = extract_bearer_token(request)
+    if not token: raise HTTPException(status_code=401, detail="missing bearer token")
+    payload = decode_access_token(token)
+    if not payload or not payload.get("sub"): raise HTTPException(status_code=401, detail="invalid token")
+    sub = _normalize_phone(str(payload.get("sub") or ""))
+    exp = _normalize_phone(expected_phone)
+    if sub != exp: raise HTTPException(status_code=403, detail="forbidden")
+    return sub
 
-def get_client_ip(request: Request) -> str:  # تابع=گرفتن IP کلاینت
-    xff = request.headers.get("x-forwarded-for", "")  # xff=هدر پروکسی
-    if xff:  # شرط=وجود xff
-        return xff.split(",")[0].strip()  # خروجی=اولین IP
-    return request.client.host or "unknown"  # خروجی=IP
+def get_client_ip(request: Request) -> str:  # تابع=آی‌پی کلاینت
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff: return xff.split(",")[0].strip()
+    return request.client.host or "unknown"
 
-def require_admin(request: Request) -> None:  # تابع=الزام مدیر (Bearer یا X-Admin-Key)
-    token = extract_bearer_token(request)  # token=توکن
-    if token:  # شرط=وجود توکن
-        payload = decode_access_token(token)  # payload=دیکود
-        sub = _normalize_phone(str((payload or {}).get("sub") or ""))  # sub=شماره نرمال
-        if sub and sub in ADMIN_PHONES_SET:  # شرط=مدیر بودن
-            return  # خروج=قبول
-    key = (request.headers.get("x-admin-key") or request.headers.get("X-Admin-Key") or "").strip()  # key=کلید
-    if key and key == ADMIN_KEY:  # شرط=کلید صحیح
-        return  # خروج=قبول
-    raise HTTPException(status_code=401, detail="admin auth required")  # خطا=۴۰۱
+def require_admin(request: Request) -> None:  # تابع=احراز مدیر
+    token = extract_bearer_token(request)
+    if token:
+        payload = decode_access_token(token)
+        sub = _normalize_phone(str((payload or {}).get("sub") or ""))
+        if sub and sub in ADMIN_PHONES_SET: return
+    key = (request.headers.get("x-admin-key") or request.headers.get("X-Admin-Key") or "").strip()
+    if key and key == ADMIN_KEY: return
+    raise HTTPException(status_code=401, detail="admin auth required")
 
-def get_admin_provider_phone(request: Request) -> str:  # تابع=گرفتن شماره سرویس‌دهنده مدیر
-    token = extract_bearer_token(request)  # token=توکن
-    if token:  # شرط=وجود توکن
-        payload = decode_access_token(token)  # payload=دیکود
-        sub = _normalize_phone(str((payload or {}).get("sub") or ""))  # sub=شماره نرمال
-        if sub and sub in ADMIN_PHONES_SET:  # شرط=مدیر بودن
-            return sub  # خروجی=شماره مدیر
-    if ADMIN_PHONES_SET:  # شرط=وجود مدیر در env
-        return sorted(list(ADMIN_PHONES_SET))[0]  # خروجی=اولین شماره
-    raise HTTPException(status_code=400, detail="admin provider phone not available")  # خطا=۴۰۰
+def get_admin_provider_phone(request: Request) -> str:  # تابع=شماره مدیر
+    token = extract_bearer_token(request)
+    if token:
+        payload = decode_access_token(token)
+        sub = _normalize_phone(str((payload or {}).get("sub") or ""))
+        if sub and sub in ADMIN_PHONES_SET: return sub
+    if ADMIN_PHONES_SET: return sorted(list(ADMIN_PHONES_SET))[0]
+    raise HTTPException(status_code=400, detail="admin provider phone not available")
 
+# -------------------- ORM models --------------------  # بخش=مدل‌های دیتابیس
+class UserTable(Base):  # کلاس=جدول کاربران
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    address = Column(String)
+    name = Column(String, default="")
+    car_list = Column(JSONB, default=list)
 
+class DriverTable(Base):  # کلاس=جدول راننده (رزرو شده)
+    __tablename__ = "drivers"
+    id = Column(Integer, primary_key=True, index=True)
+    first_name = Column(String)
+    last_name = Column(String)
+    photo_url = Column(String)
+    id_card_number = Column(String)
+    phone = Column(String, unique=True, index=True)
+    phone_verified = Column(Boolean, default=False)
+    is_online = Column(Boolean, default=False)
+    status = Column(String, default="فعال")
 
+class RequestTable(Base):  # کلاس=جدول سفارش‌ها
+    __tablename__ = "requests"
+    id = Column(Integer, primary_key=True, index=True)
+    user_phone = Column(String, index=True)
+    latitude = Column(Float)
+    longitude = Column(Float)
+    car_list = Column(JSONB)
+    address = Column(String)
+    home_number = Column(String, default="")
+    service_type = Column(String, index=True)
+    price = Column(Integer)
+    request_datetime = Column(String)
+    status = Column(String)
+    driver_name = Column(String)
+    driver_phone = Column(String)
+    finish_datetime = Column(String)
+    payment_type = Column(String)
+    scheduled_start = Column(DateTime(timezone=True), nullable=True)
+    service_place = Column(String, default="client")
+    execution_start = Column(DateTime(timezone=True), nullable=True)
 
-def _load_service_account() -> Optional[dict]:  # تابع=خواندن service account (نسخه دیباگ)
-    # 1. تلاش برای خواندن از Base64 (اولویت دارد)
+class RefreshTokenTable(Base):  # کلاس=جدول رفرش توکن
+    __tablename__ = "refresh_tokens"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    token_hash = Column(String, unique=True, index=True)
+    expires_at = Column(DateTime(timezone=True), index=True)
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (Index("ix_refresh_token_user_id_expires", "user_id", "expires_at"),)
+
+class LoginAttemptTable(Base):  # کلاس=جدول تلاش ورود
+    __tablename__ = "login_attempts"
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String, index=True)
+    ip = Column(String, index=True)
+    attempt_count = Column(Integer, default=0)
+    window_start = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    locked_until = Column(DateTime(timezone=True), nullable=True)
+    last_attempt_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (Index("ix_login_attempt_phone_ip", "phone", "ip"),)
+
+class ScheduleSlotTable(Base):  # کلاس=جدول زمان‌های پیشنهادی
+    __tablename__ = "schedule_slots"
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(Integer, ForeignKey("requests.id"), index=True)
+    provider_phone = Column(String, index=True)
+    slot_start = Column(DateTime(timezone=True), index=True)
+    status = Column(String, default="PROPOSED")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (Index("ix_schedule_slots_req_status", "request_id", "status"),)
+
+class AppointmentTable(Base):  # کلاس=جدول رزرو قطعی
+    __tablename__ = "appointments"
+    id = Column(Integer, primary_key=True, index=True)
+    provider_phone = Column(String, index=True)
+    request_id = Column(Integer, ForeignKey("requests.id"), index=True)
+    start_time = Column(DateTime(timezone=True), index=True)
+    end_time = Column(DateTime(timezone=True), index=True)
+    status = Column(String, default="BOOKED")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (
+        UniqueConstraint("provider_phone", "start_time", "end_time", name="uq_provider_slot"),
+        Index("ix_provider_time", "provider_phone", "start_time", "end_time")
+    )
+
+class NotificationTable(Base):  # کلاس=جدول اعلان‌ها
+    __tablename__ = "notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_phone = Column(String, index=True)
+    title = Column(String)
+    body = Column(String)
+    data = Column(JSONB, default=dict)
+    read = Column(Boolean, default=False, index=True)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    __table_args__ = (Index("ix_notifs_user_read_created", "user_phone", "read", "created_at"),)
+
+class DeviceTokenTable(Base):  # کلاس=توکن دستگاه
+    __tablename__ = "device_tokens"
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String, unique=True, index=True)
+    role = Column(String, index=True)
+    platform = Column(String, default="android", index=True)
+    user_phone = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (Index("ix_tokens_role_platform", "role", "platform"),)
+
+# -------------------- Pydantic models --------------------  # بخش=مدل‌های ورودی API
+class CarInfo(BaseModel):
+    brand: str
+    model: str
+    plate: str
+
+class Location(BaseModel):
+    latitude: float
+    longitude: float
+
+class CarOrderItem(BaseModel):
+    brand: str
+    model: str
+    plate: str
+    wash_outside: bool = False
+    wash_inside: bool = False
+    polish: bool = False
+
+class OrderRequest(BaseModel):
+    user_phone: str
+    location: Location
+    car_list: List[CarOrderItem]
+    address: str
+    home_number: Optional[str] = ""
+    service_type: str
+    price: int
+    request_datetime: str
+    payment_type: str
+    service_place: str
+
+class CarListUpdateRequest(BaseModel):
+    user_phone: str
+    car_list: List[CarInfo]
+
+class CancelRequest(BaseModel):
+    user_phone: str
+    service_type: str
+
+class UserRegisterRequest(BaseModel):
+    phone: str
+    password: str
+    address: Optional[str] = None
+
+class UserLoginRequest(BaseModel):
+    phone: str
+    password: str
+
+class UserProfileUpdate(BaseModel):
+    phone: str
+    name: str = ""
+    address: str = ""
+
+class ProposedSlotsRequest(BaseModel):
+    slots: List[str]
+
+class ConfirmSlotRequest(BaseModel):
+    slot: str
+
+class PriceBody(BaseModel):
+    price: int
+    agree: bool
+    exec_time: Optional[str] = None
+
+class PushRegister(BaseModel):
+    role: str
+    token: str
+    platform: str = "android"
+    user_phone: Optional[str] = None
+
+class PushUnregister(BaseModel):
+    token: str
+
+class LogoutRequest(BaseModel):
+    refresh_token: str
+    device_token: Optional[str] = None
+
+class RefreshAccessRequest(BaseModel):
+    refresh_token: str
+
+# -------------------- Push helpers (Modified) --------------------  # بخش=توابع ارسال پوش (اصلاح شده)
+
+_FCM_OAUTH_TOKEN = ""  # کش توکن OAuth
+_FCM_OAUTH_EXP = 0.0  # انقضای توکن OAuth
+
+def _load_service_account() -> Optional[dict]:  # تابع=لود فایل کردینشال (اولویت با Base64)
+    # 1. تلاش اول: Base64 (مطمئن‌ترین روش در Render)
     b64_val = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON_B64", "").strip()
     if b64_val:
         try:
-            raw_decoded = base64.b64decode(b64_val).decode("utf-8")
-            data = json.loads(raw_decoded)
+            # دیکود کردن Base64 به رشته
+            decoded_bytes = base64.b64decode(b64_val)
+            decoded_str = decoded_bytes.decode("utf-8")
+            data = json.loads(decoded_str)
+            # چک کردن فیلدها و اصلاح کاراکتر خط جدید
             if "client_email" in data and "private_key" in data:
                 pk = str(data.get("private_key", ""))
                 if "\\n" in pk:
@@ -236,15 +405,14 @@ def _load_service_account() -> Optional[dict]:  # تابع=خواندن service 
                 logger.info("Service Account loaded successfully from Base64")
                 return data
             else:
-                logger.error("Service Account loaded from Base64 but missing client_email or private_key")
+                logger.error("Service Account loaded from Base64 but missing keys")
         except Exception as e:
             logger.error(f"Failed to load Service Account from Base64: {e}")
 
-    # 2. تلاش برای خواندن از JSON Raw (اگر B64 نبود یا ناموفق بود)
+    # 2. تلاش دوم: متغیر متنی JSON (اگر Base64 نبود)
     raw_val = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
-    # پشتیبانی از نام قدیمی
     if not raw_val:
-        raw_val = os.getenv("GOOGLE_APPLICATIONS_CREDENTIALS_JSON", "").strip()
+        raw_val = os.getenv("GOOGLE_APPLICATIONS_CREDENTIALS_JSON", "").strip() # نام قدیمی
 
     if raw_val:
         try:
@@ -256,1882 +424,696 @@ def _load_service_account() -> Optional[dict]:  # تابع=خواندن service 
                 logger.info("Service Account loaded successfully from JSON Raw")
                 return data
             else:
-                logger.error("Service Account loaded from JSON Raw but missing client_email or private_key")
+                logger.error("Service Account loaded from JSON Raw but missing keys")
         except Exception as e:
             logger.error(f"Failed to load Service Account from JSON Raw: {e}")
 
-    logger.error("No valid Service Account found (Check GOOGLE_APPLICATION_CREDENTIALS_JSON_B64)")
+    logger.error("No valid Service Account found. Check env vars.")
     return None
 
+def _get_oauth2_token_for_fcm() -> Optional[str]:  # تابع=گرفتن OAuth Token
+    global _FCM_OAUTH_TOKEN, _FCM_OAUTH_EXP
+    now = time.time()
+    if _FCM_OAUTH_TOKEN and (_FCM_OAUTH_EXP - 60) > now:
+        return _FCM_OAUTH_TOKEN
+    
+    sa = _load_service_account()
+    if not sa:
+        return None
+    
+    issued = int(now)
+    expires = issued + 3600
+    payload = {
+        "iss": sa["client_email"],
+        "scope": "https://www.googleapis.com/auth/firebase.messaging",
+        "aud": "https://oauth2.googleapis.com/token",
+        "iat": issued,
+        "exp": expires
+    }
+    
+    try:
+        assertion = jwt.encode(payload, sa["private_key"], algorithm="RS256")
+        resp = httpx.post(
+            "https://oauth2.googleapis.com/token",
+            data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
+            timeout=10.0
+        )
+        if resp.status_code != 200:
+            logger.error(f"OAuth token fetch failed: {resp.text}")
+            return None
+        
+        data = resp.json()
+        token = str(data.get("access_token", "")).strip()
+        if token:
+            _FCM_OAUTH_TOKEN = token
+            _FCM_OAUTH_EXP = now + int(data.get("expires_in", 3600))
+            return token
+    except Exception as e:
+        logger.error(f"OAuth exception: {e}")
+    
+    return None
 
+def _to_fcm_data(data: dict) -> dict:  # تابع=تبدیل دیتا به رشته
+    out: Dict[str, str] = {}
+    for k, v in (data or {}).items():
+        if v is None: continue
+        out[str(k)] = str(v)
+    return out
 
-# -------------------- ORM models --------------------  # بخش=مدل‌های دیتابیس
-class UserTable(Base):  # کلاس=جدول کاربران
-    __tablename__ = "users"  # نام جدول=users
-    id = Column(Integer, primary_key=True, index=True)  # ستون=id
-    phone = Column(String, unique=True, index=True)  # ستون=شماره (نرمال)
-    password_hash = Column(String)  # ستون=هش رمز
-    address = Column(String)  # ستون=آدرس
-    name = Column(String, default="")  # ستون=نام
-    car_list = Column(JSONB, default=list)  # ستون=لیست خودرو
+def order_push_data(msg_type: str, order_id: int, status: str, service_type: str = "", scheduled_start: Optional[datetime] = None, execution_start: Optional[datetime] = None, price: Optional[int] = None) -> dict:  # تابع=ساخت payload
+    data = {"type": str(msg_type or "").strip(), "order_id": str(int(order_id)), "status": str(status or "").strip()}
+    if service_type: data["service_type"] = str(service_type).strip()
+    if scheduled_start is not None: data["scheduled_start"] = scheduled_start.astimezone(timezone.utc).isoformat()
+    if execution_start is not None: data["execution_start"] = execution_start.astimezone(timezone.utc).isoformat()
+    if price is not None: data["price"] = str(int(price))
+    return data
 
-class DriverTable(Base):  # کلاس=جدول راننده
-    __tablename__ = "drivers"  # نام جدول=drivers
-    id = Column(Integer, primary_key=True, index=True)  # ستون=id
-    first_name = Column(String)  # ستون=نام
-    last_name = Column(String)  # ستون=نام خانوادگی
-    photo_url = Column(String)  # ستون=عکس
-    id_card_number = Column(String)  # ستون=کارت
-    phone = Column(String, unique=True, index=True)  # ستون=شماره
-    phone_verified = Column(Boolean, default=False)  # ستون=تایید
-    is_online = Column(Boolean, default=False)  # ستون=آنلاین
-    status = Column(String, default="فعال")  # ستون=وضعیت
+async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict) -> None:  # تابع=ارسال Legacy
+    if not tokens: return
+    if not FCM_SERVER_KEY:
+        logger.error("FCM_SERVER_KEY is empty")
+        return
 
-class RequestTable(Base):  # کلاس=جدول سفارش‌ها
-    __tablename__ = "requests"  # نام جدول=requests
-    id = Column(Integer, primary_key=True, index=True)  # ستون=id
-    user_phone = Column(String, index=True)  # ستون=شماره کاربر (نرمال)
-    latitude = Column(Float)  # ستون=lat
-    longitude = Column(Float)  # ستون=lng
-    car_list = Column(JSONB)  # ستون=لیست خودرو/خدمات
-    address = Column(String)  # ستون=آدرس
-    home_number = Column(String, default="")  # ستون=پلاک
-    service_type = Column(String, index=True)  # ستون=نوع سرویس
-    price = Column(Integer)  # ستون=قیمت
-    request_datetime = Column(String)  # ستون=زمان ثبت (رشته)
-    status = Column(String)  # ستون=وضعیت
-    driver_name = Column(String)  # ستون=نام سرویس‌دهنده
-    driver_phone = Column(String)  # ستون=شماره سرویس‌دهنده (نرمال)
-    finish_datetime = Column(String)  # ستون=زمان پایان (رشته)
-    payment_type = Column(String)  # ستون=پرداخت
-    scheduled_start = Column(DateTime(timezone=True), nullable=True)  # ستون=زمان بازدید (UTC)
-    service_place = Column(String, default="client")  # ستون=محل سرویس
-    execution_start = Column(DateTime(timezone=True), nullable=True)  # ستون=زمان اجرا (UTC)
+    headers = {"Authorization": f"key={FCM_SERVER_KEY}", "Content-Type": "application/json"}
+    merged = dict(data or {})
+    merged["title"] = str(title or "")
+    merged["body"] = str(body or "")
+    payload = {"registration_ids": tokens, "priority": "high", "data": _to_fcm_data(merged)}
 
-class RefreshTokenTable(Base):  # کلاس=جدول refresh token
-    __tablename__ = "refresh_tokens"  # نام جدول=refresh_tokens
-    id = Column(Integer, primary_key=True, index=True)  # ستون=id
-    user_id = Column(Integer, ForeignKey("users.id"), index=True)  # ستون=user_id
-    token_hash = Column(String, unique=True, index=True)  # ستون=هش توکن
-    expires_at = Column(DateTime(timezone=True), index=True)  # ستون=انقضا
-    revoked = Column(Boolean, default=False)  # ستون=ابطال
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # ستون=ایجاد
-    __table_args__ = (Index("ix_refresh_token_user_id_expires", "user_id", "expires_at"),)  # ایندکس=ترکیبی
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload)
+    if resp.status_code != 200:
+        logger.error(f"FCM legacy send failed HTTP_{resp.status_code} body={resp.text}")
 
-class LoginAttemptTable(Base):  # کلاس=جدول تلاش ورود
-    __tablename__ = "login_attempts"  # نام جدول=login_attempts
-    id = Column(Integer, primary_key=True, index=True)  # ستون=id
-    phone = Column(String, index=True)  # ستون=شماره (نرمال)
-    ip = Column(String, index=True)  # ستون=ip
-    attempt_count = Column(Integer, default=0)  # ستون=تعداد تلاش
-    window_start = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # ستون=شروع پنجره
-    locked_until = Column(DateTime(timezone=True), nullable=True)  # ستون=قفل تا
-    last_attempt_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # ستون=آخرین تلاش
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # ستون=ایجاد
-    __table_args__ = (Index("ix_login_attempt_phone_ip", "phone", "ip"),)  # ایندکس=phone+ip
+async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict) -> None:  # تابع=ارسال v1
+    access = _get_oauth2_token_for_fcm()
+    if not access:
+        logger.error("FCM v1 oauth token not available")
+        return
+    if not FCM_PROJECT_ID:
+        logger.error("FCM_PROJECT_ID is empty")
+        return
 
-class ScheduleSlotTable(Base):  # کلاس=جدول زمان‌های پیشنهادی
-    __tablename__ = "schedule_slots"  # نام جدول=schedule_slots
-    id = Column(Integer, primary_key=True, index=True)  # ستون=id
-    request_id = Column(Integer, ForeignKey("requests.id"), index=True)  # ستون=request_id
-    provider_phone = Column(String, index=True)  # ستون=شماره سرویس‌دهنده
-    slot_start = Column(DateTime(timezone=True), index=True)  # ستون=شروع (UTC)
-    status = Column(String, default="PROPOSED")  # ستون=وضعیت
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # ستون=ایجاد
-    __table_args__ = (Index("ix_schedule_slots_req_status", "request_id", "status"),)  # ایندکس=req+status
+    headers = {"Authorization": f"Bearer {access}", "Content-Type": "application/json"}
+    merged = dict(data or {})
+    merged["title"] = str(title or "")
+    merged["body"] = str(body or "")
+    msg = {
+        "message": {
+            "token": str(token or "").strip(),
+            "android": {"priority": "HIGH"},
+            "data": _to_fcm_data(merged)
+        }
+    }
+    url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(url, headers=headers, json=msg)
+    if resp.status_code not in (200, 201):
+        logger.error(f"FCM v1 send failed HTTP_{resp.status_code} body={resp.text}")
 
-class AppointmentTable(Base):  # کلاس=جدول رزرو قطعی
-    __tablename__ = "appointments"  # نام جدول=appointments
-    id = Column(Integer, primary_key=True, index=True)  # ستون=id
-    provider_phone = Column(String, index=True)  # ستون=شماره سرویس‌دهنده
-    request_id = Column(Integer, ForeignKey("requests.id"), index=True)  # ستون=request_id
-    start_time = Column(DateTime(timezone=True), index=True)  # ستون=شروع (UTC)
-    end_time = Column(DateTime(timezone=True), index=True)  # ستون=پایان (UTC)
-    status = Column(String, default="BOOKED")  # ستون=وضعیت
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # ستون=ایجاد
-    __table_args__ = (  # table_args=قیود/ایندکس‌ها
-        UniqueConstraint("provider_phone", "start_time", "end_time", name="uq_provider_slot"),  # قید=یکتا بودن بازه
-        Index("ix_provider_time", "provider_phone", "start_time", "end_time")  # ایندکس=زمانی
-    )  # پایان table_args
+async def push_notify_tokens(tokens: List[str], title: str, body: str, data: dict) -> None:  # تابع=مدیریت ارسال پوش
+    if not tokens: return
+    
+    if PUSH_BACKEND == "fcm":
+        # بررسی امکان استفاده از v1
+        sa = _load_service_account()
+        if FCM_PROJECT_ID and (sa is not None):
+            logger.info(f"Sending push via FCM v1 to {len(tokens)} tokens")
+            for t in tokens:
+                await _send_fcm_v1_single(t, title, body, data)
+            return
+        
+        # اگر v1 ممکن نبود، تلاش با Legacy (فقط اگر کلید باشد)
+        if FCM_SERVER_KEY:
+            logger.warning("Falling back to FCM Legacy")
+            await _send_fcm_legacy(tokens, title, body, data)
+        else:
+            logger.error("Cannot send FCM: ProjectID/ServiceAccount missing AND LegacyKey missing")
+        return
 
-class NotificationTable(Base):  # کلاس=جدول اعلان‌ها
-    __tablename__ = "notifications"  # نام جدول=notifications
-    id = Column(Integer, primary_key=True, index=True)  # ستون=id
-    user_phone = Column(String, index=True)  # ستون=شماره گیرنده
-    title = Column(String)  # ستون=عنوان
-    body = Column(String)  # ستون=متن
-    data = Column(JSONB, default=dict)  # ستون=data
-    read = Column(Boolean, default=False, index=True)  # ستون=خوانده شده؟
-    read_at = Column(DateTime(timezone=True), nullable=True)  # ستون=زمان خواندن
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)  # ستون=ایجاد
-    __table_args__ = (Index("ix_notifs_user_read_created", "user_phone", "read", "created_at"),)  # ایندکس=ترکیبی
-
-class DeviceTokenTable(Base):  # کلاس=توکن دستگاه
-    __tablename__ = "device_tokens"  # نام جدول=device_tokens
-    id = Column(Integer, primary_key=True, index=True)  # ستون=id
-    token = Column(String, unique=True, index=True)  # ستون=توکن
-    role = Column(String, index=True)  # ستون=نقش
-    platform = Column(String, default="android", index=True)  # ستون=پلتفرم
-    user_phone = Column(String, nullable=True)  # ستون=شماره (اختیاری)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # ستون=ایجاد
-    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # ستون=آپدیت
-    __table_args__ = (Index("ix_tokens_role_platform", "role", "platform"),)  # ایندکس=role+platform
-# -------------------- Pydantic models --------------------  # بخش=مدل‌های ورودی/خروجی API
-
-class CarInfo(BaseModel):  # کلاس=مدل خودرو برای ذخیره لیست ماشین
-    brand: str  # فیلد=برند
-    model: str  # فیلد=مدل
-    plate: str  # فیلد=پلاک
-
-class Location(BaseModel):  # کلاس=مدل موقعیت مکانی
-    latitude: float  # فیلد=عرض جغرافیایی
-    longitude: float  # فیلد=طول جغرافیایی
-
-class CarOrderItem(BaseModel):  # کلاس=آیتم سفارش برای یک خودرو/خدمت
-    brand: str  # فیلد=برند
-    model: str  # فیلد=مدل
-    plate: str  # فیلد=پلاک
-    wash_outside: bool = False  # فیلد=روشویی
-    wash_inside: bool = False  # فیلد=توشویی
-    polish: bool = False  # فیلد=پولیش
-
-class OrderRequest(BaseModel):  # کلاس=ثبت سفارش
-    user_phone: str  # فیلد=شماره کاربر
-    location: Location  # فیلد=موقعیت
-    car_list: List[CarOrderItem]  # فیلد=لیست خودروها
-    address: str  # فیلد=آدرس
-    home_number: Optional[str] = ""  # فیلد=پلاک خانه
-    service_type: str  # فیلد=نوع سرویس
-    price: int  # فیلد=قیمت
-    request_datetime: str  # فیلد=زمان ثبت (رشته)
-    payment_type: str  # فیلد=نوع پرداخت
-    service_place: str  # فیلد=محل سرویس (client/provider)
-
-class CarListUpdateRequest(BaseModel):  # کلاس=آپدیت لیست خودروها
-    user_phone: str  # فیلد=شماره کاربر
-    car_list: List[CarInfo]  # فیلد=لیست خودرو
-
-class CancelRequest(BaseModel):  # کلاس=لغو سفارش
-    user_phone: str  # فیلد=شماره کاربر
-    service_type: str  # فیلد=نوع سرویس
-
-class UserRegisterRequest(BaseModel):  # کلاس=ثبت‌نام
-    phone: str  # فیلد=شماره
-    password: str  # فیلد=رمز
-    address: Optional[str] = None  # فیلد=آدرس
-
-class UserLoginRequest(BaseModel):  # کلاس=ورود
-    phone: str  # فیلد=شماره
-    password: str  # فیلد=رمز
-
-class UserProfileUpdate(BaseModel):  # کلاس=آپدیت پروفایل
-    phone: str  # فیلد=شماره
-    name: str = ""  # فیلد=نام
-    address: str = ""  # فیلد=آدرس
-
-class ProposedSlotsRequest(BaseModel):  # کلاس=ارسال زمان‌های پیشنهادی
-    slots: List[str]  # فیلد=لیست ISO UTC
-
-class ConfirmSlotRequest(BaseModel):  # کلاس=تأیید زمان بازدید
-    slot: str  # فیلد=زمان ISO UTC
-
-class PriceBody(BaseModel):  # کلاس=ثبت قیمت و توافق
-    price: int  # فیلد=قیمت
-    agree: bool  # فیلد=موافقت
-    exec_time: Optional[str] = None  # فیلد=زمان اجرا ISO UTC
-
-class PushRegister(BaseModel):  # کلاس=ثبت توکن پوش
-    role: str  # فیلد=نقش (client/manager)
-    token: str  # فیلد=توکن FCM
-    platform: str = "android"  # فیلد=پلتفرم
-    user_phone: Optional[str] = None  # فیلد=شماره (اختیاری)
-
-class PushUnregister(BaseModel):  # کلاس=لغو ثبت پوش
-    token: str  # فیلد=توکن
-
-class LogoutRequest(BaseModel):  # کلاس=خروج
-    refresh_token: str  # فیلد=رفرش توکن
-    device_token: Optional[str] = None  # فیلد=توکن دستگاه برای حذف
-
-class RefreshAccessRequest(BaseModel):  # کلاس=رفرش access
-    refresh_token: str  # فیلد=رفرش توکن
-
-# -------------------- Push helpers --------------------  # بخش=توابع ارسال پوش
-
-_FCM_OAUTH_TOKEN = ""  # متغیر=کش توکن OAuth
-_FCM_OAUTH_EXP = 0.0  # متغیر=زمان انقضای OAuth
-
-def _load_service_account() -> Optional[dict]:  # تابع=خواندن service account برای FCM v1
-    raw = GOOGLE_APPLICATION_CREDENTIALS_JSON  # raw=json خام
-    if not raw and GOOGLE_APPLICATION_CREDENTIALS_JSON_B64:  # شرط=داشتن b64
-        try:  # try=محافظ
-            raw = base64.b64decode(GOOGLE_APPLICATION_CREDENTIALS_JSON_B64).decode("utf-8")  # decode=تبدیل b64 به json
-        except Exception:  # catch=خطا
-            raw = ""  # مقدار=خالی
-    if not raw:  # شرط=خالی بودن
-        return None  # خروجی=None
-    try:  # try=محافظ
-        data = json.loads(raw)  # data=پارس json
-        if "client_email" in data and "private_key" in data:  # شرط=کلیدهای لازم
-            pk = str(data.get("private_key", ""))  # pk=کلید خصوصی
-            if "\\n" in pk:  # شرط=وجود \n اسکیپ
-                data["private_key"] = pk.replace("\\n", "\n")  # عمل=تبدیل به خط جدید واقعی
-            return data  # خروجی=data
-    except Exception:  # catch=خطا
-        return None  # خروجی=None
-    return None  # خروجی=None
-
-def _get_oauth2_token_for_fcm() -> Optional[str]:  # تابع=گرفتن OAuth token برای FCM v1
-    global _FCM_OAUTH_TOKEN, _FCM_OAUTH_EXP  # global=استفاده از کش
-    now = time.time()  # now=زمان فعلی
-    if _FCM_OAUTH_TOKEN and (_FCM_OAUTH_EXP - 60) > now:  # شرط=معتبر بودن کش
-        return _FCM_OAUTH_TOKEN  # خروجی=توکن کش
-    sa = _load_service_account()  # sa=service account
-    if not sa:  # شرط=نبودن
-        return None  # خروجی=None
-    issued = int(now)  # issued=iat
-    expires = issued + 3600  # expires=exp
-    payload = {  # payload=JWT assertion
-        "iss": sa["client_email"],  # iss=ایمیل سرویس
-        "scope": "https://www.googleapis.com/auth/firebase.messaging",  # scope=مجوز FCM
-        "aud": "https://oauth2.googleapis.com/token",  # aud=توکن گوگل
-        "iat": issued,  # iat=زمان صدور
-        "exp": expires  # exp=زمان انقضا
-    }  # پایان payload
-    assertion = jwt.encode(payload, sa["private_key"], algorithm="RS256")  # assertion=JWT امضاشده
-    resp = httpx.post(  # resp=درخواست توکن OAuth
-        "https://oauth2.googleapis.com/token",  # url=توکن گوگل
-        data={  # data=form
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",  # grant=نوع گرانت
-            "assertion": assertion  # assertion=JWT
-        },  # پایان data
-        timeout=10.0  # timeout=مهلت
-    )  # پایان post
-    if resp.status_code != 200:  # شرط=عدم موفقیت
-        return None  # خروجی=None
-    data = resp.json()  # data=پارس json پاسخ
-    token = str(data.get("access_token", "")).strip()  # token=access_token
-    if not token:  # شرط=نبود توکن
-        return None  # خروجی=None
-    _FCM_OAUTH_TOKEN = token  # ذخیره=توکن در کش
-    _FCM_OAUTH_EXP = now + int(data.get("expires_in", 3600))  # ذخیره=زمان انقضا
-    return token  # خروجی=توکن
-
-def _to_fcm_data(data: dict) -> dict:  # تابع=تبدیل دیتا به string برای FCM
-    out: Dict[str, str] = {}  # out=دیکشنری خروجی
-    for k, v in (data or {}).items():  # حلقه=روی کلیدها
-        if v is None:  # شرط=None
-            continue  # ادامه=رد
-        out[str(k)] = str(v)  # تبدیل=به رشته
-    return out  # خروجی=دیتای رشته‌ای
-
-def order_push_data(  # تابع=ساخت payload استاندارد برای اپ‌ها
-    msg_type: str,  # ورودی=نوع پیام
-    order_id: int,  # ورودی=شناسه سفارش
-    status: str,  # ورودی=وضعیت
-    service_type: str = "",  # ورودی=نوع سرویس
-    scheduled_start: Optional[datetime] = None,  # ورودی=زمان بازدید
-    execution_start: Optional[datetime] = None,  # ورودی=زمان اجرا
-    price: Optional[int] = None  # ورودی=قیمت
-) -> dict:  # خروجی=دیکشنری data
-    data = {  # data=بدنه اصلی
-        "type": str(msg_type or "").strip(),  # type=نوع
-        "order_id": str(int(order_id)),  # order_id=رشته
-        "status": str(status or "").strip()  # status=رشته
-    }  # پایان data
-    if service_type:  # شرط=وجود سرویس
-        data["service_type"] = str(service_type).strip()  # service_type=ثبت
-    if scheduled_start is not None:  # شرط=وجود زمان بازدید
-        data["scheduled_start"] = scheduled_start.astimezone(timezone.utc).isoformat()  # scheduled_start=ISO UTC
-    if execution_start is not None:  # شرط=وجود زمان اجرا
-        data["execution_start"] = execution_start.astimezone(timezone.utc).isoformat()  # execution_start=ISO UTC
-    if price is not None:  # شرط=وجود قیمت
-        data["price"] = str(int(price))  # price=رشته
-    return data  # خروجی=data
-
-async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict) -> None:  # تابع=ارسال Legacy FCM (Data-only)
-    if not tokens:  # شرط=توکن خالی
-        return  # خروج
-    if not FCM_SERVER_KEY:  # شرط=کلید خالی
-        logger.error("FCM_SERVER_KEY is empty")  # لاگ=خطا
-        return  # خروج
-
-    headers = {  # headers=هدرها
-        "Authorization": f"key={FCM_SERVER_KEY}",  # Authorization=کلید legacy
-        "Content-Type": "application/json"  # Content-Type=json
-    }  # پایان headers
-
-    merged = dict(data or {})  # merged=کپی data
-    merged["title"] = str(title or "")  # title=در data
-    merged["body"] = str(body or "")  # body=در data
-
-    payload = {  # payload=بدنه درخواست FCM legacy
-        "registration_ids": tokens,  # registration_ids=توکن‌ها
-        "priority": "high",  # priority=بالا
-        "data": _to_fcm_data(merged)  # data=Data-only
-    }  # پایان payload
-
-    async with httpx.AsyncClient(timeout=10.0) as client:  # client=کلاینت async
-        resp = await client.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload)  # ارسال=POST
-    if resp.status_code != 200:  # شرط=عدم موفقیت
-        logger.error(f"FCM legacy send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ=خطا
-
-async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict) -> None:  # تابع=ارسال FCM v1 تک‌توکن
-    access = _get_oauth2_token_for_fcm()  # access=توکن OAuth
-    if not access:  # شرط=نبود OAuth
-        logger.error("FCM v1 oauth token not available")  # لاگ=خطا
-        return  # خروج
-    if not FCM_PROJECT_ID:  # شرط=نبود project id
-        logger.error("FCM_PROJECT_ID is empty")  # لاگ=خطا
-        return  # خروج
-
-    headers = {  # headers=هدرها
-        "Authorization": f"Bearer {access}",  # Authorization=Bearer
-        "Content-Type": "application/json"  # Content-Type=json
-    }  # پایان headers
-
-    merged = dict(data or {})  # merged=کپی دیتا
-    merged["title"] = str(title or "")  # title=در data
-    merged["body"] = str(body or "")  # body=در data
-
-    msg = {  # msg=بدنه پیام v1
-        "message": {  # message=پیام
-            "token": str(token or "").strip(),  # token=توکن مقصد
-            "android": {"priority": "HIGH"},  # android=اولویت بالا
-            "data": _to_fcm_data(merged)  # data=Data-only
-        }  # پایان message
-    }  # پایان msg
-
-    url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"  # url=اندپوینت v1
-    async with httpx.AsyncClient(timeout=10.0) as client:  # client=کلاینت async
-        resp = await client.post(url, headers=headers, json=msg)  # ارسال=POST
-    if resp.status_code not in (200, 201):  # شرط=عدم موفقیت
-        logger.error(f"FCM v1 send failed HTTP_{resp.status_code} body={resp.text}")  # لاگ=خطا
-
-async def push_notify_tokens(tokens: List[str], title: str, body: str, data: dict) -> None:  # تابع=ارسال پوش به لیست توکن‌ها
-    if not tokens:  # شرط=توکن خالی
-        return  # خروج
-    if PUSH_BACKEND == "fcm":  # شرط=بک‌اند FCM
-        if FCM_PROJECT_ID and (_load_service_account() is not None):  # شرط=امکان v1
-            for t in tokens:  # حلقه=روی توکن‌ها
-                await _send_fcm_v1_single(t, title, body, data)  # ارسال=v1
-            return  # خروج
-        await _send_fcm_legacy(tokens, title, body, data)  # ارسال=legacy
-        return  # خروج
-    if PUSH_BACKEND == "ntfy":  # شرط=بک‌اند ntfy
-        base = (NTFY_BASE_URL or "https://ntfy.sh").strip()  # base=آدرس
-        headers: Dict[str, str] = {}  # headers=هدرها
-        if NTFY_AUTH:  # شرط=وجود auth
-            headers["Authorization"] = NTFY_AUTH  # set=هدر auth
-        async with httpx.AsyncClient(timeout=10.0) as client:  # client=کلاینت async
-            for topic in tokens:  # حلقه=topic
-                await client.post(f"{base}/{topic}", headers=headers, data=body.encode("utf-8"))  # ارسال=POST
-        return  # خروج
-    logger.error(f"unknown PUSH_BACKEND={PUSH_BACKEND}")  # لاگ=بک‌اند ناشناخته
+    if PUSH_BACKEND == "ntfy":
+        base = (NTFY_BASE_URL or "https://ntfy.sh").strip()
+        headers = {}
+        if NTFY_AUTH: headers["Authorization"] = NTFY_AUTH
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for topic in tokens:
+                await client.post(f"{base}/{topic}", headers=headers, data=body.encode("utf-8"))
+        return
+    
+    logger.error(f"unknown PUSH_BACKEND={PUSH_BACKEND}")
 
 async def get_manager_tokens(target_phone: Optional[str] = None) -> List[str]:  # تابع=گرفتن توکن‌های مدیر
-    q = DeviceTokenTable.__table__.select().where(  # q=کوئری
-        (DeviceTokenTable.role == "manager") &  # شرط=role manager
-        (DeviceTokenTable.platform == "android")  # شرط=android
-    )  # پایان where
-    if target_phone:  # شرط=شماره هدف
-        q = q.where(DeviceTokenTable.user_phone == _normalize_phone(target_phone))  # شرط=شماره
-    rows = await database.fetch_all(q)  # rows=اجرا
-    seen: set[str] = set()  # seen=جلوگیری از تکرار
-    out: List[str] = []  # out=خروجی
-    for r in rows:  # حلقه=روی ردیف‌ها
-        t = str(r["token"] or "").strip()  # t=توکن
-        if t and t not in seen:  # شرط=توکن معتبر و غیرتکراری
-            seen.add(t)  # add=به seen
-            out.append(t)  # add=به خروجی
-    return out  # خروجی=لیست
+    q = DeviceTokenTable.__table__.select().where((DeviceTokenTable.role == "manager") & (DeviceTokenTable.platform == "android"))
+    if target_phone:
+        q = q.where(DeviceTokenTable.user_phone == _normalize_phone(target_phone))
+    rows = await database.fetch_all(q)
+    seen: set[str] = set()
+    out: List[str] = []
+    for r in rows:
+        t = str(r["token"] or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 async def get_user_tokens(phone: str) -> List[str]:  # تابع=گرفتن توکن‌های کاربر
-    norm = _normalize_phone(phone)  # norm=شماره نرمال
-    q = DeviceTokenTable.__table__.select().where(  # q=کوئری
-        (DeviceTokenTable.role.in_(["client", "user"])) &  # شرط=نقش کاربر
-        (DeviceTokenTable.platform == "android") &  # شرط=اندروید
-        (DeviceTokenTable.user_phone == norm)  # شرط=شماره
-    )  # پایان where
-    rows = await database.fetch_all(q)  # rows=اجرا
-    seen: set[str] = set()  # seen=جلوگیری از تکرار
-    out: List[str] = []  # out=خروجی
-    for r in rows:  # حلقه=روی ردیف‌ها
-        t = str(r["token"] or "").strip()  # t=توکن
-        if t and t not in seen:  # شرط=توکن معتبر و غیرتکراری
-            seen.add(t)  # add=به seen
-            out.append(t)  # add=به خروجی
-    return out  # خروجی=لیست
+    norm = _normalize_phone(phone)
+    q = DeviceTokenTable.__table__.select().where(
+        (DeviceTokenTable.role.in_(["client", "user"])) &
+        (DeviceTokenTable.platform == "android") &
+        (DeviceTokenTable.user_phone == norm)
+    )
+    rows = await database.fetch_all(q)
+    seen: set[str] = set()
+    out: List[str] = []
+    for r in rows:
+        t = str(r["token"] or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
-async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None) -> None:  # تابع=ثبت اعلان + ارسال پوش کاربر
-    norm = _normalize_phone(phone)  # norm=شماره نرمال
-    ins = NotificationTable.__table__.insert().values(  # ins=درج اعلان
-        user_phone=norm,  # user_phone=شماره
-        title=str(title or ""),  # title=عنوان
-        body=str(body or ""),  # body=متن
-        data=(data or {}),  # data=داده
-        read=False,  # read=خوانده نشده
-        created_at=datetime.now(timezone.utc)  # created_at=اکنون
-    )  # پایان insert
-    await database.execute(ins)  # اجرا=insert
+async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None) -> None:  # تابع=اعلان به کاربر
+    norm = _normalize_phone(phone)
+    ins = NotificationTable.__table__.insert().values(
+        user_phone=norm, title=str(title or ""), body=str(body or ""), data=(data or {}),
+        read=False, created_at=datetime.now(timezone.utc)
+    )
+    await database.execute(ins)
+    tokens = await get_user_tokens(norm)
+    if not tokens:
+        logger.info(f"no user tokens for phone={norm}")
+        return
+    await push_notify_tokens(tokens, str(title or ""), str(body or ""), (data or {}))
 
-    tokens = await get_user_tokens(norm)  # tokens=توکن‌های کاربر
-    if not tokens:  # شرط=بدون توکن
-        logger.info(f"no user tokens for phone={norm}")  # لاگ=بدون توکن
-        return  # خروج
-    await push_notify_tokens(tokens, str(title or ""), str(body or ""), (data or {}))  # ارسال پوش
+async def notify_managers(title: str, body: str, data: Optional[dict] = None, target_phone: Optional[str] = None) -> None:  # تابع=اعلان به مدیران
+    tokens = await get_manager_tokens(target_phone=target_phone)
+    if not tokens and not target_phone:
+        logger.info("no manager tokens")
+        return
+    if not tokens and target_phone:
+        tokens = await get_manager_tokens(target_phone=None)
+    if not tokens:
+        logger.info("no manager tokens")
+        return
+    await push_notify_tokens(tokens, str(title or ""), str(body or ""), (data or {}))
 
-async def notify_managers(title: str, body: str, data: Optional[dict] = None, target_phone: Optional[str] = None) -> None:  # تابع=ارسال اعلان به مدیرها
-    tokens = await get_manager_tokens(target_phone=target_phone)  # tokens=توکن‌های هدف یا همه
-    if not tokens and not target_phone:  # شرط=بدون توکن و بدون هدف
-        logger.info("no manager tokens")  # لاگ=بدون توکن
-        return  # خروج
-    if not tokens and target_phone:  # شرط=شماره هدف ولی توکن ندارد
-        tokens = await get_manager_tokens(target_phone=None)  # tokens=همه مدیرها
-    if not tokens:  # شرط=باز هم خالی
-        logger.info("no manager tokens")  # لاگ=بدون توکن
-        return  # خروج
-    await push_notify_tokens(tokens, str(title or ""), str(body or ""), (data or {}))  # ارسال پوش
-# -------------------- App & CORS --------------------  # بخش=ساخت اپ و CORS
+# -------------------- App & CORS --------------------  # بخش=اپ و CORS
+app = FastAPI()
+allow_origins = ["*"] if ALLOW_ORIGINS_ENV == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=allow_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app = FastAPI()  # app=ساخت اپ FastAPI
+# -------------------- Startup / Shutdown --------------------  # بخش=شروع/پایان
+@app.on_event("startup")
+async def startup() -> None:
+    if not DATABASE_URL: raise RuntimeError("DATABASE_URL is empty")
+    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS scheduled_start TIMESTAMPTZ NULL;"))
+        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS execution_start TIMESTAMPTZ NULL;"))
+        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS service_place VARCHAR DEFAULT 'client';"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_slots_provider_start_active ON schedule_slots (provider_phone, slot_start) WHERE status IN ('PROPOSED','ACCEPTED');"))
+    await database.connect()
 
-allow_origins = ["*"] if ALLOW_ORIGINS_ENV == "*" else [  # allow_origins=لیست origin ها
-    o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()  # پارس=از env
-]  # پایان allow_origins
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await database.disconnect()
 
-app.add_middleware(  # افزودن=middleware
-    CORSMiddleware,  # نوع=CORSMiddleware
-    allow_origins=allow_origins,  # تنظیم=origin های مجاز
-    allow_credentials=True,  # تنظیم=اجازه credential
-    allow_methods=["*"],  # تنظیم=تمام متدها
-    allow_headers=["*"],  # تنظیم=تمام هدرها
-)  # پایان add_middleware
+# -------------------- Health --------------------  # بخش=سلامت
+@app.get("/")
+def read_root():
+    return {"message": "Putzfee FastAPI Server is running!"}
 
-# -------------------- Startup / Shutdown --------------------  # بخش=شروع/پایان برنامه
+# -------------------- Auth & Token --------------------  # بخش=احراز هویت
+@app.get("/verify_token")
+def verify_token(request: Request):
+    token = extract_bearer_token(request)
+    if not token: return {"status": "ok", "valid": False}
+    payload = decode_access_token(token)
+    return {"status": "ok", "valid": bool(payload and payload.get("sub"))}
 
-@app.on_event("startup")  # رویداد=startup
-async def startup() -> None:  # تابع=startup
-    if not DATABASE_URL:  # شرط=آدرس دیتابیس خالی
-        raise RuntimeError("DATABASE_URL is empty")  # خطا=عدم تنظیم دیتابیس
+@app.post("/auth/refresh")
+async def refresh_access(body: RefreshAccessRequest):
+    raw = str(body.refresh_token or "").strip()
+    if not raw: raise HTTPException(status_code=400, detail="refresh_token required")
+    token_hash = hash_refresh_token(raw)
+    row = await database.fetch_one(RefreshTokenTable.__table__.select().where(RefreshTokenTable.token_hash == token_hash))
+    if not row or bool(row["revoked"]): raise HTTPException(status_code=401, detail="invalid/revoked refresh token")
+    if row["expires_at"] <= datetime.now(timezone.utc): raise HTTPException(status_code=401, detail="refresh token expired")
+    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.id == int(row["user_id"])))
+    if not user: raise HTTPException(status_code=401, detail="user not found")
+    access = create_access_token(_normalize_phone(user["phone"]))
+    return unified_response("ok", "ACCESS_REFRESHED", "access token refreshed", {"access_token": access})
 
-    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))  # engine=ساخت engine sync
-    Base.metadata.create_all(engine)  # create_all=ساخت جداول
+@app.post("/logout")
+async def logout_user(body: LogoutRequest):
+    refresh_raw = str(body.refresh_token or "").strip()
+    if not refresh_raw: raise HTTPException(status_code=400, detail="refresh_token required")
+    token_hash = hash_refresh_token(refresh_raw)
+    rt_row = await database.fetch_one(RefreshTokenTable.__table__.select().where(RefreshTokenTable.token_hash == token_hash))
+    await database.execute(RefreshTokenTable.__table__.update().where(RefreshTokenTable.token_hash == token_hash).values(revoked=True))
+    device_token = str(body.device_token or "").strip()
+    if device_token:
+        await database.execute(DeviceTokenTable.__table__.delete().where(DeviceTokenTable.token == device_token))
+    elif rt_row:
+        user = await database.fetch_one(UserTable.__table__.select().where(UserTable.id == int(rt_row["user_id"])))
+        if user:
+            phone = _normalize_phone(user["phone"])
+            await database.execute(DeviceTokenTable.__table__.delete().where(DeviceTokenTable.user_phone == phone))
+    return unified_response("ok", "LOGOUT", "logged out", {})
 
-    with engine.begin() as conn:  # conn=اتصال تراکنشی sync
-        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS scheduled_start TIMESTAMPTZ NULL;"))  # مهاجرت=افزودن scheduled_start
-        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS execution_start TIMESTAMPTZ NULL;"))  # مهاجرت=افزودن execution_start
-        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS service_place VARCHAR DEFAULT 'client';"))  # مهاجرت=افزودن service_place
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_slots_provider_start_active ON schedule_slots (provider_phone, slot_start) WHERE status IN ('PROPOSED','ACCEPTED');"))  # ایندکس=یونیک اسلات فعال
+@app.post("/push/register")
+async def register_push_token(body: PushRegister):
+    now = datetime.now(timezone.utc)
+    norm_phone = _normalize_phone(body.user_phone) if body.user_phone else None
+    row = await database.fetch_one(DeviceTokenTable.__table__.select().where(DeviceTokenTable.token == str(body.token).strip()))
+    if row is None:
+        await database.execute(DeviceTokenTable.__table__.insert().values(token=str(body.token).strip(), role=str(body.role).strip(), platform=str(body.platform or "android").strip(), user_phone=norm_phone, created_at=now, updated_at=now))
+    else:
+        await database.execute(DeviceTokenTable.__table__.update().where(DeviceTokenTable.id == int(row["id"])).values(role=str(body.role).strip(), platform=str(body.platform or "android").strip(), user_phone=norm_phone if norm_phone else row["user_phone"], updated_at=now))
+    return unified_response("ok", "TOKEN_REGISTERED", "registered", {"role": str(body.role).strip()})
 
-    await database.connect()  # اتصال=async به دیتابیس
+@app.post("/push/unregister")
+async def unregister_push_token(body: PushUnregister):
+    await database.execute(DeviceTokenTable.__table__.delete().where(DeviceTokenTable.token == str(body.token).strip()))
+    return unified_response("ok", "TOKEN_UNREGISTERED", "unregistered", {})
 
-@app.on_event("shutdown")  # رویداد=shutdown
-async def shutdown() -> None:  # تابع=shutdown
-    await database.disconnect()  # قطع اتصال=async
+@app.get("/users/exists")
+async def user_exists(phone: str):
+    norm = _normalize_phone(phone)
+    if not norm: return unified_response("ok", "USER_NOT_FOUND", "check", {"exists": False})
+    count = await database.fetch_val(select(func.count()).select_from(UserTable).where(UserTable.phone == norm))
+    exists = bool(count and int(count) > 0)
+    return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "check", {"exists": exists})
 
-# -------------------- Health --------------------  # بخش=سلامت سرور
+@app.post("/register_user")
+async def register_user(user: UserRegisterRequest):
+    norm = _normalize_phone(user.phone)
+    if not norm: raise HTTPException(status_code=400, detail="phone required")
+    count = await database.fetch_val(select(func.count()).select_from(UserTable).where(UserTable.phone == norm))
+    if count and int(count) > 0: raise HTTPException(status_code=400, detail="User already exists")
+    password_hash = bcrypt_hash_password(user.password)
+    await database.execute(UserTable.__table__.insert().values(phone=norm, password_hash=password_hash, address=str(user.address or "").strip(), name="", car_list=[]))
+    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": norm})
 
-@app.get("/")  # مسیر=ریشه
-def read_root():  # تابع=سلامت
-    return {"message": "Putzfee FastAPI Server is running!"}  # پاسخ=متن سلامت
+@app.post("/login")
+async def login_user(user: UserLoginRequest, request: Request):
+    now = datetime.now(timezone.utc)
+    client_ip = get_client_ip(request)
+    phone_norm = _normalize_phone(user.phone)
+    if not phone_norm: raise HTTPException(status_code=400, detail="invalid phone")
 
-# -------------------- Token verify --------------------  # بخش=اعتبارسنجی توکن
+    sel_att = LoginAttemptTable.__table__.select().where((LoginAttemptTable.phone == phone_norm) & (LoginAttemptTable.ip == client_ip))
+    att = await database.fetch_one(sel_att)
+    if not att:
+        await database.execute(LoginAttemptTable.__table__.insert().values(phone=phone_norm, ip=client_ip, attempt_count=0, window_start=now, last_attempt_at=now, created_at=now))
+        att = await database.fetch_one(sel_att)
+    else:
+        locked_until = att["locked_until"]
+        if locked_until and locked_until > now:
+            raise HTTPException(status_code=429, detail={"code": "RATE_LIMITED", "lock_remaining": int((locked_until - now).total_seconds())}, headers={"Retry-After": str(int((locked_until - now).total_seconds()))})
+        window_age = (now - (att["window_start"] or now)).total_seconds()
+        if window_age > LOGIN_WINDOW_SECONDS or (locked_until and locked_until <= now):
+            await database.execute(LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(attempt_count=0, window_start=now, locked_until=None, last_attempt_at=now))
+            att = await database.fetch_one(sel_att)
 
-@app.get("/verify_token")  # مسیر=بررسی توکن
-def verify_token(request: Request):  # تابع=verify_token
-    token = extract_bearer_token(request)  # token=توکن Bearer
-    if not token:  # شرط=نبود توکن
-        return {"status": "ok", "valid": False}  # پاسخ=نامعتبر
-    payload = decode_access_token(token)  # payload=دیکود
-    return {"status": "ok", "valid": bool(payload and payload.get("sub"))}  # پاسخ=معتبر یا نامعتبر
+    db_user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == phone_norm))
+    if not db_user: raise HTTPException(status_code=404, detail={"code": "USER_NOT_FOUND"})
 
-# -------------------- Auth: refresh --------------------  # بخش=رفرش توکن دسترسی
+    if not verify_password_secure(user.password, db_user["password_hash"]):
+        cur = int(att["attempt_count"] or 0) + 1
+        rem = max(0, LOGIN_MAX_ATTEMPTS - cur)
+        if cur >= LOGIN_MAX_ATTEMPTS:
+            lock_time = now + timedelta(seconds=LOGIN_LOCK_SECONDS)
+            await database.execute(LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(attempt_count=cur, locked_until=lock_time, last_attempt_at=now))
+            raise HTTPException(status_code=429, detail={"code": "RATE_LIMITED", "lock_remaining": LOGIN_LOCK_SECONDS}, headers={"Retry-After": str(LOGIN_LOCK_SECONDS)})
+        await database.execute(LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(attempt_count=cur, last_attempt_at=now))
+        raise HTTPException(status_code=401, detail={"code": "WRONG_PASSWORD", "remaining_attempts": int(rem)}, headers={"X-Remaining-Attempts": str(int(rem))})
 
-@app.post("/auth/refresh")  # مسیر=رفرش access
-async def refresh_access(body: RefreshAccessRequest):  # تابع=رفرش
-    raw = str(body.refresh_token or "").strip()  # raw=رفرش خام
-    if not raw:  # شرط=خالی
-        raise HTTPException(status_code=400, detail="refresh_token required")  # خطا=۴۰۰
-
-    token_hash = hash_refresh_token(raw)  # token_hash=هش رفرش
-    sel = RefreshTokenTable.__table__.select().where(RefreshTokenTable.token_hash == token_hash)  # sel=کوئری رفرش
-    row = await database.fetch_one(sel)  # row=گرفتن ردیف
-
-    if not row:  # شرط=نبود
-        raise HTTPException(status_code=401, detail="invalid refresh token")  # خطا=۴۰۱
-    if bool(row["revoked"]):  # شرط=ابطال شده
-        raise HTTPException(status_code=401, detail="refresh token revoked")  # خطا=۴۰۱
-
-    now = datetime.now(timezone.utc)  # now=اکنون UTC
-    exp = row["expires_at"]  # exp=انقضا
-    if exp is None or exp <= now:  # شرط=منقضی
-        raise HTTPException(status_code=401, detail="refresh token expired")  # خطا=۴۰۱
-
-    user_id = int(row["user_id"])  # user_id=شناسه کاربر
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.id == user_id))  # user=کاربر
-    if not user:  # شرط=نبود کاربر
-        raise HTTPException(status_code=401, detail="user not found")  # خطا=۴۰۱
-
-    access = create_access_token(_normalize_phone(user["phone"]))  # access=توکن جدید
-    return unified_response("ok", "ACCESS_REFRESHED", "access token refreshed", {"access_token": access})  # پاسخ=توکن جدید
-
-# -------------------- Logout --------------------  # بخش=خروج
-
-@app.post("/logout")  # مسیر=خروج
-async def logout_user(body: LogoutRequest):  # تابع=logout
-    refresh_raw = str(body.refresh_token or "").strip()  # refresh_raw=رفرش ورودی
-    if not refresh_raw:  # شرط=خالی
-        raise HTTPException(status_code=400, detail="refresh_token required")  # خطا=۴۰۰
-
-    token_hash = hash_refresh_token(refresh_raw)  # token_hash=هش رفرش
-
-    rt_row = await database.fetch_one(  # rt_row=خواندن ردیف رفرش
-        RefreshTokenTable.__table__.select().where(RefreshTokenTable.token_hash == token_hash)  # select=بر اساس هش
-    )  # پایان fetch_one
-
-    await database.execute(  # اجرا=revoked کردن رفرش
-        RefreshTokenTable.__table__.update().where(RefreshTokenTable.token_hash == token_hash).values(revoked=True)  # update=revoked
-    )  # پایان execute
-
-    device_token = str(body.device_token or "").strip()  # device_token=توکن دستگاه ورودی
-    if device_token:  # شرط=توکن دستگاه داده شده
-        await database.execute(  # اجرا=حذف آن توکن
-            DeviceTokenTable.__table__.delete().where(DeviceTokenTable.token == device_token)  # delete=توکن
-        )  # پایان execute
-    else:  # حالت=توکن دستگاه داده نشده
-        if rt_row:  # شرط=ردیف رفرش داریم
-            user = await database.fetch_one(UserTable.__table__.select().where(UserTable.id == int(rt_row["user_id"])))  # user=کاربر
-            if user:  # شرط=کاربر موجود
-                phone = _normalize_phone(user["phone"])  # phone=شماره نرمال
-                await database.execute(  # اجرا=حذف همه توکن‌های کاربر
-                    DeviceTokenTable.__table__.delete().where(DeviceTokenTable.user_phone == phone)  # delete=بر اساس شماره
-                )  # پایان execute
-
-    return unified_response("ok", "LOGOUT", "refresh token revoked and device tokens removed", {})  # پاسخ=خروج موفق
-
-# -------------------- Push endpoints --------------------  # بخش=ثبت/حذف توکن پوش
-
-@app.post("/push/register")  # مسیر=ثبت توکن پوش
-async def register_push_token(body: PushRegister):  # تابع=register push
-    now = datetime.now(timezone.utc)  # now=اکنون UTC
-    norm_phone = _normalize_phone(body.user_phone) if body.user_phone else None  # norm_phone=شماره نرمال یا None
-
-    sel = DeviceTokenTable.__table__.select().where(DeviceTokenTable.token == str(body.token).strip())  # sel=کوئری توکن
-    row = await database.fetch_one(sel)  # row=ردیف موجود
-
-    if row is None:  # شرط=توکن جدید
-        await database.execute(  # اجرا=insert توکن
-            DeviceTokenTable.__table__.insert().values(  # insert=مقادیر
-                token=str(body.token).strip(),  # token=توکن
-                role=str(body.role).strip(),  # role=نقش
-                platform=str(body.platform or "android").strip(),  # platform=پلتفرم
-                user_phone=norm_phone,  # user_phone=شماره
-                created_at=now,  # created_at=اکنون
-                updated_at=now  # updated_at=اکنون
-            )  # پایان values
-        )  # پایان execute
-    else:  # حالت=توکن قبلاً هست
-        await database.execute(  # اجرا=update توکن
-            DeviceTokenTable.__table__.update().where(DeviceTokenTable.id == int(row["id"])).values(  # update=بر اساس id
-                role=str(body.role).strip(),  # role=نقش جدید
-                platform=str(body.platform or "android").strip(),  # platform=پلتفرم
-                user_phone=norm_phone if norm_phone else row["user_phone"],  # user_phone=شماره جدید یا قبلی
-                updated_at=now  # updated_at=اکنون
-            )  # پایان values
-        )  # پایان execute
-
-    return unified_response("ok", "TOKEN_REGISTERED", "registered", {"role": str(body.role).strip()})  # پاسخ=ثبت شد
-
-@app.post("/push/unregister")  # مسیر=حذف توکن پوش
-async def unregister_push_token(body: PushUnregister):  # تابع=unregister
-    await database.execute(  # اجرا=delete
-        DeviceTokenTable.__table__.delete().where(DeviceTokenTable.token == str(body.token).strip())  # delete=بر اساس token
-    )  # پایان execute
-    return unified_response("ok", "TOKEN_UNREGISTERED", "unregistered", {})  # پاسخ=حذف شد
-# -------------------- Users: exists/register/login --------------------  # بخش=کاربر (وجود/ثبت‌نام/ورود)
-
-@app.get("/users/exists")  # مسیر=بررسی وجود کاربر
-async def user_exists(phone: str):  # تابع=بررسی وجود
-    norm = _normalize_phone(phone)  # norm=شماره نرمال
-    if not norm:  # شرط=شماره نامعتبر
-        return unified_response("ok", "USER_NOT_FOUND", "user exists check", {"exists": False})  # پاسخ=وجود ندارد
-    q = select(func.count()).select_from(UserTable).where(UserTable.phone == norm)  # q=کوئری count
-    count = await database.fetch_val(q)  # count=نتیجه count
-    exists = bool(count and int(count) > 0)  # exists=وجود یا عدم وجود
-    return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "user exists check", {"exists": exists})  # پاسخ=نتیجه
-
-@app.post("/register_user")  # مسیر=ثبت‌نام کاربر
-async def register_user(user: UserRegisterRequest):  # تابع=ثبت‌نام
-    raw = str(user.phone or "").strip()  # raw=شماره خام
-    norm = _normalize_phone(raw)  # norm=شماره نرمال
-    if not norm:  # شرط=نامعتبر
-        raise HTTPException(status_code=400, detail="phone required")  # خطا=۴۰۰
-
-    q = select(func.count()).select_from(UserTable).where(UserTable.phone == norm)  # q=کوئری جلوگیری از تکرار
-    count = await database.fetch_val(q)  # count=تعداد
-    if count and int(count) > 0:  # شرط=وجود کاربر
-        raise HTTPException(status_code=400, detail="User already exists")  # خطا=۴۰۰
-
-    password_hash = bcrypt_hash_password(user.password)  # password_hash=هش رمز
-    await database.execute(  # اجرا=درج کاربر
-        UserTable.__table__.insert().values(  # insert=values
-            phone=norm,  # phone=شماره نرمال
-            password_hash=password_hash,  # password_hash=هش
-            address=str(user.address or "").strip(),  # address=آدرس
-            name="",  # name=نام
-            car_list=[]  # car_list=لیست خالی
-        )  # پایان values
-    )  # پایان execute
-
-    return unified_response("ok", "USER_REGISTERED", "registered", {"phone": norm})  # پاسخ=ثبت موفق
-
-@app.post("/login")  # مسیر=ورود کاربر (هم کاربر هم مدیر با شماره مدیر)
-async def login_user(user: UserLoginRequest, request: Request):  # تابع=ورود
-    now = datetime.now(timezone.utc)  # now=اکنون UTC
-    client_ip = get_client_ip(request)  # client_ip=آی‌پی کلاینت
-
-    raw_phone = str(user.phone or "").strip()  # raw_phone=شماره خام
-    phone_norm = _normalize_phone(raw_phone)  # phone_norm=شماره نرمال
-    if not phone_norm:  # شرط=نامعتبر
-        raise HTTPException(status_code=400, detail="invalid phone")  # خطا=۴۰۰
-
-    sel_att = LoginAttemptTable.__table__.select().where(  # sel_att=کوئری تلاش ورود
-        (LoginAttemptTable.phone == phone_norm) &  # شرط=شماره
-        (LoginAttemptTable.ip == client_ip)  # شرط=ip
-    )  # پایان where
-    att = await database.fetch_one(sel_att)  # att=ردیف تلاش
-
-    if not att:  # شرط=نبود ردیف
-        await database.execute(  # اجرا=ایجاد ردیف
-            LoginAttemptTable.__table__.insert().values(  # insert=values
-                phone=phone_norm,  # phone=شماره
-                ip=client_ip,  # ip=آی‌پی
-                attempt_count=0,  # attempt_count=۰
-                window_start=now,  # window_start=اکنون
-                locked_until=None,  # locked_until=بدون قفل
-                last_attempt_at=now,  # last_attempt_at=اکنون
-                created_at=now  # created_at=اکنون
-            )  # پایان values
-        )  # پایان execute
-        att = await database.fetch_one(sel_att)  # att=خواندن مجدد
-    else:  # حالت=ردیف موجود
-        locked_until = att["locked_until"]  # locked_until=زمان قفل
-        if locked_until is not None and locked_until > now:  # شرط=قفل فعال
-            lock_remaining = int((locked_until - now).total_seconds())  # lock_remaining=ثانیه باقیمانده
-            raise HTTPException(  # خطا=۴۲۹
-                status_code=429,  # کد=429
-                detail={"code": "RATE_LIMITED", "lock_remaining": lock_remaining},  # detail=قفل
-                headers={"Retry-After": str(lock_remaining), "X-Remaining-Attempts": "0"}  # headers=هدرها
-            )  # پایان raise
-
-        window_start = att["window_start"] or now  # window_start=شروع پنجره
-        window_age = (now - window_start).total_seconds()  # window_age=سن پنجره
-        if window_age > LOGIN_WINDOW_SECONDS or (locked_until is not None and locked_until <= now):  # شرط=ریست پنجره
-            await database.execute(  # اجرا=ریست شمارنده
-                LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
-                    attempt_count=0,  # attempt_count=۰
-                    window_start=now,  # window_start=اکنون
-                    locked_until=None,  # locked_until=پاک
-                    last_attempt_at=now  # last_attempt_at=اکنون
-                )  # پایان values
-            )  # پایان execute
-            att = await database.fetch_one(sel_att)  # att=خواندن مجدد
-
-    db_user = await database.fetch_one(  # db_user=گرفتن کاربر
-        UserTable.__table__.select().where(UserTable.phone == phone_norm)  # select=بر اساس شماره نرمال
-    )  # پایان fetch_one
-
-    if not db_user:  # شرط=کاربر نبود
-        raise HTTPException(status_code=404, detail={"code": "USER_NOT_FOUND"})  # خطا=۴۰۴
-
-    if not verify_password_secure(user.password, db_user["password_hash"]):  # شرط=رمز اشتباه
-        cur_count = int(att["attempt_count"] or 0) + 1  # cur_count=تلاش جدید
-        remaining = max(0, LOGIN_MAX_ATTEMPTS - cur_count)  # remaining=باقی‌مانده
-
-        if cur_count >= LOGIN_MAX_ATTEMPTS:  # شرط=قفل
-            locked_until_new = now + timedelta(seconds=LOGIN_LOCK_SECONDS)  # locked_until_new=زمان قفل
-            lock_remaining = int((locked_until_new - now).total_seconds())  # lock_remaining=ثانیه قفل
-            await database.execute(  # اجرا=ثبت قفل
-                LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
-                    attempt_count=cur_count,  # attempt_count=تلاش
-                    locked_until=locked_until_new,  # locked_until=قفل
-                    last_attempt_at=now  # last_attempt_at=اکنون
-                )  # پایان values
-            )  # پایان execute
-            raise HTTPException(  # خطا=۴۲۹
-                status_code=429,  # کد=429
-                detail={"code": "RATE_LIMITED", "lock_remaining": lock_remaining},  # detail=قفل
-                headers={"Retry-After": str(lock_remaining), "X-Remaining-Attempts": "0"}  # headers=هدرها
-            )  # پایان raise
-
-        await database.execute(  # اجرا=ثبت تلاش ناموفق
-            LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
-                attempt_count=cur_count,  # attempt_count=تلاش جدید
-                last_attempt_at=now  # last_attempt_at=اکنون
-            )  # پایان values
-        )  # پایان execute
-
-        raise HTTPException(  # خطا=۴۰۱
-            status_code=401,  # کد=401
-            detail={"code": "WRONG_PASSWORD", "remaining_attempts": int(remaining)},  # detail=رمز اشتباه
-            headers={"X-Remaining-Attempts": str(int(remaining))}  # headers=باقی‌مانده
-        )  # پایان raise
-
-    await database.execute(  # اجرا=ریست تلاش‌ها در ورود موفق
-        LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
-            attempt_count=0,  # attempt_count=۰
-            window_start=now,  # window_start=اکنون
-            locked_until=None,  # locked_until=پاک
-            last_attempt_at=now  # last_attempt_at=اکنون
-        )  # پایان values
-    )  # پایان execute
-
-    access_token = create_access_token(phone_norm)  # access_token=ساخت access
-    refresh_token = create_refresh_token()  # refresh_token=ساخت refresh
-    refresh_hash = hash_refresh_token(refresh_token)  # refresh_hash=هش refresh
-    refresh_exp = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)  # refresh_exp=انقضا
-
-    await database.execute(  # اجرا=درج refresh token
-        RefreshTokenTable.__table__.insert().values(  # insert=values
-            user_id=int(db_user["id"]),  # user_id=شناسه کاربر
-            token_hash=refresh_hash,  # token_hash=هش
-            expires_at=refresh_exp,  # expires_at=انقضا
-            revoked=False  # revoked=ابطال نشده
-        )  # پایان values
-    )  # پایان execute
-
-    return {  # پاسخ=فرمت مورد انتظار اپ‌ها
-        "status": "ok",  # status=ok
-        "access_token": access_token,  # access_token=توکن دسترسی
-        "refresh_token": refresh_token,  # refresh_token=توکن رفرش
-        "user": {  # user=اطلاعات کاربر
-            "phone": phone_norm,  # phone=شماره
-            "address": str(db_user["address"] or ""),  # address=آدرس
-            "name": str(db_user["name"] or "")  # name=نام
-        }  # پایان user
-    }  # پایان پاسخ
-
-# -------------------- Admin Login --------------------  # بخش=ورود مدیر
+    await database.execute(LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(attempt_count=0, window_start=now, locked_until=None, last_attempt_at=now))
+    
+    access = create_access_token(phone_norm)
+    refresh = create_refresh_token()
+    await database.execute(RefreshTokenTable.__table__.insert().values(user_id=int(db_user["id"]), token_hash=hash_refresh_token(refresh), expires_at=now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), revoked=False))
+    return {"status": "ok", "access_token": access, "refresh_token": refresh, "user": {"phone": phone_norm, "address": str(db_user["address"] or ""), "name": str(db_user["name"] or "")}}
 
 class AdminLoginRequest(BaseModel):  # کلاس=مدل ورودی ورود مدیر
-    phone: str  # فیلد=شماره موبایل
-    password: str  # فیلد=رمز عبور
+    phone: str
+    password: str
 
 @app.post("/admin/login")  # مسیر=ورود مدیر
-async def admin_login(body: AdminLoginRequest, request: Request):  # تابع=ورود مدیر
-    now = datetime.now(timezone.utc)  # now=زمان فعلی UTC
-    client_ip = get_client_ip(request)  # client_ip=آی‌پی کلاینت
+async def admin_login(body: AdminLoginRequest, request: Request):
+    now = datetime.now(timezone.utc)
+    client_ip = get_client_ip(request)
+    phone_norm = _normalize_phone(body.phone)
+    if not phone_norm: raise HTTPException(status_code=400, detail="invalid phone")
 
-    raw_phone = str(body.phone or "").strip()  # raw_phone=شماره خام ورودی
-    phone_norm = _normalize_phone(raw_phone)  # phone_norm=شماره نرمال‌شده
-    if not phone_norm:  # شرط=شماره نامعتبر
-        raise HTTPException(status_code=400, detail="invalid phone")  # خطا=شماره نامعتبر
+    if phone_norm not in ADMIN_PHONES_SET:
+        raise HTTPException(status_code=401, detail={"code": "WRONG_PASSWORD", "remaining_attempts": 0})
 
-    # ——— بررسی اینکه شماره در لیست مدیران هست یا نه ———  # توضیح=امنیت
-    if phone_norm not in ADMIN_PHONES_SET:  # شرط=شماره مدیر نیست
-        raise HTTPException(  # خطا=پیام عمومی برای امنیت
-            status_code=401,  # کد=۴۰۱
-            detail={"code": "WRONG_PASSWORD", "remaining_attempts": 0}  # detail=پیام امن
-        )  # پایان خطا
+    sel_att = LoginAttemptTable.__table__.select().where((LoginAttemptTable.phone == phone_norm) & (LoginAttemptTable.ip == client_ip))
+    att = await database.fetch_one(sel_att)
+    if not att:
+        await database.execute(LoginAttemptTable.__table__.insert().values(phone=phone_norm, ip=client_ip, attempt_count=0, window_start=now, last_attempt_at=now, created_at=now))
+        att = await database.fetch_one(sel_att)
+    else:
+        locked_until = att["locked_until"]
+        if locked_until and locked_until > now:
+            raise HTTPException(status_code=429, detail={"code": "RATE_LIMITED", "lock_remaining": int((locked_until - now).total_seconds())})
+        if (now - (att["window_start"] or now)).total_seconds() > LOGIN_WINDOW_SECONDS or (locked_until and locked_until <= now):
+            await database.execute(LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(attempt_count=0, window_start=now, locked_until=None))
+            att = await database.fetch_one(sel_att)
 
-    # ——— Rate Limiting (مشابه /login) ———  # توضیح=جلوگیری از حمله brute-force
-    sel_att = LoginAttemptTable.__table__.select().where(  # sel_att=کوئری تلاش ورود
-        (LoginAttemptTable.phone == phone_norm) &  # شرط=شماره
-        (LoginAttemptTable.ip == client_ip)  # شرط=ip
-    )  # پایان where
-    att = await database.fetch_one(sel_att)  # att=ردیف تلاش
+    db_user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == phone_norm))
+    password_raw = str(body.password or "").strip()
+    if not password_raw: raise HTTPException(status_code=400, detail="password required")
 
-    if not att:  # شرط=نبود ردیف تلاش
-        await database.execute(  # اجرا=ایجاد ردیف جدید
-            LoginAttemptTable.__table__.insert().values(  # insert=مقادیر
-                phone=phone_norm,  # phone=شماره
-                ip=client_ip,  # ip=آی‌پی
-                attempt_count=0,  # attempt_count=صفر
-                window_start=now,  # window_start=اکنون
-                locked_until=None,  # locked_until=بدون قفل
-                last_attempt_at=now,  # last_attempt_at=اکنون
-                created_at=now  # created_at=اکنون
-            )  # پایان values
-        )  # پایان execute
-        att = await database.fetch_one(sel_att)  # att=خواندن مجدد
-    else:  # حالت=ردیف موجود
-        locked_until = att["locked_until"]  # locked_until=زمان قفل
-        if locked_until is not None and locked_until > now:  # شرط=قفل فعال
-            lock_remaining = int((locked_until - now).total_seconds())  # lock_remaining=ثانیه باقیمانده
-            raise HTTPException(  # خطا=۴۲۹
-                status_code=429,  # کد=429
-                detail={"code": "RATE_LIMITED", "lock_remaining": lock_remaining},  # detail=قفل
-                headers={"Retry-After": str(lock_remaining), "X-Remaining-Attempts": "0"}  # headers=هدرها
-            )  # پایان raise
+    if not db_user:
+        password_hash = bcrypt_hash_password(password_raw)
+        await database.execute(UserTable.__table__.insert().values(phone=phone_norm, password_hash=password_hash, address="", name="Manager", car_list=[]))
+        db_user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == phone_norm))
+    else:
+        if not verify_password_secure(password_raw, db_user["password_hash"]):
+            cur = int(att["attempt_count"] or 0) + 1
+            if cur >= LOGIN_MAX_ATTEMPTS:
+                lock = now + timedelta(seconds=LOGIN_LOCK_SECONDS)
+                await database.execute(LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(attempt_count=cur, locked_until=lock))
+                raise HTTPException(status_code=429, detail={"code": "RATE_LIMITED", "lock_remaining": LOGIN_LOCK_SECONDS})
+            await database.execute(LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(attempt_count=cur))
+            raise HTTPException(status_code=401, detail={"code": "WRONG_PASSWORD", "remaining_attempts": max(0, LOGIN_MAX_ATTEMPTS - cur)})
 
-        window_start = att["window_start"] or now  # window_start=شروع پنجره
-        window_age = (now - window_start).total_seconds()  # window_age=سن پنجره
-        if window_age > LOGIN_WINDOW_SECONDS or (locked_until is not None and locked_until <= now):  # شرط=ریست پنجره
-            await database.execute(  # اجرا=ریست شمارنده
-                LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
-                    attempt_count=0,  # attempt_count=صفر
-                    window_start=now,  # window_start=اکنون
-                    locked_until=None,  # locked_until=پاک
-                    last_attempt_at=now  # last_attempt_at=اکنون
-                )  # پایان values
-            )  # پایان execute
-            att = await database.fetch_one(sel_att)  # att=خواندن مجدد
-
-    # ——— جستجوی مدیر در دیتابیس ———  # توضیح=بررسی ثبت‌نام قبلی
-    db_user = await database.fetch_one(  # db_user=کاربر از دیتابیس
-        UserTable.__table__.select().where(UserTable.phone == phone_norm)  # select=بر اساس شماره
-    )  # پایان fetch_one
-
-    password_raw = str(body.password or "").strip()  # password_raw=رمز ورودی
-    if not password_raw:  # شرط=رمز خالی
-        raise HTTPException(status_code=400, detail="password required")  # خطا=رمز لازم
-
-    if not db_user:  # شرط=مدیر هنوز ثبت‌نام نکرده (اولین ورود)
-        # ——— ثبت‌نام خودکار مدیر ———  # توضیح=ذخیره رمز برای دفعات بعد
-        password_hash = bcrypt_hash_password(password_raw)  # password_hash=هش رمز
-        await database.execute(  # اجرا=درج کاربر جدید
-            UserTable.__table__.insert().values(  # insert=مقادیر
-                phone=phone_norm,  # phone=شماره نرمال
-                password_hash=password_hash,  # password_hash=هش رمز
-                address="",  # address=خالی
-                name="Manager",  # name=نام پیش‌فرض
-                car_list=[]  # car_list=لیست خالی
-            )  # پایان values
-        )  # پایان execute
-        db_user = await database.fetch_one(  # db_user=خواندن کاربر جدید
-            UserTable.__table__.select().where(UserTable.phone == phone_norm)  # select=شماره
-        )  # پایان fetch_one
-    else:  # حالت=مدیر قبلاً ثبت‌نام کرده
-        # ——— بررسی رمز ———  # توضیح=چک رمز ذخیره‌شده
-        if not verify_password_secure(password_raw, db_user["password_hash"]):  # شرط=رمز اشتباه
-            cur_count = int(att["attempt_count"] or 0) + 1  # cur_count=تلاش جدید
-            remaining = max(0, LOGIN_MAX_ATTEMPTS - cur_count)  # remaining=باقی‌مانده
-
-            if cur_count >= LOGIN_MAX_ATTEMPTS:  # شرط=قفل
-                locked_until_new = now + timedelta(seconds=LOGIN_LOCK_SECONDS)  # locked_until_new=زمان قفل
-                lock_remaining = int((locked_until_new - now).total_seconds())  # lock_remaining=ثانیه
-                await database.execute(  # اجرا=ثبت قفل
-                    LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
-                        attempt_count=cur_count,  # attempt_count=تلاش
-                        locked_until=locked_until_new,  # locked_until=قفل
-                        last_attempt_at=now  # last_attempt_at=اکنون
-                    )  # پایان values
-                )  # پایان execute
-                raise HTTPException(  # خطا=۴۲۹
-                    status_code=429,  # کد=429
-                    detail={"code": "RATE_LIMITED", "lock_remaining": lock_remaining},  # detail=قفل
-                    headers={"Retry-After": str(lock_remaining), "X-Remaining-Attempts": "0"}  # headers=هدرها
-                )  # پایان raise
-
-            await database.execute(  # اجرا=ثبت تلاش ناموفق
-                LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
-                    attempt_count=cur_count,  # attempt_count=تلاش جدید
-                    last_attempt_at=now  # last_attempt_at=اکنون
-                )  # پایان values
-            )  # پایان execute
-
-            raise HTTPException(  # خطا=۴۰۱
-                status_code=401,  # کد=401
-                detail={"code": "WRONG_PASSWORD", "remaining_attempts": int(remaining)},  # detail=رمز اشتباه
-                headers={"X-Remaining-Attempts": str(int(remaining))}  # headers=باقی‌مانده
-            )  # پایان raise
-
-    # ——— ریست تلاش‌ها پس از ورود موفق ———  # توضیح=پاکسازی شمارنده
-    await database.execute(  # اجرا=ریست
-        LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
-            attempt_count=0,  # attempt_count=صفر
-            window_start=now,  # window_start=اکنون
-            locked_until=None,  # locked_until=پاک
-            last_attempt_at=now  # last_attempt_at=اکنون
-        )  # پایان values
-    )  # پایان execute
-
-    # ——— صدور توکن‌ها ———  # توضیح=ساخت access و refresh
-    access_token = create_access_token(phone_norm)  # access_token=توکن دسترسی
-    refresh_token = create_refresh_token()  # refresh_token=توکن رفرش
-    refresh_hash = hash_refresh_token(refresh_token)  # refresh_hash=هش رفرش
-    refresh_exp = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)  # refresh_exp=انقضای رفرش
-
-    await database.execute(  # اجرا=درج رفرش توکن
-        RefreshTokenTable.__table__.insert().values(  # insert=مقادیر
-            user_id=int(db_user["id"]),  # user_id=شناسه کاربر
-            token_hash=refresh_hash,  # token_hash=هش
-            expires_at=refresh_exp,  # expires_at=انقضا
-            revoked=False  # revoked=ابطال نشده
-        )  # پایان values
-    )  # پایان execute
-
-    return {  # پاسخ=فرمت مورد انتظار اپ مدیر
-        "status": "ok",  # status=ok
-        "access_token": access_token,  # access_token=توکن دسترسی
-        "refresh_token": refresh_token,  # refresh_token=توکن رفرش
-        "user": {  # user=اطلاعات کاربر
-            "phone": phone_norm,  # phone=شماره
-            "address": str(db_user["address"] or ""),  # address=آدرس
-            "name": str(db_user["name"] or "")  # name=نام
-        }  # پایان user
-    }  # پایان پاسخ
+    await database.execute(LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(attempt_count=0, window_start=now, locked_until=None))
     
-# -------------------- Admin: active requests --------------------  # بخش=ادمین لیست سفارش‌های فعال
-
-@app.get("/admin/requests/active")  # مسیر=فعال‌ها بدون اسلش
-@app.get("/admin/requests/active/")  # مسیر=فعال‌ها با اسلش
-async def admin_active_requests(request: Request):  # تابع=لیست فعال
-    require_admin(request)  # احراز=ادمین
-    active = ["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]  # active=وضعیت‌ها
-    sel = RequestTable.__table__.select().where(RequestTable.status.in_(active)).order_by(RequestTable.id.desc())  # sel=کوئری
-    rows = await database.fetch_all(sel)  # rows=نتیجه
-    return unified_response("ok", "ACTIVE_REQUESTS", "active requests", {"items": [dict(r) for r in rows]})  # پاسخ=لیست
-# -------------------- Cars --------------------  # بخش=ماشین‌ها
-
-@app.get("/user_cars/{user_phone}")  # مسیر=گرفتن لیست ماشین‌های کاربر
-async def get_user_cars(user_phone: str, request: Request):  # تابع=گرفتن ماشین‌ها
-    norm = _normalize_phone(user_phone)  # norm=شماره نرمال از مسیر
-    if not norm:  # شرط=شماره نامعتبر
-        raise HTTPException(status_code=400, detail="invalid user_phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))  # user=کاربر از دیتابیس
-    if not user:  # شرط=کاربر نبود
-        raise HTTPException(status_code=404, detail="User not found")  # خطا=۴۰۴
-
-    cars = user["car_list"] or []  # cars=لیست خودروها یا خالی
-    return unified_response("ok", "USER_CARS", "cars list", {"items": cars})  # پاسخ=لیست ماشین‌ها
-
-@app.post("/user_cars")  # مسیر=آپدیت لیست ماشین‌ها (بدون اسلش)
-@app.post("/user_cars/")  # مسیر=آپدیت لیست ماشین‌ها (با اسلش)
-async def update_user_cars(body: CarListUpdateRequest, request: Request):  # تابع=آپدیت ماشین‌ها
-    norm = _normalize_phone(body.user_phone)  # norm=شماره نرمال از بدنه
-    if not norm:  # شرط=شماره نامعتبر
-        raise HTTPException(status_code=400, detail="invalid user_phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))  # user=کاربر از دیتابیس
-    if not user:  # شرط=نبود کاربر
-        raise HTTPException(status_code=404, detail="User not found")  # خطا=۴۰۴
-
-    cars_payload = [c.dict() for c in (body.car_list or [])]  # cars_payload=تبدیل لیست به dict
-    await database.execute(  # اجرا=update car_list
-        UserTable.__table__.update().where(UserTable.phone == norm).values(car_list=cars_payload)  # update=car_list
-    )  # پایان execute
-
-    return unified_response("ok", "USER_CARS_UPDATED", "cars updated", {"count": len(cars_payload)})  # پاسخ=تعداد
-
-# -------------------- Profile --------------------  # بخش=پروفایل
-
-@app.post("/user/profile")  # مسیر=ذخیره پروفایل
-async def update_profile(body: UserProfileUpdate, request: Request):  # تابع=آپدیت پروفایل
-    norm = _normalize_phone(body.phone)  # norm=شماره نرمال
-    if not norm:  # شرط=شماره نامعتبر
-        raise HTTPException(status_code=400, detail="invalid phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))  # user=کاربر
-    if not user:  # شرط=نبود
-        raise HTTPException(status_code=404, detail="User not found")  # خطا=۴۰۴
-
-    await database.execute(  # اجرا=آپدیت نام و آدرس
-        UserTable.__table__.update().where(UserTable.phone == norm).values(  # update=users
-            name=str(body.name or "").strip(),  # name=نام
-            address=str(body.address or "").strip()  # address=آدرس
-        )  # پایان values
-    )  # پایان execute
-
-    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": norm})  # پاسخ=موفق
-
-@app.get("/user/profile/{phone}")  # مسیر=دریافت پروفایل
-async def get_user_profile(phone: str, request: Request):  # تابع=گرفتن پروفایل
-    norm = _normalize_phone(phone)  # norm=شماره نرمال
-    if not norm:  # شرط=شماره نامعتبر
-        raise HTTPException(status_code=400, detail="invalid phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))  # user=کاربر
-    if not user:  # شرط=نبود
-        raise HTTPException(status_code=404, detail="User not found")  # خطا=۴۰۴
-
-    return unified_response(  # پاسخ=پروفایل
-        "ok",  # status=ok
-        "PROFILE_FETCHED",  # code=کد
-        "profile data",  # message=پیام
-        {"phone": norm, "name": str(user["name"] or ""), "address": str(user["address"] or "")}  # data=پروفایل
-    )  # پایان پاسخ
-
-# -------------------- Orders --------------------  # بخش=سفارش‌ها
-
-@app.post("/order")  # مسیر=ثبت سفارش
-async def create_order(order: OrderRequest, request: Request):  # تابع=ایجاد سفارش
-    norm = _normalize_phone(order.user_phone)  # norm=شماره نرمال
-    if not norm:  # شرط=شماره نامعتبر
-        raise HTTPException(status_code=400, detail="invalid user_phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))  # user=کاربر
-    if not user:  # شرط=کاربر نبود
-        raise HTTPException(status_code=404, detail="User not found")  # خطا=۴۰۴
-
-    ins = RequestTable.__table__.insert().values(  # ins=insert سفارش
-        user_phone=norm,  # user_phone=شماره کاربر
-        latitude=float(order.location.latitude),  # latitude=عرض
-        longitude=float(order.location.longitude),  # longitude=طول
-        car_list=[car.dict() for car in (order.car_list or [])],  # car_list=لیست آیتم‌ها
-        address=str(order.address or "").strip(),  # address=آدرس
-        home_number=str(order.home_number or "").strip(),  # home_number=پلاک
-        service_type=str(order.service_type or "").strip().lower(),  # service_type=کد سرویس
-        price=int(order.price),  # price=قیمت
-        request_datetime=str(order.request_datetime or "").strip(),  # request_datetime=زمان ثبت
-        status="NEW",  # status=جدید
-        payment_type=str(order.payment_type or "").strip().lower(),  # payment_type=پرداخت
-        service_place=str(order.service_place or "client").strip().lower(),  # service_place=محل سرویس
-        driver_phone="",  # driver_phone=خالی
-        driver_name=""  # driver_name=خالی
-    ).returning(RequestTable.id)  # returning=id
-
-    row = await database.fetch_one(ins)  # row=نتیجه insert
-    new_id = int(row["id"]) if row and row["id"] else 0  # new_id=شناسه جدید
-
-    try:  # try=محافظ اعلان مدیر
-        await notify_managers(  # اعلان=به مدیران
-            title="سفارش جدید",  # title=عنوان
-            body=f"سفارش جدید ثبت شد: {str(order.service_type or '')}",  # body=متن
-            data={"order_id": str(new_id), "user_phone": norm, "service_type": str(order.service_type or ""), "status": "NEW"}  # data=اطلاعات
-        )  # پایان notify
-    except Exception as e:  # catch=خطا
-        logger.error(f"notify_managers(create_order) failed: {e}")  # لاگ=خطا
-
-    return unified_response("ok", "REQUEST_CREATED", "request created", {"id": new_id})  # پاسخ=شناسه
-
-@app.post("/cancel_order")  # مسیر=لغو سفارش کاربر
-async def cancel_order(cancel: CancelRequest, request: Request):  # تابع=لغو سفارش
-    norm = _normalize_phone(cancel.user_phone)  # norm=شماره نرمال
-    if not norm:  # شرط=نامعتبر
-        raise HTTPException(status_code=400, detail="invalid user_phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    service = str(cancel.service_type or "").strip().lower()  # service=نوع سرویس
-    if not service:  # شرط=خالی
-        raise HTTPException(status_code=400, detail="service_type required")  # خطا=۴۰۰
-
-    upd = (  # upd=کوئری آپدیت
-        RequestTable.__table__.update()  # update=requests
-        .where(  # where=شرایط لغو
-            (RequestTable.user_phone == norm) &  # شرط=شماره کاربر
-            (RequestTable.service_type == service) &  # شرط=سرویس
-            (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED"])) &  # شرط=قابل لغو
-            (RequestTable.execution_start.is_(None))  # شرط=بدون زمان اجرا
-        )  # پایان where
-        .values(status="CANCELED", scheduled_start=None, execution_start=None)  # values=لغو + پاکسازی زمان‌ها
-        .returning(RequestTable.id, RequestTable.driver_phone)  # returning=شناسه و سرویس‌دهنده
-    )  # پایان upd
-
-    rows = await database.fetch_all(upd)  # rows=نتیجه
-    if not rows:  # شرط=چیزی لغو نشد
-        raise HTTPException(status_code=409, detail={"code": "CANNOT_CANCEL", "message": "order cannot be canceled at this stage"})  # خطا=۴۰۹
-
-    ids = [int(r["id"]) for r in rows]  # ids=شناسه‌های لغو شده
-    driver_phones = list({str(r["driver_phone"] or "").strip() for r in rows if str(r["driver_phone"] or "").strip()})  # driver_phones=لیست سرویس‌دهنده‌ها
-
-    await database.execute(  # اجرا=رد اسلات‌های فعال
-        ScheduleSlotTable.__table__.update().where(  # update=schedule_slots
-            (ScheduleSlotTable.request_id.in_(ids)) &  # شرط=این سفارش‌ها
-            (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))  # شرط=فعال
-        ).values(status="REJECTED")  # values=رد
-    )  # پایان execute
-
-    await database.execute(  # اجرا=لغو appointmentهای رزرو
-        AppointmentTable.__table__.update().where(  # update=appointments
-            (AppointmentTable.request_id.in_(ids)) &  # شرط=این سفارش‌ها
-            (AppointmentTable.status == "BOOKED")  # شرط=رزرو
-        ).values(status="CANCELED")  # values=لغو
-    )  # پایان execute
-
-    try:  # try=محافظ اعلان مدیر
-        await notify_managers(  # اعلان=به مدیرها
-            title="لغو سفارش",  # title=عنوان
-            body=f"سفارش توسط کاربر لغو شد ({service})",  # body=متن
-            data={"order_ids": ",".join(str(x) for x in ids), "user_phone": norm, "service_type": service, "status": "CANCELED"}  # data=اطلاعات
-        )  # پایان notify
-        for dp in driver_phones:  # حلقه=روی سرویس‌دهنده‌ها
-            await notify_managers(  # اعلان=هدفمند
-                title="لغو سفارش",  # title=عنوان
-                body=f"سفارش شما لغو شد (id={ids[0]})",  # body=متن
-                data={"order_ids": ",".join(str(x) for x in ids), "status": "CANCELED"},  # data=اطلاعات
-                target_phone=_normalize_phone(dp)  # target_phone=شماره هدف
-            )  # پایان notify
-    except Exception as e:  # catch=خطا
-        logger.error(f"notify_managers(cancel_order) failed: {e}")  # لاگ=خطا
-
-    return unified_response("ok", "ORDER_CANCELED", "canceled", {"count": len(ids)})  # پاسخ=تعداد
-
-@app.get("/user_active_services/{user_phone}")  # مسیر=سرویس‌های فعال کاربر
-async def get_user_active_services(user_phone: str, request: Request):  # تابع=فعال‌ها
-    norm = _normalize_phone(user_phone)  # norm=شماره نرمال
-    if not norm:  # شرط=نامعتبر
-        raise HTTPException(status_code=400, detail="invalid user_phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    sel = RequestTable.__table__.select().where(  # sel=کوئری سفارش‌های فعال
-        (RequestTable.user_phone == norm) &  # شرط=شماره
-        (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]))  # شرط=فعال
-    )  # پایان where
-    rows = await database.fetch_all(sel)  # rows=نتیجه
-    return unified_response("ok", "USER_ACTIVE_SERVICES", "active services", {"items": [dict(r) for r in rows]})  # پاسخ=لیست
-
-@app.get("/user_orders/{user_phone}")  # مسیر=تمام سفارش‌های کاربر
-async def get_user_orders(user_phone: str, request: Request):  # تابع=سفارش‌ها
-    norm = _normalize_phone(user_phone)  # norm=شماره نرمال
-    if not norm:  # شرط=نامعتبر
-        raise HTTPException(status_code=400, detail="invalid user_phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    sel = RequestTable.__table__.select().where(RequestTable.user_phone == norm).order_by(RequestTable.id.desc())  # sel=کوئری
-    rows = await database.fetch_all(sel)  # rows=نتیجه
-    return unified_response("ok", "USER_ORDERS", "orders list", {"items": [dict(r) for r in rows]})  # پاسخ=لیست
-
-# -------------------- Notifications (User) --------------------  # بخش=اعلان‌ها برای اپ کاربر
-
-@app.get("/user/{phone}/notifications")  # مسیر=لیست اعلان‌ها
-async def get_notifications(phone: str, request: Request, only_unread: bool = True, limit: int = 20, offset: int = 0):  # تابع=گرفتن اعلان‌ها
-    norm = _normalize_phone(phone)  # norm=شماره نرمال
-    if not norm:  # شرط=نامعتبر
-        raise HTTPException(status_code=400, detail="invalid phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    lim = int(limit) if int(limit) > 0 else 20  # lim=حد
-    off = int(offset) if int(offset) >= 0 else 0  # off=افست
-
-    q = NotificationTable.__table__.select().where(NotificationTable.user_phone == norm)  # q=کوئری پایه
-    if only_unread:  # شرط=فقط خوانده‌نشده
-        q = q.where(NotificationTable.read == False)  # where=read false
-    q = q.order_by(NotificationTable.created_at.desc()).limit(lim).offset(off)  # مرتب‌سازی و limit/offset
-
-    rows = await database.fetch_all(q)  # rows=نتیجه
-
-    items: List[dict] = []  # items=خروجی نهایی
-    for r in rows:  # حلقه=روی اعلان‌ها
-        items.append({  # افزودن=آیتم
-            "id": int(r["id"]),  # id=شناسه
-            "user_phone": str(r["user_phone"] or ""),  # user_phone=شماره
-            "title": str(r["title"] or ""),  # title=عنوان
-            "body": str(r["body"] or ""),  # body=متن
-            "data": r["data"] or {},  # data=داده
-            "read": bool(r["read"]),  # read=خوانده شده؟
-            "created_at": (r["created_at"].astimezone(timezone.utc).isoformat() if r["created_at"] else None)  # created_at=ISO UTC
-        })  # پایان append
-
-    return unified_response("ok", "NOTIFICATIONS", "notifications", {"items": items})  # پاسخ=لیست اعلان‌ها
-
-@app.post("/user/{phone}/notifications/{notif_id}/read")  # مسیر=خوانده‌شدن یک اعلان
-async def mark_notification_read(phone: str, notif_id: int, request: Request):  # تابع=خوانده کردن اعلان
-    norm = _normalize_phone(phone)  # norm=شماره نرمال
-    if not norm:  # شرط=نامعتبر
-        raise HTTPException(status_code=400, detail="invalid phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    now = datetime.now(timezone.utc)  # now=اکنون UTC
-    upd = (  # upd=آپدیت اعلان
-        NotificationTable.__table__.update()  # update=notifications
-        .where((NotificationTable.id == int(notif_id)) & (NotificationTable.user_phone == norm))  # where=همان اعلان و همان کاربر
-        .values(read=True, read_at=now)  # values=خوانده شده
-    )  # پایان upd
-    res = await database.execute(upd)  # res=اجرای update
-
-    return unified_response("ok", "NOTIFICATION_READ", "notification marked read", {"id": int(notif_id)})  # پاسخ=موفق
-
-@app.post("/user/{phone}/notifications/mark_all_read")  # مسیر=خوانده‌شدن همه اعلان‌ها
-async def mark_all_notifications_read(phone: str, request: Request):  # تابع=خوانده کردن همه
-    norm = _normalize_phone(phone)  # norm=شماره نرمال
-    if not norm:  # شرط=نامعتبر
-        raise HTTPException(status_code=400, detail="invalid phone")  # خطا=۴۰۰
-    require_user_phone(request, norm)  # احراز=Bearer و تطبیق شماره
-
-    now = datetime.now(timezone.utc)  # now=اکنون UTC
-    await database.execute(  # اجرا=آپدیت همه اعلان‌های خوانده‌نشده
-        NotificationTable.__table__.update().where(  # update=notifications
-            (NotificationTable.user_phone == norm) & (NotificationTable.read == False)  # where=خوانده‌نشده‌ها
-        ).values(read=True, read_at=now)  # values=خوانده شده
-    )  # پایان execute
-
-    return unified_response("ok", "ALL_NOTIFICATIONS_READ", "all notifications marked read", {})  # پاسخ=موفق
-# -------------------- Utils: provider schedule --------------------  # بخش=ابزار بررسی زمان‌های مشغول
-
-async def provider_is_free(provider_phone: str, start: datetime, end: datetime, exclude_order_id: Optional[int] = None) -> bool:  # تابع=بررسی آزاد بودن سرویس‌دهنده در بازه
-    provider = _normalize_phone(provider_phone)  # provider=شماره نرمال سرویس‌دهنده
-    if not provider:  # شرط=شماره نامعتبر
-        return False  # خروجی=غیرآزاد
-
-    one_hour = text("interval '1 hour'")  # one_hour=اینترول یک ساعت در PostgreSQL
-
-    q_app = select(func.count()).select_from(AppointmentTable).where(  # q_app=شمارش تداخل رزروهای قطعی
-        (AppointmentTable.provider_phone == provider) &  # شرط=سرویس‌دهنده
-        (AppointmentTable.status == "BOOKED") &  # شرط=رزرو فعال
-        (AppointmentTable.start_time < end) &  # شرط=شروع قبل از پایان
-        (AppointmentTable.end_time > start)  # شرط=پایان بعد از شروع
-    )  # پایان where
-    if exclude_order_id is not None:  # شرط=نادیده گرفتن سفارش
-        q_app = q_app.where(AppointmentTable.request_id != int(exclude_order_id))  # where=حذف سفارش
-    app_count = await database.fetch_val(q_app)  # app_count=تعداد تداخل
-    if app_count and int(app_count) > 0:  # شرط=تداخل
-        return False  # خروجی=غیرآزاد
-
-    slot_end = ScheduleSlotTable.slot_start + one_hour  # slot_end=پایان اسلات پیشنهادی
-    q_slot = select(func.count()).select_from(ScheduleSlotTable).where(  # q_slot=شمارش تداخل اسلات‌های پیشنهادی/پذیرفته
-        (ScheduleSlotTable.provider_phone == provider) &  # شرط=سرویس‌دهنده
-        (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=اسلات فعال
-        (ScheduleSlotTable.slot_start < end) &  # شرط=شروع قبل پایان
-        (slot_end > start)  # شرط=پایان بعد شروع
-    )  # پایان where
-    if exclude_order_id is not None:  # شرط=نادیده گرفتن سفارش
-        q_slot = q_slot.where(ScheduleSlotTable.request_id != int(exclude_order_id))  # where=حذف سفارش
-    slot_count = await database.fetch_val(q_slot)  # slot_count=تعداد تداخل
-    if slot_count and int(slot_count) > 0:  # شرط=تداخل
-        return False  # خروجی=غیرآزاد
-
-    exec_end = RequestTable.execution_start + one_hour  # exec_end=پایان بازه اجرا
-    q_exec = select(func.count()).select_from(RequestTable).where(  # q_exec=شمارش اجرای فعال
-        (RequestTable.driver_phone == provider) &  # شرط=سرویس‌دهنده
-        (RequestTable.execution_start.is_not(None)) &  # شرط=زمان اجرا وجود دارد
-        (RequestTable.status.in_(["IN_PROGRESS", "STARTED"])) &  # شرط=وضعیت اجرا
-        (RequestTable.execution_start < end) &  # شرط=شروع قبل پایان
-        (exec_end > start)  # شرط=پایان بعد شروع
-    )  # پایان where
-    if exclude_order_id is not None:  # شرط=نادیده گرفتن سفارش
-        q_exec = q_exec.where(RequestTable.id != int(exclude_order_id))  # where=حذف سفارش
-    exec_count = await database.fetch_val(q_exec)  # exec_count=تعداد تداخل
-    if exec_count and int(exec_count) > 0:  # شرط=تداخل
-        return False  # خروجی=غیرآزاد
-
-    visit_end = RequestTable.scheduled_start + one_hour  # visit_end=پایان بازه بازدید
-    q_visit = select(func.count()).select_from(RequestTable).where(  # q_visit=شمارش بازدیدهای قطعی
-        (RequestTable.driver_phone == provider) &  # شرط=سرویس‌دهنده
-        (RequestTable.scheduled_start.is_not(None)) &  # شرط=زمان بازدید وجود دارد
-        (RequestTable.status.in_(["WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"])) &  # شرط=وضعیت‌های مرتبط
-        (RequestTable.scheduled_start < end) &  # شرط=شروع قبل پایان
-        (visit_end > start)  # شرط=پایان بعد شروع
-    )  # پایان where
-    if exclude_order_id is not None:  # شرط=نادیده گرفتن سفارش
-        q_visit = q_visit.where(RequestTable.id != int(exclude_order_id))  # where=حذف سفارش
-    visit_count = await database.fetch_val(q_visit)  # visit_count=تعداد تداخل
-    if visit_count and int(visit_count) > 0:  # شرط=تداخل
-        return False  # خروجی=غیرآزاد
-
-    return True  # خروجی=آزاد
-
-# -------------------- Scheduling (Manager) --------------------  # بخش=زمان‌بندی مدیر
-
-@app.get("/busy_slots")  # مسیر=اسلات‌های مشغول مدیر
-async def get_busy_slots(request: Request, date: str, exclude_order_id: Optional[int] = None):  # تابع=busy_slots
-    require_admin(request)  # احراز=ادمین
-
-    d = datetime.fromisoformat(str(date).strip()).date()  # d=تاریخ
-    provider = get_admin_provider_phone(request)  # provider=شماره سرویس‌دهنده (شماره مدیر)
-
-    day_start = datetime(d.year, d.month, d.day, 0, 0, tzinfo=timezone.utc)  # day_start=شروع روز UTC
-    day_end = day_start + timedelta(days=1)  # day_end=پایان روز UTC
-
-    sel_sched = ScheduleSlotTable.__table__.select().where(  # sel_sched=اسلات‌های فعال
-        (ScheduleSlotTable.slot_start >= day_start) &  # شرط=از شروع روز
-        (ScheduleSlotTable.slot_start < day_end) &  # شرط=تا پایان روز
-        (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=فعال
-        (ScheduleSlotTable.provider_phone == provider)  # شرط=سرویس‌دهنده
-    )  # پایان where
-    if exclude_order_id is not None:  # شرط=استثنا
-        sel_sched = sel_sched.where(ScheduleSlotTable.request_id != int(exclude_order_id))  # where=حذف سفارش
-    rows_sched = await database.fetch_all(sel_sched)  # rows_sched=نتیجه
-
-    sel_app = AppointmentTable.__table__.select().where(  # sel_app=رزروهای قطعی
-        (AppointmentTable.start_time >= day_start) &  # شرط=از شروع روز
-        (AppointmentTable.start_time < day_end) &  # شرط=تا پایان روز
-        (AppointmentTable.status == "BOOKED") &  # شرط=رزرو فعال
-        (AppointmentTable.provider_phone == provider)  # شرط=سرویس‌دهنده
-    )  # پایان where
-    if exclude_order_id is not None:  # شرط=استثنا
-        sel_app = sel_app.where(AppointmentTable.request_id != int(exclude_order_id))  # where=حذف سفارش
-    rows_app = await database.fetch_all(sel_app)  # rows_app=نتیجه
-
-    sel_exec = RequestTable.__table__.select().where(  # sel_exec=اجراهای فعال
-        (RequestTable.execution_start >= day_start) &  # شرط=از شروع روز
-        (RequestTable.execution_start < day_end) &  # شرط=تا پایان روز
-        (RequestTable.execution_start.is_not(None)) &  # شرط=دارای اجرا
-        (RequestTable.status.in_(["IN_PROGRESS", "STARTED"])) &  # شرط=وضعیت اجرا
-        (RequestTable.driver_phone == provider)  # شرط=سرویس‌دهنده
-    )  # پایان where
-    if exclude_order_id is not None:  # شرط=استثنا
-        sel_exec = sel_exec.where(RequestTable.id != int(exclude_order_id))  # where=حذف سفارش
-    rows_exec = await database.fetch_all(sel_exec)  # rows_exec=نتیجه
-
-    sel_visit = RequestTable.__table__.select().where(  # sel_visit=بازدیدهای قطعی
-        (RequestTable.scheduled_start >= day_start) &  # شرط=از شروع روز
-        (RequestTable.scheduled_start < day_end) &  # شرط=تا پایان روز
-        (RequestTable.scheduled_start.is_not(None)) &  # شرط=دارای بازدید
-        (RequestTable.status.in_(["ASSIGNED", "IN_PROGRESS", "STARTED", "WAITING"])) &  # شرط=وضعیت‌ها
-        (RequestTable.driver_phone == provider)  # شرط=سرویس‌دهنده
-    )  # پایان where
-    if exclude_order_id is not None:  # شرط=استثنا
-        sel_visit = sel_visit.where(RequestTable.id != int(exclude_order_id))  # where=حذف سفارش
-    rows_visit = await database.fetch_all(sel_visit)  # rows_visit=نتیجه
-
-    busy: set[str] = set()  # busy=ست زمان‌های مشغول
-    for r in rows_sched:  # حلقه=اسلات‌ها
-        busy.add(r["slot_start"].astimezone(timezone.utc).isoformat())  # افزودن=ISO UTC
-    for r in rows_app:  # حلقه=رزروها
-        busy.add(r["start_time"].astimezone(timezone.utc).isoformat())  # افزودن=ISO UTC
-    for r in rows_exec:  # حلقه=اجراها
-        busy.add(r["execution_start"].astimezone(timezone.utc).isoformat())  # افزودن=ISO UTC
-    for r in rows_visit:  # حلقه=بازدیدها
-        busy.add(r["scheduled_start"].astimezone(timezone.utc).isoformat())  # افزودن=ISO UTC
-
-    return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": sorted(list(busy))})  # پاسخ=لیست
-
-@app.post("/order/{order_id}/propose_slots")  # مسیر=پیشنهاد زمان‌ها
-@app.post("/order/{order_id}/propose_slots/")  # مسیر=پیشنهاد زمان‌ها با اسلش
-async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Request):  # تابع=ثبت پیشنهاد زمان توسط مدیر
-    require_admin(request)  # احراز=ادمین
-
-    provider = get_admin_provider_phone(request)  # provider=شماره سرویس‌دهنده (مدیر)
-    sel_req = RequestTable.__table__.select().where(RequestTable.id == int(order_id))  # sel_req=کوئری سفارش
-    req_row = await database.fetch_one(sel_req)  # req_row=سفارش
-    if not req_row:  # شرط=نبود سفارش
-        raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
-
-    cur_status = str(req_row["status"] or "").strip().upper()  # cur_status=وضعیت
-    if cur_status in ["FINISH", "CANCELED"]:  # شرط=بسته
-        raise HTTPException(status_code=409, detail="order cannot accept new proposed slots")  # خطا=۴۰۹
-    if req_row["execution_start"] is not None:  # شرط=بعد از زمان اجرا
-        raise HTTPException(status_code=409, detail="order cannot accept new proposed slots after execution_time")  # خطا=۴۰۹
-
-    raw_slots = body.slots or []  # raw_slots=لیست ورودی
-    cleaned: List[str] = []  # cleaned=لیست پاکسازی‌شده
-    seen: set[str] = set()  # seen=برای حذف تکرار
-    for s in raw_slots:  # حلقه=روی اسلات‌ها
-        ss = str(s or "").strip()  # ss=trim
-        if not ss:  # شرط=خالی
-            continue  # ادامه
-        if ss in seen:  # شرط=تکراری
-            continue  # ادامه
-        seen.add(ss)  # افزودن=به seen
-        cleaned.append(ss)  # افزودن=به لیست
-        if len(cleaned) >= 3:  # شرط=حداکثر ۳
-            break  # خروج از حلقه
-    if not cleaned:  # شرط=بدون زمان
-        raise HTTPException(status_code=400, detail="slots required")  # خطا=۴۰۰
-
-    slot_dts = [parse_iso(x) for x in cleaned]  # slot_dts=پارس زمان‌ها
-    slot_dts.sort()  # sort=مرتب‌سازی
-
-    accepted: List[str] = []  # accepted=لیست ثبت‌شده
-
-    async with database.transaction():  # تراکنش=اتمیک
-        await database.execute(  # اجرا=رد اسلات‌های قبلی این سفارش
-            ScheduleSlotTable.__table__.update().where(
-                (ScheduleSlotTable.request_id == int(order_id)) &  # شرط=همین سفارش
-                (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))  # شرط=فعال
-            ).values(status="REJECTED")  # values=رد
-        )  # پایان execute
-
-        await database.execute(  # اجرا=لغو رزروهای قبلی همین سفارش
-            AppointmentTable.__table__.update().where(
-                (AppointmentTable.request_id == int(order_id)) &  # شرط=همین سفارش
-                (AppointmentTable.status == "BOOKED")  # شرط=رزرو فعال
-            ).values(status="CANCELED")  # values=لغو
-        )  # پایان execute
-
-        await database.execute(  # اجرا=آپدیت سفارش به WAITING و ثبت سرویس‌دهنده
-            RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-                driver_phone=provider,  # driver_phone=ثبت سرویس‌دهنده
-                status="WAITING",  # status=WAITING
-                scheduled_start=None  # scheduled_start=پاکسازی
-            )  # پایان values
-        )  # پایان execute
-
-        for dt in slot_dts:  # حلقه=روی زمان‌ها
-            end_dt = dt + timedelta(hours=1)  # end_dt=پایان یک ساعت
-            free = await provider_is_free(provider, dt, end_dt, exclude_order_id=int(order_id))  # free=آزاد بودن
-            if not free:  # شرط=تداخل
-                raise HTTPException(status_code=409, detail="slot overlaps with existing schedule")  # خطا=۴۰۹
-
-            try:  # try=محافظ برخورد یکتا
-                await database.execute(  # اجرا=درج اسلات پیشنهادی
-                    ScheduleSlotTable.__table__.insert().values(
-                        request_id=int(order_id),  # request_id=سفارش
-                        provider_phone=provider,  # provider_phone=سرویس‌دهنده
-                        slot_start=dt,  # slot_start=شروع
-                        status="PROPOSED",  # status=پیشنهادی
-                        created_at=datetime.now(timezone.utc)  # created_at=اکنون
-                    )  # پایان values
-                )  # پایان execute
-            except Exception as e:  # catch=خطا
-                msg = str(e)  # msg=متن خطا
-                if ("uq_schedule_slots_provider_start_active" in msg) or ("duplicate key value" in msg):  # شرط=تداخل یکتا
-                    raise HTTPException(status_code=409, detail="slot already reserved for another order")  # خطا=۴۰۹
-                raise  # raise=پرتاب مجدد
-
-            accepted.append(dt.isoformat())  # افزودن=خروجی
-
-    try:  # try=ارسال اعلان به کاربر
-        await notify_user(  # اعلان=به کاربر
-            phone=str(req_row["user_phone"]),  # phone=شماره کاربر
-            title="پیشنهاد زمان بازدید",  # title=عنوان
-            body="زمان‌های پیشنهادی برای بازدید ارسال شد.",  # body=متن
-            data={  # data=اطلاعات
-                "type": "visit_slots",  # type=نوع پیام
-                "order_id": int(order_id),  # order_id=شناسه
-                "status": "WAITING",  # status=WAITING
-                "service_type": str(req_row["service_type"] or "")  # service_type=نوع سرویس
-            }  # پایان data
-        )  # پایان notify_user
-    except Exception as e:  # catch=خطا
-        logger.error(f"notify_user(propose_slots) failed: {e}")  # لاگ=خطا
-
-    return unified_response("ok", "SLOTS_PROPOSED", "slots proposed", {"accepted": accepted})  # پاسخ=لیست زمان‌ها
-
-# -------------------- Proposed slots (User) --------------------  # بخش=گرفتن اسلات‌های پیشنهادی برای کاربر
-
-@app.get("/order/{order_id}/proposed_slots")  # مسیر=اسلات‌های پیشنهادی
-async def get_proposed_slots(order_id: int, request: Request):  # تابع=گرفتن اسلات‌ها
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))  # req=سفارش
-    if not req:  # شرط=نبود
-        raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
-    require_user_phone(request, str(req["user_phone"]))  # احراز=کاربر همان سفارش
-
-    sel = ScheduleSlotTable.__table__.select().where(
-        (ScheduleSlotTable.request_id == int(order_id)) &  # شرط=همین سفارش
-        (ScheduleSlotTable.status == "PROPOSED")  # شرط=پیشنهادی
-    ).order_by(ScheduleSlotTable.slot_start.asc())  # order_by=زمان صعودی
-    rows = await database.fetch_all(sel)  # rows=نتیجه
-    items = [r["slot_start"].astimezone(timezone.utc).isoformat() for r in rows]  # items=لیست ISO
-    return unified_response("ok", "PROPOSED_SLOTS", "proposed slots", {"items": items})  # پاسخ=لیست
-
-# -------------------- Confirm slot (User) --------------------  # بخش=تأیید زمان بازدید توسط کاربر (فقط یک نسخه)
-
-@app.post("/order/{order_id}/confirm_slot")  # مسیر=تأیید زمان
-@app.post("/order/{order_id}/confirm_slot/")  # مسیر=تأیید زمان با اسلش
-async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request):  # تابع=تأیید اسلات
-    req_row = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))  # req_row=سفارش
-    if not req_row:  # شرط=نبود
-        raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
-
-    require_user_phone(request, str(req_row["user_phone"]))  # احراز=کاربر همان سفارش
-
-    if req_row["execution_start"] is not None:  # شرط=بعد از تعیین زمان اجرا
-        raise HTTPException(status_code=409, detail={"code": "CANNOT_CONFIRM", "message": "cannot confirm slot after execution time is set"})  # خطا=۴۰۹
-
-    st = str(req_row["status"] or "").strip().upper()  # st=وضعیت
-    if st not in ["WAITING", "ASSIGNED", "NEW"]:  # شرط=وضعیت نامعتبر
-        raise HTTPException(status_code=409, detail={"code": "CANNOT_CONFIRM", "message": "order is not in schedulable state"})  # خطا=۴۰۹
-
-    slot_dt = parse_iso(body.slot)  # slot_dt=زمان انتخابی UTC
-    end_dt = slot_dt + timedelta(hours=1)  # end_dt=پایان یک ساعت
-
-    async with database.transaction():  # تراکنش=اتمیک
-        slot_row = await database.fetch_one(  # slot_row=اسلات انتخابی
-            ScheduleSlotTable.__table__.select().where(
-                (ScheduleSlotTable.request_id == int(order_id)) &  # شرط=همین سفارش
-                (ScheduleSlotTable.slot_start == slot_dt) &  # شرط=همین زمان
-                (ScheduleSlotTable.status == "PROPOSED")  # شرط=پیشنهادی
-            )  # پایان where
-        )  # پایان fetch_one
-        if not slot_row:  # شرط=نبود اسلات
-            raise HTTPException(status_code=404, detail="slot not found for this order")  # خطا=۴۰۴
-
-        provider = _normalize_phone(str(slot_row["provider_phone"] or ""))  # provider=شماره سرویس‌دهنده
-        if not provider:  # شرط=نبود سرویس‌دهنده
-            raise HTTPException(status_code=400, detail="provider_phone missing on slot")  # خطا=۴۰۰
-
-        free = await provider_is_free(provider, slot_dt, end_dt, exclude_order_id=int(order_id))  # free=بررسی تداخل
-        if not free:  # شرط=تداخل
-            raise HTTPException(status_code=409, detail="selected slot overlaps with existing schedule")  # خطا=۴۰۹
-
-        await database.execute(  # اجرا=لغو رزروهای BOOKED قبلی این سفارش غیر از بازه جدید
-            AppointmentTable.__table__.update().where(
-                (AppointmentTable.request_id == int(order_id)) &  # شرط=همین سفارش
-                (AppointmentTable.status == "BOOKED") &  # شرط=رزرو فعال
-                ((AppointmentTable.start_time != slot_dt) | (AppointmentTable.end_time != end_dt))  # شرط=غیر از بازه جدید
-            ).values(status="CANCELED")  # values=لغو
-        )  # پایان execute
-
-        await database.execute(  # اجرا=رد سایر اسلات‌های فعال این سفارش
-            ScheduleSlotTable.__table__.update().where(
-                (ScheduleSlotTable.request_id == int(order_id)) &  # شرط=همین سفارش
-                (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &  # شرط=فعال
-                (ScheduleSlotTable.slot_start != slot_dt)  # شرط=غیر از انتخابی
-            ).values(status="REJECTED")  # values=رد
-        )  # پایان execute
-
-        await database.execute(  # اجرا=پذیرفتن اسلات انتخابی
-            ScheduleSlotTable.__table__.update().where(
-                (ScheduleSlotTable.request_id == int(order_id)) &  # شرط=همین سفارش
-                (ScheduleSlotTable.slot_start == slot_dt)  # شرط=همین زمان
-            ).values(status="ACCEPTED")  # values=پذیرفته
-        )  # پایان execute
-
-        any_row = await database.fetch_one(  # any_row=رزرو موجود با همین بازه
-            AppointmentTable.__table__.select().where(
-                (AppointmentTable.provider_phone == provider) &  # شرط=سرویس‌دهنده
-                (AppointmentTable.start_time == slot_dt) &  # شرط=شروع
-                (AppointmentTable.end_time == end_dt)  # شرط=پایان
-            ).limit(1)  # limit=۱
-        )  # پایان fetch_one
-
-        if any_row:  # شرط=رزرو موجود
-            if (str(any_row["status"] or "").strip().upper() == "BOOKED") and (int(any_row["request_id"] or 0) != int(order_id)):  # شرط=BOOKED برای سفارش دیگر
-                raise HTTPException(status_code=409, detail="selected slot overlaps with existing schedule")  # خطا=۴۰۹
-            await database.execute(  # اجرا=آپدیت رزرو موجود برای این سفارش
-                AppointmentTable.__table__.update().where(AppointmentTable.id == int(any_row["id"])).values(
-                    request_id=int(order_id),  # request_id=این سفارش
-                    status="BOOKED"  # status=رزرو
-                )  # پایان values
-            )  # پایان execute
-        else:  # حالت=رزرو وجود ندارد
-            try:  # try=محافظ یکتا
-                await database.execute(  # اجرا=insert رزرو جدید
-                    AppointmentTable.__table__.insert().values(
-                        provider_phone=provider,  # provider_phone=سرویس‌دهنده
-                        request_id=int(order_id),  # request_id=سفارش
-                        start_time=slot_dt,  # start_time=شروع
-                        end_time=end_dt,  # end_time=پایان
-                        status="BOOKED",  # status=رزرو
-                        created_at=datetime.now(timezone.utc)  # created_at=اکنون
-                    )  # پایان values
-                )  # پایان execute
-            except Exception as e:  # catch=خطا
-                msg = str(e)  # msg=متن خطا
-                if ("uq_provider_slot" in msg) or ("duplicate key value" in msg):  # شرط=برخورد یکتا
-                    any_row2 = await database.fetch_one(  # any_row2=خواندن مجدد
-                        AppointmentTable.__table__.select().where(
-                            (AppointmentTable.provider_phone == provider) &  # شرط=سرویس‌دهنده
-                            (AppointmentTable.start_time == slot_dt) &  # شرط=شروع
-                            (AppointmentTable.end_time == end_dt)  # شرط=پایان
-                        ).limit(1)  # limit=۱
-                    )  # پایان fetch_one
-                    if any_row2 and (str(any_row2["status"] or "").strip().upper() == "BOOKED") and (int(any_row2["request_id"] or 0) != int(order_id)):  # شرط=BOOKED برای سفارش دیگر
-                        raise HTTPException(status_code=409, detail="selected slot overlaps with existing schedule")  # خطا=۴۰۹
-                    if any_row2:  # شرط=پیدا شد
-                        await database.execute(  # اجرا=آپدیت رزرو موجود
-                            AppointmentTable.__table__.update().where(AppointmentTable.id == int(any_row2["id"])).values(
-                                request_id=int(order_id),  # request_id=این سفارش
-                                status="BOOKED"  # status=رزرو
-                            )  # پایان values
-                        )  # پایان execute
-                    else:  # حالت=پیدا نشد
-                        raise  # raise=پرتاب مجدد
-                else:  # حالت=خطای دیگر
-                    raise  # raise=پرتاب مجدد
-
-        await database.execute(  # اجرا=آپدیت سفارش با زمان قطعی
-            RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-                scheduled_start=slot_dt,  # scheduled_start=زمان قطعی
-                status="ASSIGNED",  # status=ASSIGNED
-                driver_phone=provider  # driver_phone=سرویس‌دهنده
-            )  # پایان values
-        )  # پایان execute
-
-    try:  # try=اعلان فقط به مدیر/سرویس‌دهنده
-        await notify_managers(  # اعلان=به مدیر
-            title="تأیید زمان بازدید",  # title=عنوان
-            body=f"کاربر زمان بازدید را تأیید کرد (order_id={int(order_id)}).",  # body=متن
-            data=order_push_data(  # data=داده استاندارد
-                msg_type="time_confirm",  # msg_type=نوع پیام
-                order_id=int(order_id),  # order_id=شناسه
-                status="ASSIGNED",  # status=وضعیت
-                service_type=str(req_row["service_type"] or ""),  # service_type=نوع سرویس
-                scheduled_start=slot_dt  # scheduled_start=زمان بازدید
-            ),  # پایان data
-            target_phone=provider  # target_phone=هدف
-        )  # پایان notify
-    except Exception as e:  # catch=خطا
-        logger.error(f"notify(confirm_slot->manager_only) failed: {e}")  # لاگ=خطا
-
-    return unified_response("ok", "SLOT_CONFIRMED", "slot confirmed", {"start": slot_dt.isoformat(), "end": end_dt.isoformat()})  # پاسخ=تأیید شد
-
-# -------------------- User: reject all and cancel --------------------  # بخش=رد همه اسلات‌ها و لغو سفارش
-
-@app.post("/order/{order_id}/reject_all_and_cancel")  # مسیر=لغو توسط کاربر (رد همه)
-async def reject_all_and_cancel(order_id: int, request: Request):  # تابع=لغو و رد
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))  # req=سفارش
-    if not req:  # شرط=نبود
-        raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
-    require_user_phone(request, str(req["user_phone"]))  # احراز=کاربر همان سفارش
-
-    if req["execution_start"] is not None:  # شرط=بعد از زمان اجرا
-        raise HTTPException(status_code=409, detail={"code": "CANNOT_CANCEL", "message": "order cannot be canceled at this stage"})  # خطا=۴۰۹
-
-    st = str(req["status"] or "").strip().upper()  # st=وضعیت
-    if st not in ["NEW", "WAITING", "ASSIGNED"]:  # شرط=قابل لغو بودن
-        raise HTTPException(status_code=409, detail={"code": "CANNOT_CANCEL", "message": "order cannot be canceled at this stage"})  # خطا=۴۰۹
-
-    await database.execute(  # اجرا=رد اسلات‌های فعال
-        ScheduleSlotTable.__table__.update().where(
-            (ScheduleSlotTable.request_id == int(order_id)) &  # شرط=سفارش
-            (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))  # شرط=فعال
-        ).values(status="REJECTED")  # values=رد
-    )  # پایان execute
-
-    await database.execute(  # اجرا=لغو رزروهای BOOKED
-        AppointmentTable.__table__.update().where(
-            (AppointmentTable.request_id == int(order_id)) &  # شرط=سفارش
-            (AppointmentTable.status == "BOOKED")  # شرط=رزرو
-        ).values(status="CANCELED")  # values=لغو
-    )  # پایان execute
-
-    await database.execute(  # اجرا=لغو سفارش
-        RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-            status="CANCELED",  # status=لغو
-            scheduled_start=None,  # scheduled_start=پاک
-            execution_start=None  # execution_start=پاک
-        )  # پایان values
-    )  # پایان execute
-
-    try:  # try=اعلان مدیر
-        await notify_managers(  # اعلان=به مدیرها
-            title="لغو سفارش",  # title=عنوان
-            body=f"سفارش {int(order_id)} توسط کاربر لغو شد.",  # body=متن
-            data={"order_id": int(order_id), "status": "CANCELED", "user_phone": _normalize_phone(str(req["user_phone"]))}  # data=اطلاعات
-        )  # پایان notify
-    except Exception as e:  # catch=خطا
-        logger.error(f"notify_managers(reject_all_and_cancel) failed: {e}")  # لاگ=خطا
-
-    return unified_response("ok", "ORDER_CANCELED", "order canceled", {"order_id": int(order_id)})  # پاسخ=لغو شد
-
-# -------------------- Admin: set price / finish / cancel --------------------  # بخش=اکشن‌های مدیر
-
-@app.post("/admin/order/{order_id}/price")  # مسیر=ثبت قیمت و زمان اجرا
-async def admin_set_price(order_id: int, body: PriceBody, request: Request):  # تابع=ثبت قیمت/زمان اجرا
-    require_admin(request)  # احراز=ادمین
-
-    req_row = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))  # req_row=سفارش
-    if not req_row:  # شرط=نبود
-        raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
-
-    provider = _normalize_phone(str(req_row["driver_phone"] or ""))  # provider=سرویس‌دهنده
-    service_type = str(req_row["service_type"] or "")  # service_type=نوع سرویس
-    now = datetime.now(timezone.utc)  # now=اکنون
-
-    exec_dt: Optional[datetime] = None  # exec_dt=زمان اجرا
-    new_status = "PRICE_REJECTED"  # new_status=پیش‌فرض
-
-    async with database.transaction():  # تراکنش=اتمیک
-        if bool(body.agree):  # شرط=توافق
-            if not body.exec_time or not str(body.exec_time).strip():  # شرط=نیاز به زمان اجرا
-                raise HTTPException(status_code=400, detail="exec_time required when agree=true")  # خطا=۴۰۰
-            if not provider:  # شرط=نبود سرویس‌دهنده
-                raise HTTPException(status_code=400, detail="driver_phone(provider) not set for this order")  # خطا=۴۰۰
-
-            exec_dt = parse_iso(str(body.exec_time))  # exec_dt=پارس UTC
-            end_dt = exec_dt + timedelta(hours=1)  # end_dt=پایان یک ساعت
-
-            free = await provider_is_free(provider, exec_dt, end_dt, exclude_order_id=int(order_id))  # free=آزاد بودن
-            if not free:  # شرط=تداخل
-                raise HTTPException(status_code=409, detail="execution time overlaps with existing schedule")  # خطا=۴۰۹
-
-            any_row = await database.fetch_one(  # any_row=رزرو موجود با همین بازه
-                AppointmentTable.__table__.select().where(
-                    (AppointmentTable.provider_phone == provider) &  # شرط=سرویس‌دهنده
-                    (AppointmentTable.start_time == exec_dt) &  # شرط=شروع
-                    (AppointmentTable.end_time == end_dt)  # شرط=پایان
-                ).limit(1)  # limit=۱
-            )  # پایان fetch_one
-
-            if any_row:  # شرط=رزرو وجود دارد
-                if (str(any_row["status"] or "").strip().upper() == "BOOKED") and (int(any_row["request_id"] or 0) != int(order_id)):  # شرط=BOOKED برای سفارش دیگر
-                    raise HTTPException(status_code=409, detail="execution time overlaps with existing schedule")  # خطا=۴۰۹
-                await database.execute(  # اجرا=آپدیت رزرو موجود
-                    AppointmentTable.__table__.update().where(AppointmentTable.id == int(any_row["id"])).values(
-                        request_id=int(order_id),  # request_id=این سفارش
-                        status="BOOKED"  # status=رزرو
-                    )  # پایان values
-                )  # پایان execute
-            else:  # حالت=رزرو وجود ندارد
-                try:  # try=محافظ یکتا
-                    await database.execute(  # اجرا=insert رزرو جدید
-                        AppointmentTable.__table__.insert().values(
-                            provider_phone=provider,  # provider_phone=سرویس‌دهنده
-                            request_id=int(order_id),  # request_id=سفارش
-                            start_time=exec_dt,  # start_time=شروع
-                            end_time=end_dt,  # end_time=پایان
-                            status="BOOKED",  # status=رزرو
-                            created_at=now  # created_at=اکنون
-                        )  # پایان values
-                    )  # پایان execute
-                except Exception as e:  # catch=خطا
-                    msg = str(e)  # msg=متن خطا
-                    if ("uq_provider_slot" in msg) or ("duplicate key value" in msg):  # شرط=برخورد یکتا
-                        any_row2 = await database.fetch_one(  # any_row2=خواندن مجدد
-                            AppointmentTable.__table__.select().where(
-                                (AppointmentTable.provider_phone == provider) &  # شرط=سرویس‌دهنده
-                                (AppointmentTable.start_time == exec_dt) &  # شرط=شروع
-                                (AppointmentTable.end_time == end_dt)  # شرط=پایان
-                            ).limit(1)  # limit=۱
-                        )  # پایان fetch_one
-                        if any_row2 and (str(any_row2["status"] or "").strip().upper() == "BOOKED") and (int(any_row2["request_id"] or 0) != int(order_id)):  # شرط=BOOKED برای سفارش دیگر
-                            raise HTTPException(status_code=409, detail="execution time overlaps with existing schedule")  # خطا=۴۰۹
-                        if any_row2:  # شرط=پیدا شد
-                            await database.execute(  # اجرا=آپدیت رزرو موجود
-                                AppointmentTable.__table__.update().where(AppointmentTable.id == int(any_row2["id"])).values(
-                                    request_id=int(order_id),  # request_id=این سفارش
-                                    status="BOOKED"  # status=رزرو
-                                )  # پایان values
-                            )  # پایان execute
-                        else:  # حالت=پیدا نشد
-                            raise  # raise=پرتاب مجدد
-                    else:  # حالت=خطای دیگر
-                        raise  # raise=پرتاب مجدد
-
-            new_status = "IN_PROGRESS"  # new_status=در حال انجام
-
-        saved = await database.fetch_one(  # saved=آپدیت سفارش و گرفتن خروجی
-            RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-                price=int(body.price),  # price=قیمت
-                status=new_status,  # status=وضعیت
-                execution_start=exec_dt  # execution_start=زمان اجرا
-            ).returning(RequestTable.id, RequestTable.price, RequestTable.status, RequestTable.execution_start)  # returning=فیلدها
-        )  # پایان fetch_one
-
-    try:  # try=اعلان کاربر
-        if bool(body.agree):  # شرط=توافق
-            await notify_user(  # اعلان=به کاربر
-                phone=str(req_row["user_phone"]),  # phone=کاربر
-                title="توافق قیمت",  # title=عنوان
-                body=f"قیمت {int(body.price)} ثبت شد.",  # body=متن
-                data=order_push_data(  # data=داده استاندارد
-                    msg_type="execution_time",  # msg_type=زمان اجرا
-                    order_id=int(order_id),  # order_id=شناسه
-                    status=str(new_status),  # status=وضعیت
-                    service_type=service_type,  # service_type=نوع سرویس
-                    scheduled_start=req_row["scheduled_start"],  # scheduled_start=اگر موجود
-                    execution_start=exec_dt,  # execution_start=زمان اجرا
-                    price=int(body.price)  # price=قیمت
-                )  # پایان data
-            )  # پایان notify
-        else:  # حالت=عدم توافق
-            await notify_user(  # اعلان=به کاربر
-                phone=str(req_row["user_phone"]),  # phone=کاربر
-                title="عدم توافق قیمت",  # title=عنوان
-                body="قیمت مورد توافق قرار نگرفت.",  # body=متن
-                data=order_push_data(  # data=داده استاندارد
-                    msg_type="price_set",  # msg_type=قیمت
-                    order_id=int(order_id),  # order_id=شناسه
-                    status=str(new_status),  # status=وضعیت
-                    service_type=service_type,  # service_type=نوع سرویس
-                    scheduled_start=req_row["scheduled_start"],  # scheduled_start=اگر موجود
-                    execution_start=None,  # execution_start=ندارد
-                    price=int(body.price)  # price=قیمت
-                )  # پایان data
-            )  # پایان notify
-    except Exception as e:  # catch=خطا
-        logger.error(f"notify_user(admin_set_price) failed: {e}")  # لاگ=خطا
-
-    return unified_response(  # پاسخ=نتیجه
-        "ok",  # status=ok
-        "PRICE_SET",  # code=کد
-        "price/status updated",  # message=پیام
-        {  # data=خروجی
-            "order_id": int(saved["id"]) if saved else int(order_id),  # order_id=شناسه
-            "price": int(saved["price"]) if saved else int(body.price),  # price=قیمت
-            "status": str(saved["status"]) if saved else str(new_status),  # status=وضعیت
-            "execution_start": (saved["execution_start"].astimezone(timezone.utc).isoformat() if (saved and saved["execution_start"]) else None)  # execution_start=ISO
-        }  # پایان data
-    )  # پایان پاسخ
-
-@app.post("/order/{order_id}/finish")  # مسیر=اتمام کار
-async def finish_order(order_id: int, request: Request):  # تابع=finish
-    require_admin(request)  # احراز=ادمین
-
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))  # req=سفارش
-    if not req:  # شرط=نبود
-        raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
-
-    now_iso = datetime.now(timezone.utc).isoformat()  # now_iso=زمان پایان
-
-    async with database.transaction():  # تراکنش=اتمیک
-        await database.execute(  # اجرا=آپدیت سفارش
-            RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-                status="FINISH",  # status=FINISH
-                finish_datetime=now_iso  # finish_datetime=اکنون
-            )  # پایان values
-        )  # پایان execute
-
-        await database.execute(  # اجرا=آزادسازی appointmentها
-            AppointmentTable.__table__.update().where(
-                (AppointmentTable.request_id == int(order_id)) &  # شرط=سفارش
-                (AppointmentTable.status == "BOOKED")  # شرط=رزرو فعال
-            ).values(status="DONE")  # values=DONE
-        )  # پایان execute
-
-    try:  # try=اعلان‌ها
-        await notify_user(  # اعلان=به کاربر
-            phone=str(req["user_phone"]),  # phone=کاربر
-            title="اتمام کار",  # title=عنوان
-            body="سفارش شما انجام شد.",  # body=متن
-            data={"type": "work_finished", "order_id": int(order_id), "status": "FINISH", "service_type": str(req["service_type"] or "")}  # data=اطلاعات
-        )  # پایان notify_user
-    except Exception as e:  # catch=خطا
-        logger.error(f"notify(finish_order) failed: {e}")  # لاگ=خطا
-
-    return unified_response("ok", "ORDER_FINISHED", "order finished", {"order_id": int(order_id), "status": "FINISH"})  # پاسخ=موفق
-
-@app.post("/admin/order/{order_id}/cancel")  # مسیر=لغو توسط مدیر
-async def admin_cancel_order(order_id: int, request: Request):  # تابع=لغو مدیر
-    require_admin(request)  # احراز=ادمین
-
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))  # req=سفارش
-    if not req:  # شرط=نبود
-        raise HTTPException(status_code=404, detail="order not found")  # خطا=۴۰۴
-
-    await database.execute(  # اجرا=لغو سفارش
-        RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-            status="CANCELED",  # status=لغو
-            scheduled_start=None,  # scheduled_start=پاک
-            execution_start=None  # execution_start=پاک
-        )  # پایان values
-    )  # پایان execute
-
-    await database.execute(  # اجرا=رد اسلات‌ها
-        ScheduleSlotTable.__table__.update().where(
-            (ScheduleSlotTable.request_id == int(order_id)) &  # شرط=سفارش
-            (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))  # شرط=فعال
-        ).values(status="REJECTED")  # values=رد
-    )  # پایان execute
-
-    await database.execute(  # اجرا=لغو appointmentها
-        AppointmentTable.__table__.update().where(
-            (AppointmentTable.request_id == int(order_id)) &  # شرط=سفارش
-            (AppointmentTable.status == "BOOKED")  # شرط=رزرو فعال
-        ).values(status="CANCELED")  # values=لغو
-    )  # پایان execute
-
-    try:  # try=اعلان کاربر
-        await notify_user(  # اعلان=به کاربر
-            phone=str(req["user_phone"]),  # phone=کاربر
-            title="لغو سفارش",  # title=عنوان
-            body="سفارش شما توسط مدیر لغو شد.",  # body=متن
-            data={"type": "order_canceled", "order_id": int(order_id), "status": "CANCELED", "service_type": str(req["service_type"] or ""), "canceled_by": "manager"}  # data=اطلاعات
-        )  # پایان notify_user
-    except Exception as e:  # catch=خطا
-        logger.error(f"notify(admin_cancel_order) failed: {e}")  # لاگ=خطا
-
-    return unified_response("ok", "ORDER_CANCELED", "order canceled by admin", {"order_id": int(order_id), "status": "CANCELED"})  # پاسخ=موفق
-
-# -------------------- Debug --------------------  # بخش=دیباگ
-
-@app.get("/debug/routes")  # مسیر=لیست routeها
-def debug_routes():  # تابع=برگرداندن routeها
-    out: List[dict] = []  # out=لیست خروجی
-    for r in app.router.routes:  # حلقه=روی routeها
-        path = getattr(r, "path", "")  # path=مسیر
-        methods = sorted(list(getattr(r, "methods", []) or []))  # methods=متدها
-        name = getattr(r, "name", "")  # name=نام
-        out.append({"path": path, "methods": methods, "name": name})  # افزودن=به خروجی
-    return {"items": out}  # پاسخ=لیست
-
-@app.get("/debug/users")  # مسیر=دیباگ کاربران
-async def debug_users():  # تابع=لیست کاربران
-    rows = await database.fetch_all(UserTable.__table__.select().order_by(UserTable.id.asc()))  # rows=همه کاربران
-    out: List[dict] = []  # out=خروجی
-    for r in rows:  # حلقه=روی کاربران
-        out.append({"id": int(r["id"]), "phone": str(r["phone"] or ""), "name": str(r["name"] or ""), "address": str(r["address"] or "")})  # افزودن=آیتم
-    return {"items": out}  # پاسخ=لیست
-
-
-
+    access = create_access_token(phone_norm)
+    refresh = create_refresh_token()
+    await database.execute(RefreshTokenTable.__table__.insert().values(user_id=int(db_user["id"]), token_hash=hash_refresh_token(refresh), expires_at=now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), revoked=False))
+    return {"status": "ok", "access_token": access, "refresh_token": refresh, "user": {"phone": phone_norm, "address": str(db_user["address"] or ""), "name": str(db_user["name"] or "")}}
+
+@app.get("/admin/requests/active")
+async def admin_active_requests(request: Request):
+    require_admin(request)
+    active = ["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]
+    rows = await database.fetch_all(RequestTable.__table__.select().where(RequestTable.status.in_(active)).order_by(RequestTable.id.desc()))
+    return unified_response("ok", "ACTIVE_REQUESTS", "active requests", {"items": [dict(r) for r in rows]})
+
+@app.get("/user_cars/{user_phone}")
+async def get_user_cars(user_phone: str, request: Request):
+    norm = require_user_phone(request, user_phone)
+    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+    return unified_response("ok", "USER_CARS", "cars list", {"items": user["car_list"] or []})
+
+@app.post("/user_cars")
+async def update_user_cars(body: CarListUpdateRequest, request: Request):
+    norm = require_user_phone(request, body.user_phone)
+    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+    cars_payload = [c.dict() for c in (body.car_list or [])]
+    await database.execute(UserTable.__table__.update().where(UserTable.phone == norm).values(car_list=cars_payload))
+    return unified_response("ok", "USER_CARS_UPDATED", "cars updated", {"count": len(cars_payload)})
+
+@app.post("/user/profile")
+async def update_profile(body: UserProfileUpdate, request: Request):
+    norm = require_user_phone(request, body.phone)
+    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+    await database.execute(UserTable.__table__.update().where(UserTable.phone == norm).values(name=str(body.name or "").strip(), address=str(body.address or "").strip()))
+    return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": norm})
+
+@app.get("/user/profile/{phone}")
+async def get_user_profile(phone: str, request: Request):
+    norm = require_user_phone(request, phone)
+    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+    return unified_response("ok", "PROFILE_FETCHED", "profile data", {"phone": norm, "name": str(user["name"] or ""), "address": str(user["address"] or "")})
+
+@app.post("/order")
+async def create_order(order: OrderRequest, request: Request):
+    norm = require_user_phone(request, order.user_phone)
+    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+    ins = RequestTable.__table__.insert().values(user_phone=norm, latitude=float(order.location.latitude), longitude=float(order.location.longitude), car_list=[car.dict() for car in (order.car_list or [])], address=str(order.address or "").strip(), home_number=str(order.home_number or "").strip(), service_type=str(order.service_type or "").strip().lower(), price=int(order.price), request_datetime=str(order.request_datetime or "").strip(), status="NEW", payment_type=str(order.payment_type or "").strip().lower(), service_place=str(order.service_place or "client").strip().lower(), driver_phone="", driver_name="").returning(RequestTable.id)
+    row = await database.fetch_one(ins)
+    new_id = int(row["id"]) if row and row["id"] else 0
+    try:
+        await notify_managers(title="سفارش جدید", body=f"سفارش جدید ثبت شد: {str(order.service_type or '')}", data={"order_id": str(new_id), "user_phone": norm, "service_type": str(order.service_type or ""), "status": "NEW"})
+    except Exception as e: logger.error(f"notify_managers(create_order) failed: {e}")
+    return unified_response("ok", "REQUEST_CREATED", "request created", {"id": new_id})
+
+@app.post("/cancel_order")
+async def cancel_order(cancel: CancelRequest, request: Request):
+    norm = require_user_phone(request, cancel.user_phone)
+    service = str(cancel.service_type or "").strip().lower()
+    if not service: raise HTTPException(status_code=400, detail="service_type required")
+    upd = RequestTable.__table__.update().where((RequestTable.user_phone == norm) & (RequestTable.service_type == service) & (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED"])) & (RequestTable.execution_start.is_(None))).values(status="CANCELED", scheduled_start=None, execution_start=None).returning(RequestTable.id, RequestTable.driver_phone)
+    rows = await database.fetch_all(upd)
+    if not rows: raise HTTPException(status_code=409, detail={"code": "CANNOT_CANCEL", "message": "cannot cancel"})
+    ids = [int(r["id"]) for r in rows]
+    drivers = list({str(r["driver_phone"] or "").strip() for r in rows if str(r["driver_phone"] or "").strip()})
+    await database.execute(ScheduleSlotTable.__table__.update().where((ScheduleSlotTable.request_id.in_(ids)) & (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))).values(status="REJECTED"))
+    await database.execute(AppointmentTable.__table__.update().where((AppointmentTable.request_id.in_(ids)) & (AppointmentTable.status == "BOOKED")).values(status="CANCELED"))
+    try:
+        await notify_managers(title="لغو سفارش", body=f"سفارش توسط کاربر لغو شد ({service})", data={"order_ids": ",".join(str(x) for x in ids), "user_phone": norm, "service_type": service, "status": "CANCELED"})
+        for dp in drivers:
+            await notify_managers(title="لغو سفارش", body=f"سفارش شما لغو شد (id={ids[0]})", data={"order_ids": ",".join(str(x) for x in ids), "status": "CANCELED"}, target_phone=_normalize_phone(dp))
+    except Exception as e: logger.error(f"notify_managers(cancel_order) failed: {e}")
+    return unified_response("ok", "ORDER_CANCELED", "canceled", {"count": len(ids)})
+
+@app.get("/user_active_services/{user_phone}")
+async def get_user_active_services(user_phone: str, request: Request):
+    norm = require_user_phone(request, user_phone)
+    rows = await database.fetch_all(RequestTable.__table__.select().where((RequestTable.user_phone == norm) & (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]))))
+    return unified_response("ok", "USER_ACTIVE_SERVICES", "active services", {"items": [dict(r) for r in rows]})
+
+@app.get("/user_orders/{user_phone}")
+async def get_user_orders(user_phone: str, request: Request):
+    norm = require_user_phone(request, user_phone)
+    rows = await database.fetch_all(RequestTable.__table__.select().where(RequestTable.user_phone == norm).order_by(RequestTable.id.desc()))
+    return unified_response("ok", "USER_ORDERS", "orders list", {"items": [dict(r) for r in rows]})
+
+@app.get("/user/{phone}/notifications")
+async def get_notifications(phone: str, request: Request, only_unread: bool = True, limit: int = 20, offset: int = 0):
+    norm = require_user_phone(request, phone)
+    q = NotificationTable.__table__.select().where(NotificationTable.user_phone == norm)
+    if only_unread: q = q.where(NotificationTable.read == False)
+    rows = await database.fetch_all(q.order_by(NotificationTable.created_at.desc()).limit(limit).offset(offset))
+    items = [{"id": int(r["id"]), "user_phone": str(r["user_phone"] or ""), "title": str(r["title"] or ""), "body": str(r["body"] or ""), "data": r["data"] or {}, "read": bool(r["read"]), "created_at": (r["created_at"].astimezone(timezone.utc).isoformat() if r["created_at"] else None)} for r in rows]
+    return unified_response("ok", "NOTIFICATIONS", "notifications", {"items": items})
+
+@app.post("/user/{phone}/notifications/{notif_id}/read")
+async def mark_notification_read(phone: str, notif_id: int, request: Request):
+    norm = require_user_phone(request, phone)
+    await database.execute(NotificationTable.__table__.update().where((NotificationTable.id == int(notif_id)) & (NotificationTable.user_phone == norm)).values(read=True, read_at=datetime.now(timezone.utc)))
+    return unified_response("ok", "NOTIFICATION_READ", "notification marked read", {"id": int(notif_id)})
+
+@app.post("/user/{phone}/notifications/mark_all_read")
+async def mark_all_notifications_read(phone: str, request: Request):
+    norm = require_user_phone(request, phone)
+    await database.execute(NotificationTable.__table__.update().where((NotificationTable.user_phone == norm) & (NotificationTable.read == False)).values(read=True, read_at=datetime.now(timezone.utc)))
+    return unified_response("ok", "ALL_NOTIFICATIONS_READ", "all marked read", {})
+
+async def provider_is_free(provider_phone: str, start: datetime, end: datetime, exclude_order_id: Optional[int] = None) -> bool:
+    provider = _normalize_phone(provider_phone)
+    if not provider: return False
+    one_hour = text("interval '1 hour'")
+    q_app = select(func.count()).select_from(AppointmentTable).where((AppointmentTable.provider_phone == provider) & (AppointmentTable.status == "BOOKED") & (AppointmentTable.start_time < end) & (AppointmentTable.end_time > start))
+    if exclude_order_id: q_app = q_app.where(AppointmentTable.request_id != int(exclude_order_id))
+    if int(await database.fetch_val(q_app) or 0) > 0: return False
+    
+    q_slot = select(func.count()).select_from(ScheduleSlotTable).where((ScheduleSlotTable.provider_phone == provider) & (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) & (ScheduleSlotTable.slot_start < end) & ((ScheduleSlotTable.slot_start + one_hour) > start))
+    if exclude_order_id: q_slot = q_slot.where(ScheduleSlotTable.request_id != int(exclude_order_id))
+    if int(await database.fetch_val(q_slot) or 0) > 0: return False
+
+    q_exec = select(func.count()).select_from(RequestTable).where((RequestTable.driver_phone == provider) & (RequestTable.execution_start.is_not(None)) & (RequestTable.status.in_(["IN_PROGRESS", "STARTED"])) & (RequestTable.execution_start < end) & ((RequestTable.execution_start + one_hour) > start))
+    if exclude_order_id: q_exec = q_exec.where(RequestTable.id != int(exclude_order_id))
+    if int(await database.fetch_val(q_exec) or 0) > 0: return False
+
+    q_visit = select(func.count()).select_from(RequestTable).where((RequestTable.driver_phone == provider) & (RequestTable.scheduled_start.is_not(None)) & (RequestTable.status.in_(["WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"])) & (RequestTable.scheduled_start < end) & ((RequestTable.scheduled_start + one_hour) > start))
+    if exclude_order_id: q_visit = q_visit.where(RequestTable.id != int(exclude_order_id))
+    if int(await database.fetch_val(q_visit) or 0) > 0: return False
+    return True
+
+@app.get("/busy_slots")
+async def get_busy_slots(request: Request, date: str, exclude_order_id: Optional[int] = None):
+    require_admin(request)
+    d = datetime.fromisoformat(str(date).strip()).date()
+    provider = get_admin_provider_phone(request)
+    start = datetime(d.year, d.month, d.day, 0, 0, tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    
+    q_sched = ScheduleSlotTable.__table__.select().where((ScheduleSlotTable.slot_start >= start) & (ScheduleSlotTable.slot_start < end) & (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) & (ScheduleSlotTable.provider_phone == provider))
+    if exclude_order_id: q_sched = q_sched.where(ScheduleSlotTable.request_id != int(exclude_order_id))
+    
+    q_app = AppointmentTable.__table__.select().where((AppointmentTable.start_time >= start) & (AppointmentTable.start_time < end) & (AppointmentTable.status == "BOOKED") & (AppointmentTable.provider_phone == provider))
+    if exclude_order_id: q_app = q_app.where(AppointmentTable.request_id != int(exclude_order_id))
+
+    q_exec = RequestTable.__table__.select().where((RequestTable.execution_start >= start) & (RequestTable.execution_start < end) & (RequestTable.execution_start.is_not(None)) & (RequestTable.status.in_(["IN_PROGRESS", "STARTED"])) & (RequestTable.driver_phone == provider))
+    if exclude_order_id: q_exec = q_exec.where(RequestTable.id != int(exclude_order_id))
+
+    q_visit = RequestTable.__table__.select().where((RequestTable.scheduled_start >= start) & (RequestTable.scheduled_start < end) & (RequestTable.scheduled_start.is_not(None)) & (RequestTable.status.in_(["ASSIGNED", "IN_PROGRESS", "STARTED", "WAITING"])) & (RequestTable.driver_phone == provider))
+    if exclude_order_id: q_visit = q_visit.where(RequestTable.id != int(exclude_order_id))
+
+    busy = set()
+    for r in await database.fetch_all(q_sched): busy.add(r["slot_start"].astimezone(timezone.utc).isoformat())
+    for r in await database.fetch_all(q_app): busy.add(r["start_time"].astimezone(timezone.utc).isoformat())
+    for r in await database.fetch_all(q_exec): busy.add(r["execution_start"].astimezone(timezone.utc).isoformat())
+    for r in await database.fetch_all(q_visit): busy.add(r["scheduled_start"].astimezone(timezone.utc).isoformat())
+    return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": sorted(list(busy))})
+
+@app.post("/order/{order_id}/propose_slots")
+async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Request):
+    require_admin(request)
+    provider = get_admin_provider_phone(request)
+    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    if not req: raise HTTPException(status_code=404, detail="order not found")
+    if req["status"] in ["FINISH", "CANCELED"] or req["execution_start"]: raise HTTPException(status_code=409, detail="cannot propose slots")
+    
+    slots = sorted(list(set(body.slots)))[:3]
+    if not slots: raise HTTPException(status_code=400, detail="slots required")
+    slot_dts = [parse_iso(x) for x in slots]
+    
+    async with database.transaction():
+        await database.execute(ScheduleSlotTable.__table__.update().where((ScheduleSlotTable.request_id == int(order_id)) & (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))).values(status="REJECTED"))
+        await database.execute(AppointmentTable.__table__.update().where((AppointmentTable.request_id == int(order_id)) & (AppointmentTable.status == "BOOKED")).values(status="CANCELED"))
+        await database.execute(RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(driver_phone=provider, status="WAITING", scheduled_start=None))
+        
+        for dt in slot_dts:
+            if not await provider_is_free(provider, dt, dt + timedelta(hours=1), exclude_order_id=int(order_id)):
+                raise HTTPException(status_code=409, detail="slot overlap")
+            try:
+                await database.execute(ScheduleSlotTable.__table__.insert().values(request_id=int(order_id), provider_phone=provider, slot_start=dt, status="PROPOSED", created_at=datetime.now(timezone.utc)))
+            except: raise HTTPException(status_code=409, detail="slot conflict")
+            
+    try:
+        await notify_user(phone=str(req["user_phone"]), title="پیشنهاد زمان بازدید", body="زمان‌های پیشنهادی برای بازدید ارسال شد.", data={"type": "visit_slots", "order_id": int(order_id), "status": "WAITING", "service_type": str(req["service_type"] or "")})
+    except Exception as e: logger.error(f"notify_user(propose_slots) failed: {e}")
+    return unified_response("ok", "SLOTS_PROPOSED", "slots proposed", {"accepted": [dt.isoformat() for dt in slot_dts]})
+
+@app.get("/order/{order_id}/proposed_slots")
+async def get_proposed_slots(order_id: int, request: Request):
+    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    if not req: raise HTTPException(status_code=404, detail="order not found")
+    require_user_phone(request, str(req["user_phone"]))
+    rows = await database.fetch_all(ScheduleSlotTable.__table__.select().where((ScheduleSlotTable.request_id == int(order_id)) & (ScheduleSlotTable.status == "PROPOSED")).order_by(ScheduleSlotTable.slot_start.asc()))
+    return unified_response("ok", "PROPOSED_SLOTS", "proposed slots", {"items": [r["slot_start"].astimezone(timezone.utc).isoformat() for r in rows]})
+
+@app.post("/order/{order_id}/confirm_slot")
+async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request):
+    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    if not req: raise HTTPException(status_code=404, detail="order not found")
+    require_user_phone(request, str(req["user_phone"]))
+    if req["execution_start"] or str(req["status"]).upper() not in ["WAITING", "ASSIGNED", "NEW"]: raise HTTPException(status_code=409, detail="cannot confirm")
+    
+    slot_dt = parse_iso(body.slot)
+    end_dt = slot_dt + timedelta(hours=1)
+    
+    async with database.transaction():
+        slot_row = await database.fetch_one(ScheduleSlotTable.__table__.select().where((ScheduleSlotTable.request_id == int(order_id)) & (ScheduleSlotTable.slot_start == slot_dt) & (ScheduleSlotTable.status == "PROPOSED")))
+        if not slot_row: raise HTTPException(status_code=404, detail="slot not found")
+        provider = _normalize_phone(str(slot_row["provider_phone"]))
+        if not await provider_is_free(provider, slot_dt, end_dt, int(order_id)): raise HTTPException(status_code=409, detail="overlap")
+        
+        await database.execute(AppointmentTable.__table__.update().where((AppointmentTable.request_id == int(order_id)) & (AppointmentTable.status == "BOOKED") & ((AppointmentTable.start_time != slot_dt) | (AppointmentTable.end_time != end_dt))).values(status="CANCELED"))
+        await database.execute(ScheduleSlotTable.__table__.update().where((ScheduleSlotTable.request_id == int(order_id)) & (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) & (ScheduleSlotTable.slot_start != slot_dt)).values(status="REJECTED"))
+        await database.execute(ScheduleSlotTable.__table__.update().where((ScheduleSlotTable.request_id == int(order_id)) & (ScheduleSlotTable.slot_start == slot_dt)).values(status="ACCEPTED"))
+        
+        exist = await database.fetch_one(AppointmentTable.__table__.select().where((AppointmentTable.provider_phone == provider) & (AppointmentTable.start_time == slot_dt)).limit(1))
+        if exist:
+            if str(exist["status"]) == "BOOKED" and int(exist["request_id"]) != int(order_id): raise HTTPException(status_code=409, detail="conflict")
+            await database.execute(AppointmentTable.__table__.update().where(AppointmentTable.id == int(exist["id"])).values(request_id=int(order_id), status="BOOKED"))
+        else:
+            await database.execute(AppointmentTable.__table__.insert().values(provider_phone=provider, request_id=int(order_id), start_time=slot_dt, end_time=end_dt, status="BOOKED", created_at=datetime.now(timezone.utc)))
+        
+        await database.execute(RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(scheduled_start=slot_dt, status="ASSIGNED", driver_phone=provider))
+        
+    try:
+        await notify_managers(title="تأیید زمان بازدید", body=f"کاربر زمان بازدید را تأیید کرد (order_id={int(order_id)}).", data=order_push_data(msg_type="time_confirm", order_id=int(order_id), status="ASSIGNED", service_type=str(req["service_type"] or ""), scheduled_start=slot_dt), target_phone=provider)
+    except Exception as e: logger.error(f"notify(confirm_slot) failed: {e}")
+    return unified_response("ok", "SLOT_CONFIRMED", "confirmed", {"start": slot_dt.isoformat(), "end": end_dt.isoformat()})
+
+@app.post("/order/{order_id}/reject_all_and_cancel")
+async def reject_all_and_cancel(order_id: int, request: Request):
+    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    if not req: raise HTTPException(status_code=404, detail="order not found")
+    require_user_phone(request, str(req["user_phone"]))
+    if req["execution_start"] or str(req["status"]).upper() not in ["NEW", "WAITING", "ASSIGNED"]: raise HTTPException(status_code=409, detail="cannot cancel")
+    
+    await database.execute(ScheduleSlotTable.__table__.update().where((ScheduleSlotTable.request_id == int(order_id)) & (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))).values(status="REJECTED"))
+    await database.execute(AppointmentTable.__table__.update().where((AppointmentTable.request_id == int(order_id)) & (AppointmentTable.status == "BOOKED")).values(status="CANCELED"))
+    await database.execute(RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(status="CANCELED", scheduled_start=None, execution_start=None))
+    
+    try:
+        await notify_managers(title="لغو سفارش", body=f"سفارش {int(order_id)} توسط کاربر لغو شد.", data={"order_id": int(order_id), "status": "CANCELED", "user_phone": _normalize_phone(str(req["user_phone"]))})
+    except Exception as e: logger.error(f"notify_managers(reject_all) failed: {e}")
+    return unified_response("ok", "ORDER_CANCELED", "canceled", {"order_id": int(order_id)})
+
+@app.post("/admin/order/{order_id}/price")
+async def admin_set_price(order_id: int, body: PriceBody, request: Request):
+    require_admin(request)
+    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    if not req: raise HTTPException(status_code=404, detail="order not found")
+    provider = _normalize_phone(str(req["driver_phone"] or ""))
+    new_status = "PRICE_REJECTED"
+    exec_dt = None
+    
+    async with database.transaction():
+        if body.agree:
+            if not body.exec_time or not provider: raise HTTPException(status_code=400, detail="exec_time/provider required")
+            exec_dt = parse_iso(str(body.exec_time))
+            end_dt = exec_dt + timedelta(hours=1)
+            if not await provider_is_free(provider, exec_dt, end_dt, int(order_id)): raise HTTPException(status_code=409, detail="overlap")
+            
+            exist = await database.fetch_one(AppointmentTable.__table__.select().where((AppointmentTable.provider_phone == provider) & (AppointmentTable.start_time == exec_dt)).limit(1))
+            if exist:
+                if str(exist["status"]) == "BOOKED" and int(exist["request_id"]) != int(order_id): raise HTTPException(status_code=409, detail="conflict")
+                await database.execute(AppointmentTable.__table__.update().where(AppointmentTable.id == int(exist["id"])).values(request_id=int(order_id), status="BOOKED"))
+            else:
+                await database.execute(AppointmentTable.__table__.insert().values(provider_phone=provider, request_id=int(order_id), start_time=exec_dt, end_time=end_dt, status="BOOKED", created_at=datetime.now(timezone.utc)))
+            new_status = "IN_PROGRESS"
+            
+        saved = await database.fetch_one(RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(price=int(body.price), status=new_status, execution_start=exec_dt).returning(RequestTable.id, RequestTable.price, RequestTable.status, RequestTable.execution_start))
+        
+    try:
+        title = "توافق قیمت" if body.agree else "عدم توافق قیمت"
+        msg = f"قیمت {int(body.price)} ثبت شد." if body.agree else "قیمت مورد توافق قرار نگرفت."
+        m_type = "execution_time" if body.agree else "price_set"
+        await notify_user(phone=str(req["user_phone"]), title=title, body=msg, data=order_push_data(msg_type=m_type, order_id=int(order_id), status=str(new_status), service_type=str(req["service_type"] or ""), scheduled_start=req["scheduled_start"], execution_start=exec_dt, price=int(body.price)))
+    except Exception as e: logger.error(f"notify_user(set_price) failed: {e}")
+    
+    return unified_response("ok", "PRICE_SET", "updated", {"order_id": saved["id"], "price": saved["price"], "status": saved["status"], "execution_start": (saved["execution_start"].astimezone(timezone.utc).isoformat() if saved["execution_start"] else None)})
+
+@app.post("/order/{order_id}/finish")
+async def finish_order(order_id: int, request: Request):
+    require_admin(request)
+    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    if not req: raise HTTPException(status_code=404, detail="order not found")
+    
+    async with database.transaction():
+        await database.execute(RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(status="FINISH", finish_datetime=datetime.now(timezone.utc).isoformat()))
+        await database.execute(AppointmentTable.__table__.update().where((AppointmentTable.request_id == int(order_id)) & (AppointmentTable.status == "BOOKED")).values(status="DONE"))
+        
+    try:
+        await notify_user(phone=str(req["user_phone"]), title="اتمام کار", body="سفارش شما انجام شد.", data={"type": "work_finished", "order_id": int(order_id), "status": "FINISH", "service_type": str(req["service_type"] or "")})
+    except Exception as e: logger.error(f"notify(finish) failed: {e}")
+    return unified_response("ok", "ORDER_FINISHED", "finished", {"order_id": int(order_id), "status": "FINISH"})
+
+@app.post("/admin/order/{order_id}/cancel")
+async def admin_cancel_order(order_id: int, request: Request):
+    require_admin(request)
+    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    if not req: raise HTTPException(status_code=404, detail="order not found")
+    
+    await database.execute(RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(status="CANCELED", scheduled_start=None, execution_start=None))
+    await database.execute(ScheduleSlotTable.__table__.update().where((ScheduleSlotTable.request_id == int(order_id)) & (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))).values(status="REJECTED"))
+    await database.execute(AppointmentTable.__table__.update().where((AppointmentTable.request_id == int(order_id)) & (AppointmentTable.status == "BOOKED")).values(status="CANCELED"))
+    
+    try:
+        await notify_user(phone=str(req["user_phone"]), title="لغو سفارش", body="سفارش شما توسط مدیر لغو شد.", data={"type": "order_canceled", "order_id": int(order_id), "status": "CANCELED", "service_type": str(req["service_type"] or ""), "canceled_by": "manager"})
+    except Exception as e: logger.error(f"notify(admin_cancel) failed: {e}")
+    return unified_response("ok", "ORDER_CANCELED", "canceled by admin", {"order_id": int(order_id), "status": "CANCELED"})
+
+@app.get("/debug/users")
+async def debug_users():
+    rows = await database.fetch_all(UserTable.__table__.select().order_by(UserTable.id.asc()))
+    return {"items": [{"id": r["id"], "phone": r["phone"]} for r in rows]}
