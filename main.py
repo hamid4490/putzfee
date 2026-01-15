@@ -219,6 +219,54 @@ def get_admin_provider_phone(request: Request) -> str:  # تابع=گرفتن ش
         return sorted(list(ADMIN_PHONES_SET))[0]  # خروجی=اولین شماره
     raise HTTPException(status_code=400, detail="admin provider phone not available")  # خطا=۴۰۰
 
+
+
+
+def _load_service_account() -> Optional[dict]:  # تابع=خواندن service account (نسخه دیباگ)
+    # 1. تلاش برای خواندن از Base64 (اولویت دارد)
+    b64_val = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON_B64", "").strip()
+    if b64_val:
+        try:
+            raw_decoded = base64.b64decode(b64_val).decode("utf-8")
+            data = json.loads(raw_decoded)
+            if "client_email" in data and "private_key" in data:
+                pk = str(data.get("private_key", ""))
+                if "\\n" in pk:
+                    data["private_key"] = pk.replace("\\n", "\n")
+                logger.info("Service Account loaded successfully from Base64")
+                return data
+            else:
+                logger.error("Service Account loaded from Base64 but missing client_email or private_key")
+        except Exception as e:
+            logger.error(f"Failed to load Service Account from Base64: {e}")
+
+    # 2. تلاش برای خواندن از JSON Raw (اگر B64 نبود یا ناموفق بود)
+    raw_val = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+    # پشتیبانی از نام قدیمی
+    if not raw_val:
+        raw_val = os.getenv("GOOGLE_APPLICATIONS_CREDENTIALS_JSON", "").strip()
+
+    if raw_val:
+        try:
+            data = json.loads(raw_val)
+            if "client_email" in data and "private_key" in data:
+                pk = str(data.get("private_key", ""))
+                if "\\n" in pk:
+                    data["private_key"] = pk.replace("\\n", "\n")
+                logger.info("Service Account loaded successfully from JSON Raw")
+                return data
+            else:
+                logger.error("Service Account loaded from JSON Raw but missing client_email or private_key")
+        except Exception as e:
+            logger.error(f"Failed to load Service Account from JSON Raw: {e}")
+
+    logger.error("No valid Service Account found (Check GOOGLE_APPLICATION_CREDENTIALS_JSON_B64)")
+    return None
+
+
+
+
+
 # -------------------- ORM models --------------------  # بخش=مدل‌های دیتابیس
 class UserTable(Base):  # کلاس=جدول کاربران
     __tablename__ = "users"  # نام جدول=users
@@ -2086,4 +2134,5 @@ async def debug_users():  # تابع=لیست کاربران
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": int(r["id"]), "phone": str(r["phone"] or ""), "name": str(r["name"] or ""), "address": str(r["address"] or "")})  # افزودن=آیتم
     return {"items": out}  # پاسخ=لیست
+
 
