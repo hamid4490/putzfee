@@ -966,6 +966,167 @@ async def login_user(user: UserLoginRequest, request: Request):  # تابع=ور
         }  # پایان user
     }  # پایان پاسخ
 
+# -------------------- Admin Login --------------------  # بخش=ورود مدیر
+
+class AdminLoginRequest(BaseModel):  # کلاس=مدل ورودی ورود مدیر
+    phone: str  # فیلد=شماره موبایل
+    password: str  # فیلد=رمز عبور
+
+@app.post("/admin/login")  # مسیر=ورود مدیر
+async def admin_login(body: AdminLoginRequest, request: Request):  # تابع=ورود مدیر
+    now = datetime.now(timezone.utc)  # now=زمان فعلی UTC
+    client_ip = get_client_ip(request)  # client_ip=آی‌پی کلاینت
+
+    raw_phone = str(body.phone or "").strip()  # raw_phone=شماره خام ورودی
+    phone_norm = _normalize_phone(raw_phone)  # phone_norm=شماره نرمال‌شده
+    if not phone_norm:  # شرط=شماره نامعتبر
+        raise HTTPException(status_code=400, detail="invalid phone")  # خطا=شماره نامعتبر
+
+    # ——— بررسی اینکه شماره در لیست مدیران هست یا نه ———  # توضیح=امنیت
+    if phone_norm not in ADMIN_PHONES_SET:  # شرط=شماره مدیر نیست
+        raise HTTPException(  # خطا=پیام عمومی برای امنیت
+            status_code=401,  # کد=۴۰۱
+            detail={"code": "WRONG_PASSWORD", "remaining_attempts": 0}  # detail=پیام امن
+        )  # پایان خطا
+
+    # ——— Rate Limiting (مشابه /login) ———  # توضیح=جلوگیری از حمله brute-force
+    sel_att = LoginAttemptTable.__table__.select().where(  # sel_att=کوئری تلاش ورود
+        (LoginAttemptTable.phone == phone_norm) &  # شرط=شماره
+        (LoginAttemptTable.ip == client_ip)  # شرط=ip
+    )  # پایان where
+    att = await database.fetch_one(sel_att)  # att=ردیف تلاش
+
+    if not att:  # شرط=نبود ردیف تلاش
+        await database.execute(  # اجرا=ایجاد ردیف جدید
+            LoginAttemptTable.__table__.insert().values(  # insert=مقادیر
+                phone=phone_norm,  # phone=شماره
+                ip=client_ip,  # ip=آی‌پی
+                attempt_count=0,  # attempt_count=صفر
+                window_start=now,  # window_start=اکنون
+                locked_until=None,  # locked_until=بدون قفل
+                last_attempt_at=now,  # last_attempt_at=اکنون
+                created_at=now  # created_at=اکنون
+            )  # پایان values
+        )  # پایان execute
+        att = await database.fetch_one(sel_att)  # att=خواندن مجدد
+    else:  # حالت=ردیف موجود
+        locked_until = att["locked_until"]  # locked_until=زمان قفل
+        if locked_until is not None and locked_until > now:  # شرط=قفل فعال
+            lock_remaining = int((locked_until - now).total_seconds())  # lock_remaining=ثانیه باقیمانده
+            raise HTTPException(  # خطا=۴۲۹
+                status_code=429,  # کد=429
+                detail={"code": "RATE_LIMITED", "lock_remaining": lock_remaining},  # detail=قفل
+                headers={"Retry-After": str(lock_remaining), "X-Remaining-Attempts": "0"}  # headers=هدرها
+            )  # پایان raise
+
+        window_start = att["window_start"] or now  # window_start=شروع پنجره
+        window_age = (now - window_start).total_seconds()  # window_age=سن پنجره
+        if window_age > LOGIN_WINDOW_SECONDS or (locked_until is not None and locked_until <= now):  # شرط=ریست پنجره
+            await database.execute(  # اجرا=ریست شمارنده
+                LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
+                    attempt_count=0,  # attempt_count=صفر
+                    window_start=now,  # window_start=اکنون
+                    locked_until=None,  # locked_until=پاک
+                    last_attempt_at=now  # last_attempt_at=اکنون
+                )  # پایان values
+            )  # پایان execute
+            att = await database.fetch_one(sel_att)  # att=خواندن مجدد
+
+    # ——— جستجوی مدیر در دیتابیس ———  # توضیح=بررسی ثبت‌نام قبلی
+    db_user = await database.fetch_one(  # db_user=کاربر از دیتابیس
+        UserTable.__table__.select().where(UserTable.phone == phone_norm)  # select=بر اساس شماره
+    )  # پایان fetch_one
+
+    password_raw = str(body.password or "").strip()  # password_raw=رمز ورودی
+    if not password_raw:  # شرط=رمز خالی
+        raise HTTPException(status_code=400, detail="password required")  # خطا=رمز لازم
+
+    if not db_user:  # شرط=مدیر هنوز ثبت‌نام نکرده (اولین ورود)
+        # ——— ثبت‌نام خودکار مدیر ———  # توضیح=ذخیره رمز برای دفعات بعد
+        password_hash = bcrypt_hash_password(password_raw)  # password_hash=هش رمز
+        await database.execute(  # اجرا=درج کاربر جدید
+            UserTable.__table__.insert().values(  # insert=مقادیر
+                phone=phone_norm,  # phone=شماره نرمال
+                password_hash=password_hash,  # password_hash=هش رمز
+                address="",  # address=خالی
+                name="Manager",  # name=نام پیش‌فرض
+                car_list=[]  # car_list=لیست خالی
+            )  # پایان values
+        )  # پایان execute
+        db_user = await database.fetch_one(  # db_user=خواندن کاربر جدید
+            UserTable.__table__.select().where(UserTable.phone == phone_norm)  # select=شماره
+        )  # پایان fetch_one
+    else:  # حالت=مدیر قبلاً ثبت‌نام کرده
+        # ——— بررسی رمز ———  # توضیح=چک رمز ذخیره‌شده
+        if not verify_password_secure(password_raw, db_user["password_hash"]):  # شرط=رمز اشتباه
+            cur_count = int(att["attempt_count"] or 0) + 1  # cur_count=تلاش جدید
+            remaining = max(0, LOGIN_MAX_ATTEMPTS - cur_count)  # remaining=باقی‌مانده
+
+            if cur_count >= LOGIN_MAX_ATTEMPTS:  # شرط=قفل
+                locked_until_new = now + timedelta(seconds=LOGIN_LOCK_SECONDS)  # locked_until_new=زمان قفل
+                lock_remaining = int((locked_until_new - now).total_seconds())  # lock_remaining=ثانیه
+                await database.execute(  # اجرا=ثبت قفل
+                    LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
+                        attempt_count=cur_count,  # attempt_count=تلاش
+                        locked_until=locked_until_new,  # locked_until=قفل
+                        last_attempt_at=now  # last_attempt_at=اکنون
+                    )  # پایان values
+                )  # پایان execute
+                raise HTTPException(  # خطا=۴۲۹
+                    status_code=429,  # کد=429
+                    detail={"code": "RATE_LIMITED", "lock_remaining": lock_remaining},  # detail=قفل
+                    headers={"Retry-After": str(lock_remaining), "X-Remaining-Attempts": "0"}  # headers=هدرها
+                )  # پایان raise
+
+            await database.execute(  # اجرا=ثبت تلاش ناموفق
+                LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
+                    attempt_count=cur_count,  # attempt_count=تلاش جدید
+                    last_attempt_at=now  # last_attempt_at=اکنون
+                )  # پایان values
+            )  # پایان execute
+
+            raise HTTPException(  # خطا=۴۰۱
+                status_code=401,  # کد=401
+                detail={"code": "WRONG_PASSWORD", "remaining_attempts": int(remaining)},  # detail=رمز اشتباه
+                headers={"X-Remaining-Attempts": str(int(remaining))}  # headers=باقی‌مانده
+            )  # پایان raise
+
+    # ——— ریست تلاش‌ها پس از ورود موفق ———  # توضیح=پاکسازی شمارنده
+    await database.execute(  # اجرا=ریست
+        LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(  # update=by id
+            attempt_count=0,  # attempt_count=صفر
+            window_start=now,  # window_start=اکنون
+            locked_until=None,  # locked_until=پاک
+            last_attempt_at=now  # last_attempt_at=اکنون
+        )  # پایان values
+    )  # پایان execute
+
+    # ——— صدور توکن‌ها ———  # توضیح=ساخت access و refresh
+    access_token = create_access_token(phone_norm)  # access_token=توکن دسترسی
+    refresh_token = create_refresh_token()  # refresh_token=توکن رفرش
+    refresh_hash = hash_refresh_token(refresh_token)  # refresh_hash=هش رفرش
+    refresh_exp = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)  # refresh_exp=انقضای رفرش
+
+    await database.execute(  # اجرا=درج رفرش توکن
+        RefreshTokenTable.__table__.insert().values(  # insert=مقادیر
+            user_id=int(db_user["id"]),  # user_id=شناسه کاربر
+            token_hash=refresh_hash,  # token_hash=هش
+            expires_at=refresh_exp,  # expires_at=انقضا
+            revoked=False  # revoked=ابطال نشده
+        )  # پایان values
+    )  # پایان execute
+
+    return {  # پاسخ=فرمت مورد انتظار اپ مدیر
+        "status": "ok",  # status=ok
+        "access_token": access_token,  # access_token=توکن دسترسی
+        "refresh_token": refresh_token,  # refresh_token=توکن رفرش
+        "user": {  # user=اطلاعات کاربر
+            "phone": phone_norm,  # phone=شماره
+            "address": str(db_user["address"] or ""),  # address=آدرس
+            "name": str(db_user["name"] or "")  # name=نام
+        }  # پایان user
+    }  # پایان پاسخ
+    
 # -------------------- Admin: active requests --------------------  # بخش=ادمین لیست سفارش‌های فعال
 
 @app.get("/admin/requests/active")  # مسیر=فعال‌ها بدون اسلش
@@ -1925,3 +2086,4 @@ async def debug_users():  # تابع=لیست کاربران
     for r in rows:  # حلقه=روی کاربران
         out.append({"id": int(r["id"]), "phone": str(r["phone"] or ""), "name": str(r["name"] or ""), "address": str(r["address"] or "")})  # افزودن=آیتم
     return {"items": out}  # پاسخ=لیست
+
