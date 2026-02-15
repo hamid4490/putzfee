@@ -76,35 +76,51 @@ Base = declarative_base()  # Base=ریشه ORM
 
 # -------------------- Helpers: phone --------------------  # بخش=نرمال‌سازی شماره
 def _normalize_phone(p: str) -> str:  # تابع=نرمال‌سازی شماره به فرم یکتا
-    raw = str(p or "").strip()  # raw=ورودی trim
-    if not raw: return ""  # خالی
+    raw = str(p or "").strip()  # raw=تبدیل ورودی به رشته و حذف فاصله‌های ابتدا/انتها
+    if not raw:  # شرط=اگر ورودی خالی بود
+        return ""  # خروجی=رشته خالی
 
-    cleaned = "".join(ch for ch in raw if ch.isdigit() or ch == "+")  # فقط رقم و +
-    if not cleaned: return ""
+    cleaned = "".join(ch for ch in raw if ch.isdigit() or ch == "+")  # cleaned=فقط نگه‌داشتن رقم‌ها و علامت +
+    if not cleaned:  # شرط=اگر بعد از پاکسازی چیزی نماند
+        return ""  # خروجی=رشته خالی
 
-    if cleaned.startswith("+"): cleaned = cleaned[1:]
-    if cleaned.startswith("00"): cleaned = cleaned[2:]
+    if cleaned.startswith("+"):  # شرط=اگر با + شروع می‌شود
+        cleaned = cleaned[1:]  # cleaned=حذف + از ابتدای شماره
 
-    digits = "".join(ch for ch in cleaned if ch.isdigit())
-    if not digits: return ""
+    if cleaned.startswith("00"):  # شرط=اگر با 00 شروع می‌شود
+        cleaned = cleaned[2:]  # cleaned=حذف 00 از ابتدای شماره
 
-    if digits.startswith("98") and len(digits) >= 12:
-        tail10 = digits[-10:]
-        if tail10.startswith("9"): return "0" + tail10
+    digits = "".join(ch for ch in cleaned if ch.isdigit())  # digits=فقط رقم‌ها
+    if not digits:  # شرط=اگر رقم خالی شد
+        return ""  # خروجی=رشته خالی
 
-    if digits.startswith("9") and len(digits) == 10:
-        return "0" + digits
+    if digits.startswith("98") and len(digits) >= 12:  # شرط=اگر با 98 شروع شد و طول کافی داشت
+        tail10 = digits[-10:]  # tail10=۱۰ رقم انتهایی شماره
+        if tail10.startswith("9"):  # شرط=اگر ۱۰ رقم انتهایی با 9 شروع شد
+            return "0" + tail10  # خروجی=تبدیل به فرمت ۰۹xxxxxxxxx
 
-    return digits
+    if digits.startswith("9") and len(digits) == 10:  # شرط=اگر ۱۰ رقم و با 9 شروع شد
+        return "0" + digits  # خروجی=اضافه کردن 0 ابتدای شماره
 
-def _parse_admin_phones(s: str) -> set[str]:  # تابع=تبدیل env مدیران به set
-    out: set[str] = set()
-    for part in (s or "").split(","):
-        vv = _normalize_phone(part.strip())
-        if vv: out.add(vv)
-    return out
+    return digits  # خروجی=برگرداندن رقم‌ها به همان شکل
 
-ADMIN_PHONES_SET = _parse_admin_phones(ADMIN_PHONES_ENV)  # مقدار=set مدیران
+
+def _parse_admin_phones(s: str) -> set[str]:  # تابع=تبدیل ADMIN_PHONES env به set با جداکننده‌های مختلف
+    out: set[str] = set()  # out=ست خروجی برای شماره‌های مدیر
+    raw = str(s or "").strip()  # raw=متن ورودی بعد از trim
+    if not raw:  # شرط=اگر ورودی خالی بود
+        return out  # خروجی=ست خالی
+
+    parts = re.split(r"[,\s;]+", raw)  # parts=تقسیم بر اساس کاما/فاصله/سطرجدید/سمی‌کالن
+    for part in parts:  # حلقه=روی هر بخش جداشده
+        vv = _normalize_phone(part.strip())  # vv=شماره نرمال‌شده هر بخش
+        if vv:  # شرط=اگر شماره معتبر بود
+            out.add(vv)  # add=افزودن شماره به ست
+
+    return out  # خروجی=ست نهایی شماره‌های مدیر
+
+
+ADMIN_PHONES_SET = _parse_admin_phones(ADMIN_PHONES_ENV)  # مقدار=ساخت set مدیران از envمدیران از env
 
 # -------------------- Helpers: time (UTC only) --------------------  # بخش=زمان UTC
 def parse_iso(ts: str) -> datetime:  # تابع=پارس ISO با timezone
@@ -1131,5 +1147,6 @@ async def admin_cancel_order(order_id: int, request: Request):
 async def debug_users():
     rows = await database.fetch_all(UserTable.__table__.select().order_by(UserTable.id.asc()))
     return {"items": [{"id": r["id"], "phone": r["phone"]} for r in rows]}
+
 
 
