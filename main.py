@@ -1909,7 +1909,6 @@ async def submit_review(order_id: int, body: ReviewSubmitBody, request: Request)
 
     return unified_response("ok", "REVIEW_SUBMITTED", "review submitted", {"order_id": int(order_id)})
 
-// میانگین نظرات
 @app.get("/admin/reviews")
 async def admin_list_reviews(request: Request, status: str = "APPROVED", limit: int = 50, offset: int = 0):
     require_admin(request)
