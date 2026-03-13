@@ -1972,7 +1972,6 @@ async def admin_list_reviews(request: Request, status: str = "APPROVED", limit: 
     })
 
 
-// رد یا تأیید توسط مدیر
 @app.post("/admin/reviews/{review_id}/decide")
 async def admin_decide_review(review_id: int, body: ReviewDecisionBody, request: Request):
     require_admin(request)
