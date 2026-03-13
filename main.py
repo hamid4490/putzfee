@@ -741,6 +741,58 @@ app.add_middleware(
 )
 
 # -------------------- Startup / Shutdown --------------------
+@app.get("/reviews")
+async def public_reviews(limit: int = 50, offset: int = 0):
+    reviews = ReviewTable.__table__
+    users = UserTable.__table__
+
+    q = (
+        select(
+            reviews.c.id,
+            reviews.c.request_id,
+            reviews.c.user_phone,
+            reviews.c.rating,
+            reviews.c.comment,
+            reviews.c.status,
+            reviews.c.created_at,
+            users.c.name.label("user_name"),
+        )
+        .select_from(reviews.outerjoin(users, users.c.phone == reviews.c.user_phone))
+        .where(reviews.c.status == "APPROVED")
+        .order_by(reviews.c.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+    rows = await database.fetch_all(q)
+    items = []
+    for r in rows:
+        items.append({
+            "id": int(r["id"]),
+            "request_id": int(r["request_id"]),
+            "user_phone": str(r["user_phone"] or ""),
+            "user_name": str(r["user_name"] or ""),
+            "rating": int(r["rating"] or 0),
+            "comment": str(r["comment"] or ""),
+            "created_at": (r["created_at"].astimezone(timezone.utc).isoformat() if r["created_at"] else None),
+        })
+
+    avg_val = await database.fetch_val(
+        select(func.avg(ReviewTable.__table__.c.rating)).where(ReviewTable.__table__.c.status == "APPROVED")
+    )
+    count_val = await database.fetch_val(
+        select(func.count()).select_from(ReviewTable.__table__).where(ReviewTable.__table__.c.status == "APPROVED")
+    )
+
+    avg = float(avg_val) if avg_val is not None else None
+    count = int(count_val or 0)
+
+    return unified_response("ok", "PUBLIC_REVIEWS", "reviews", {
+        "items": items,
+        "avg_rating": avg,
+        "count": count,
+    })
+    
 @app.on_event("startup")
 async def startup() -> None:
     if not DATABASE_URL:
