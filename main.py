@@ -219,6 +219,22 @@ def get_admin_provider_phone(request: Request) -> str:
     raise HTTPException(status_code=400, detail="admin provider phone not available")
 
 # -------------------- ORM models --------------------
+class ReviewTable(Base):
+    __tablename__ = "reviews"
+    id = Column(Integer, primary_key=True, index=True)
+
+    request_id = Column(Integer, ForeignKey("requests.id"), unique=True, index=True)
+    user_phone = Column(String, index=True)
+
+    rating = Column(Integer)  # 1..5
+    comment = Column(String, default="")
+
+    status = Column(String, default="PENDING", index=True)  # PENDING | APPROVED | REJECTED
+
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    decided_at = Column(DateTime(timezone=True), nullable=True)
+    decided_by = Column(String, nullable=True)  # admin phone (optional)
+    
 class UserTable(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -409,6 +425,13 @@ class LogoutRequest(BaseModel):
 class RefreshAccessRequest(BaseModel):
     refresh_token: str
 
+class ReviewSubmitBody(BaseModel):
+    rating: int
+    comment: Optional[str] = ""
+
+class ReviewDecisionBody(BaseModel):
+    approve: bool
+    
 # -------------------- Push helpers --------------------
 _FCM_OAUTH_TOKEN = ""
 _FCM_OAUTH_EXP = 0.0
@@ -1833,3 +1856,139 @@ async def admin_cancel_order(order_id: int, request: Request):
 async def debug_users():
     rows = await database.fetch_all(UserTable.__table__.select().order_by(UserTable.id.asc()))
     return {"items": [{"id": r["id"], "phone": r["phone"]} for r in rows]}
+
+
+@app.post("/order/{order_id}/review/submit")
+async def submit_review(order_id: int, body: ReviewSubmitBody, request: Request):
+    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    if not req:
+        raise HTTPException(status_code=404, detail="order not found")
+
+    norm = require_user_phone(request, str(req["user_phone"]))
+    status = str(req["status"] or "").strip().upper()
+    if status not in ["FINISH", "DONE", "COMPLETED", "FINISHED"]:
+        raise HTTPException(status_code=409, detail="order is not finished")
+
+    rating = int(body.rating or 0)
+    if rating < 1 or rating > 5:
+        raise HTTPException(status_code=400, detail="rating must be 1..5")
+
+    comment = str(body.comment or "").strip()
+
+    existing = await database.fetch_one(
+        ReviewTable.__table__.select().where(ReviewTable.request_id == int(order_id))
+    )
+
+    if existing:
+        # اگر قبلاً ثبت کرده بود و هنوز تایید نشده، آپدیت کن
+        await database.execute(
+            ReviewTable.__table__.update()
+            .where(ReviewTable.request_id == int(order_id))
+            .values(
+                rating=rating,
+                comment=comment,
+                status="PENDING",
+                created_at=datetime.now(timezone.utc),
+                decided_at=None,
+                decided_by=None,
+            )
+        )
+    else:
+        await database.execute(
+            ReviewTable.__table__.insert().values(
+                request_id=int(order_id),
+                user_phone=norm,
+                rating=rating,
+                comment=comment,
+                status="PENDING",
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+
+    # (اختیاری) می‌توانی به مدیر نوتیف بفرستی که نظر جدید برای تایید آمده
+
+    return unified_response("ok", "REVIEW_SUBMITTED", "review submitted", {"order_id": int(order_id)})
+
+// میانگین نظرات
+@app.get("/admin/reviews")
+async def admin_list_reviews(request: Request, status: str = "APPROVED", limit: int = 50, offset: int = 0):
+    require_admin(request)
+
+    st = str(status or "APPROVED").strip().upper()
+    if st not in ["PENDING", "APPROVED", "REJECTED"]:
+        st = "APPROVED"
+
+    reviews = ReviewTable.__table__
+    users = UserTable.__table__
+
+    q = (
+        select(
+            reviews.c.id,
+            reviews.c.request_id,
+            reviews.c.user_phone,
+            reviews.c.rating,
+            reviews.c.comment,
+            reviews.c.status,
+            reviews.c.created_at,
+            users.c.name.label("user_name"),
+        )
+        .select_from(reviews.outerjoin(users, users.c.phone == reviews.c.user_phone))
+        .where(reviews.c.status == st)
+        .order_by(reviews.c.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+    rows = await database.fetch_all(q)
+    items = []
+    for r in rows:
+        items.append({
+            "id": int(r["id"]),
+            "request_id": int(r["request_id"]),
+            "user_phone": str(r["user_phone"] or ""),
+            "user_name": str(r["user_name"] or ""),
+            "rating": int(r["rating"] or 0),
+            "comment": str(r["comment"] or ""),
+            "status": str(r["status"] or ""),
+            "created_at": (r["created_at"].astimezone(timezone.utc).isoformat() if r["created_at"] else None),
+        })
+
+    avg = None
+    count = 0
+    if st == "APPROVED":
+        avg_val = await database.fetch_val(
+            select(func.avg(ReviewTable.__table__.c.rating)).where(ReviewTable.__table__.c.status == "APPROVED")
+        )
+        count_val = await database.fetch_val(
+            select(func.count()).select_from(ReviewTable.__table__).where(ReviewTable.__table__.c.status == "APPROVED")
+        )
+        count = int(count_val or 0)
+        avg = float(avg_val) if avg_val is not None else None
+
+    return unified_response("ok", "REVIEWS", "reviews", {
+        "items": items,
+        "avg_rating": avg,
+        "count": count,
+        "status": st,
+    })
+
+
+// رد یا تأیید توسط مدیر
+@app.post("/admin/reviews/{review_id}/decide")
+async def admin_decide_review(review_id: int, body: ReviewDecisionBody, request: Request):
+    require_admin(request)
+
+    row = await database.fetch_one(ReviewTable.__table__.select().where(ReviewTable.id == int(review_id)))
+    if not row:
+        raise HTTPException(status_code=404, detail="review not found")
+
+    new_status = "APPROVED" if body.approve else "REJECTED"
+    decided_by = get_admin_provider_phone(request)
+
+    await database.execute(
+        ReviewTable.__table__.update()
+        .where(ReviewTable.id == int(review_id))
+        .values(status=new_status, decided_at=datetime.now(timezone.utc), decided_by=decided_by)
+    )
+
+    return unified_response("ok", "REVIEW_DECIDED", "decided", {"id": int(review_id), "status": new_status})
