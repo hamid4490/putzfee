@@ -998,14 +998,15 @@ async def admin_upsert_service(
             .values(**patch)
         )
     else:
-        # اگر icon نیومد، مقدار خالی می‌مونه
+        vals = dict(patch)
+        vals["service_type"] = svc
+
+        # اگر آیکون نفرستادند، ستون‌ها خالی بمانند (تا insert ارور ندهد)
+        vals.setdefault("icon_path", "")
+        vals.setdefault("icon_mime", "")
+
         await database.execute(
-            ServicePriceTable.__table__.insert().values(
-                service_type=svc,
-                icon_path=patch.get("icon_path", ""),
-                icon_mime=patch.get("icon_mime", ""),
-                **patch
-            )
+            ServicePriceTable.__table__.insert().values(**vals)
         )
 
     return unified_response("ok", "SERVICE_UPSERTED", "saved", {"service_type": svc})
