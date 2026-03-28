@@ -67,6 +67,9 @@ MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "1000000"))  # 1MB default
 os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(os.path.join(MEDIA_DIR, "users"), exist_ok=True)
 os.makedirs(os.path.join(MEDIA_DIR, "promotions"), exist_ok=True)
+os.makedirs(os.path.join(MEDIA_DIR, "users"), exist_ok=True)
+os.makedirs(os.path.join(MEDIA_DIR, "promotions"), exist_ok=True)
+os.makedirs(os.path.join(MEDIA_DIR, "services"), exist_ok=True)
 
 # -------------------- Logger --------------------
 logger = logging.getLogger("putz.push")
@@ -425,7 +428,6 @@ class DeviceTokenTable(Base):
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     __table_args__ = (Index("ix_tokens_role_platform", "role", "platform"),)
 
-# new: promotions
 class PromotionTable(Base):
     __tablename__ = "promotions"
     id = Column(Integer, primary_key=True, index=True)
@@ -439,12 +441,24 @@ class PromotionTable(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
-# new: base prices
 class ServicePriceTable(Base):
     __tablename__ = "service_prices"
     id = Column(Integer, primary_key=True, index=True)
-    service_type = Column(String, unique=True, index=True)
+
+    service_type = Column(String, unique=True, index=True)  # carwash, ...
     base_price = Column(Integer, default=0)
+
+    # NEW: service catalog fields
+    active = Column(Boolean, default=True, index=True)
+    sort_order = Column(Integer, default=0, index=True)
+
+    # {"fa":"کارواش", "en":"Car wash", "de":"Autowäsche"}
+    name_i18n = Column(JSONB, default=dict)
+
+    # icon stored on server FS
+    icon_path = Column(String, default="")
+    icon_mime = Column(String, default="")
+
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 # -------------------- Pydantic models --------------------
@@ -852,10 +866,16 @@ async def startup() -> None:
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_path TEXT DEFAULT '';"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_mime VARCHAR DEFAULT '';"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_updated_at TIMESTAMPTZ NULL;"))
-
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS service_types JSONB DEFAULT '[]'::jsonb;"))
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS preferred_slots JSONB DEFAULT '[]'::jsonb;"))
 
+        conn.execute(text("ALTER TABLE service_prices ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;"))
+        conn.execute(text("ALTER TABLE service_prices ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0;"))
+        conn.execute(text("ALTER TABLE service_prices ADD COLUMN IF NOT EXISTS name_i18n JSONB DEFAULT '{}'::jsonb;"))
+        conn.execute(text("ALTER TABLE service_prices ADD COLUMN IF NOT EXISTS icon_path TEXT DEFAULT '';"))
+        conn.execute(text("ALTER TABLE service_prices ADD COLUMN IF NOT EXISTS icon_mime VARCHAR DEFAULT '';"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_service_prices_active_sort ON service_prices (active, sort_order);"))
+    
     await database.connect()
 
 @app.on_event("shutdown")
@@ -900,6 +920,96 @@ async def refresh_access(body: RefreshAccessRequest):
     access = create_access_token(_normalize_phone(user["phone"]))
     return unified_response("ok", "ACCESS_REFRESHED", "access token refreshed", {"access_token": access})
 
+@app.get("/admin/services")
+async def admin_list_services(request: Request):
+    require_admin(request)
+
+    rows = await database.fetch_all(
+        ServicePriceTable.__table__
+        .select()
+        .order_by(ServicePriceTable.__table__.c.sort_order.asc(), ServicePriceTable.__table__.c.service_type.asc())
+    )
+
+    items = []
+    for r in rows:
+        items.append({
+            "service_type": str(r["service_type"] or ""),
+            "base_price": int(r["base_price"] or 0),
+            "active": bool(r["active"]),
+            "sort_order": int(r["sort_order"] or 0),
+            "name_i18n": r["name_i18n"] or {},
+            "icon_url": _media_url(str(r["icon_path"] or "")),
+            "updated_at": (r["updated_at"].astimezone(timezone.utc).isoformat() if r["updated_at"] else None),
+        })
+
+    return unified_response("ok", "ADMIN_SERVICES", "services", {"items": items})
+
+@app.post("/admin/services")
+async def admin_upsert_service(
+    request: Request,
+    service_type: str = Form(...),
+    base_price: int = Form(0),
+    active: bool = Form(True),
+    sort_order: int = Form(0),
+    name_i18n: str = Form("{}"),   # JSON string
+    icon: Optional[UploadFile] = File(None),
+):
+    require_admin(request)
+
+    svc = str(service_type or "").strip().lower()
+    if not svc:
+        raise HTTPException(status_code=400, detail="service_type required")
+
+    bp = int(base_price or 0)
+    if bp < 0:
+        raise HTTPException(status_code=400, detail="base_price must be >= 0")
+
+    try:
+        nm = json.loads(name_i18n or "{}")
+        if not isinstance(nm, dict):
+            raise ValueError()
+    except Exception:
+        raise HTTPException(status_code=400, detail="name_i18n must be JSON object string")
+
+    existing = await database.fetch_one(ServicePriceTable.__table__.select().where(ServicePriceTable.__table__.c.service_type == svc))
+
+    patch = {
+        "base_price": bp,
+        "active": bool(active),
+        "sort_order": int(sort_order),
+        "name_i18n": nm,
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    # icon upload
+    if icon is not None:
+        rel_path, mime, _ = await _save_image_upload(icon, subdir="services")
+        # delete old icon
+        if existing and str(existing.get("icon_path") or "").strip():
+            _delete_media_file(str(existing["icon_path"]))
+        patch["icon_path"] = rel_path
+        patch["icon_mime"] = mime
+
+    if existing:
+        await database.execute(
+            ServicePriceTable.__table__
+            .update()
+            .where(ServicePriceTable.__table__.c.service_type == svc)
+            .values(**patch)
+        )
+    else:
+        # اگر icon نیومد، مقدار خالی می‌مونه
+        await database.execute(
+            ServicePriceTable.__table__.insert().values(
+                service_type=svc,
+                icon_path=patch.get("icon_path", ""),
+                icon_mime=patch.get("icon_mime", ""),
+                **patch
+            )
+        )
+
+    return unified_response("ok", "SERVICE_UPSERTED", "saved", {"service_type": svc})
+        
 @app.post("/logout")
 async def logout_user(body: LogoutRequest):
     refresh_raw = str(body.refresh_token or "").strip()
@@ -2147,9 +2257,13 @@ def _pick_i18n(d: dict, lang: str) -> str:
 
 @app.get("/public/home")
 async def public_home(lang: str = "en"):
-    # promotions
+    # promotions (active + ordered)
     promos = PromotionTable.__table__
-    q = promos.select().where(promos.c.active == True).order_by(promos.c.sort_order.asc(), promos.c.id.asc())
+    q = (
+        promos.select()
+        .where(promos.c.active == True)
+        .order_by(promos.c.sort_order.asc(), promos.c.id.asc())
+    )
     rows = await database.fetch_all(q)
 
     promo_items = []
@@ -2162,11 +2276,7 @@ async def public_home(lang: str = "en"):
             "image_url": _media_url(str(r["image_path"] or "")),
         })
 
-    # base prices
-    pr_rows = await database.fetch_all(ServicePriceTable.__table__.select())
-    base_price_map = {str(x["service_type"] or "").strip().lower(): int(x["base_price"] or 0) for x in pr_rows}
-
-    # ratings per service_type
+    # ratings per service_type (from approved reviews joined to requests)
     reviews = ReviewTable.__table__
     reqs = RequestTable.__table__
     q_rating = (
@@ -2188,30 +2298,37 @@ async def public_home(lang: str = "en"):
         for x in rr
     }
 
-    service_keys = [
-        "carwash",
-        "sofa_cleaning",
-        "general_cleaning",
-        "window_cleaning",
-        "stairs_cleaning",
-        "garden_cleaning",
-    ]
+    # services from catalog table (service_prices)
+    svc_rows = await database.fetch_all(
+        ServicePriceTable.__table__
+        .select()
+        .where(ServicePriceTable.__table__.c.active == True)
+        .order_by(
+            ServicePriceTable.__table__.c.sort_order.asc(),
+            ServicePriceTable.__table__.c.service_type.asc()
+        )
+    )
 
     services = []
-    for k in service_keys:
+    for r in svc_rows:
+        k = str(r["service_type"] or "").strip().lower()
         rm = rating_map.get(k, {"avg": None, "count": 0})
+
         services.append({
             "service_type": k,
-            "base_price": int(base_price_map.get(k, 0)),
+            "name": _pick_i18n(r["name_i18n"] or {}, lang),
+            "icon_url": _media_url(str(r["icon_path"] or "")),
+            "base_price": int(r["base_price"] or 0),
             "avg_rating": rm["avg"],
             "review_count": rm["count"],
+            "sort_order": int(r["sort_order"] or 0),
         })
 
     return unified_response("ok", "PUBLIC_HOME", "home", {
         "promotions": promo_items,
         "services": services,
     })
-
+    
 # -------------------- Admin: promotions CRUD --------------------
 @app.get("/admin/promotions")
 async def admin_list_promotions(request: Request):
