@@ -985,7 +985,7 @@ async def admin_upsert_service(
     if icon is not None:
         rel_path, mime, _ = await _save_image_upload(icon, subdir="services")
         # delete old icon
-        if existing and str(existing.get("icon_path") or "").strip():
+        if existing and str(existing["icon_path"] or "").strip():
             _delete_media_file(str(existing["icon_path"]))
         patch["icon_path"] = rel_path
         patch["icon_mime"] = mime
@@ -1307,7 +1307,7 @@ async def upload_user_photo(phone: str, request: Request, file: UploadFile = Fil
 
     # delete old
     prev = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
-    if prev and str(prev.get("photo_path") or "").strip():
+    if prev and str(prev("photo_path") or "").strip():
         _delete_media_file(str(prev["photo_path"]))
 
     await database.execute(
@@ -1345,7 +1345,7 @@ async def get_user_profile(phone: str, request: Request):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    photo_url = _media_url(str(user.get("photo_path") or ""))
+    photo_url = _media_url(str(user("photo_path") or ""))
     return unified_response("ok", "PROFILE_FETCHED", "profile data", {
         "phone": norm,
         "name": str(user["name"] or ""),
@@ -2447,7 +2447,7 @@ async def admin_update_promotion(
     if image is not None:
         rel_path, mime, _ = await _save_image_upload(image, subdir="promotions")
         # delete old image
-        if str(old.get("image_path") or "").strip():
+        if str(old("image_path") or "").strip():
             _delete_media_file(str(old["image_path"]))
         patch["image_path"] = rel_path
         patch["image_mime"] = mime
@@ -2464,7 +2464,7 @@ async def admin_delete_promotion(promo_id: int, request: Request):
     if not old:
         raise HTTPException(status_code=404, detail="promotion not found")
 
-    if str(old.get("image_path") or "").strip():
+    if str(old("image_path") or "").strip():
         _delete_media_file(str(old["image_path"]))
 
     await database.execute(PromotionTable.__table__.delete().where(PromotionTable.__table__.c.id == int(promo_id)))
