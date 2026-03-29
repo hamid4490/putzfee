@@ -67,8 +67,6 @@ MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "1000000"))  # 1MB default
 os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(os.path.join(MEDIA_DIR, "users"), exist_ok=True)
 os.makedirs(os.path.join(MEDIA_DIR, "promotions"), exist_ok=True)
-os.makedirs(os.path.join(MEDIA_DIR, "users"), exist_ok=True)
-os.makedirs(os.path.join(MEDIA_DIR, "promotions"), exist_ok=True)
 os.makedirs(os.path.join(MEDIA_DIR, "services"), exist_ok=True)
 
 # -------------------- Logger --------------------
