@@ -3,6 +3,7 @@
 
 import os
 import re
+import io
 import json
 import time
 import base64
@@ -10,13 +11,15 @@ import hashlib
 import secrets
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import bcrypt
 import jwt
 import httpx
 
 from dotenv import load_dotenv
+from PIL import Image, ImageOps, UnidentifiedImageError
+
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -37,13 +40,14 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 JWT_SECRET = os.getenv("JWT_SECRET", "change-me-secret").strip()
 PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "change-me-pepper").strip()
+
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
 BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
 ALLOW_ORIGINS_ENV = os.getenv("ALLOW_ORIGINS", "*").strip()
 
-FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()   # legacy (optional)
-FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()   # v1
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()
+FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()
 
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
 GOOGLE_APPLICATION_CREDENTIALS_JSON_B64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON_B64", "").strip()
@@ -59,10 +63,17 @@ PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()
 NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()
 NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()
 
-# --- Media (store images on server FS) ---
+# --- Media ---
 MEDIA_DIR = os.getenv("MEDIA_DIR", "media").strip() or "media"
 MEDIA_URL_PREFIX = os.getenv("MEDIA_URL_PREFIX", "/media").strip() or "/media"
-MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "1000000"))  # 1MB default
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "5000000"))  # input max before processing
+
+# نرمال‌سازی سمت سرور
+MEDIA_TARGET_WIDTH = int(os.getenv("MEDIA_TARGET_WIDTH", "1200"))
+MEDIA_TARGET_HEIGHT = int(os.getenv("MEDIA_TARGET_HEIGHT", "1200"))
+MEDIA_SAVE_FORMAT = os.getenv("MEDIA_SAVE_FORMAT", "JPEG").strip().upper()  # JPEG | WEBP | PNG
+MEDIA_JPEG_QUALITY = int(os.getenv("MEDIA_JPEG_QUALITY", "82"))
+MEDIA_WEBP_QUALITY = int(os.getenv("MEDIA_WEBP_QUALITY", "82"))
 
 os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(os.path.join(MEDIA_DIR, "users"), exist_ok=True)
@@ -122,17 +133,67 @@ def _parse_admin_phones(s: str) -> set[str]:
 ADMIN_PHONES_SET = _parse_admin_phones(ADMIN_PHONES_ENV)
 
 # -------------------- Helpers: time (UTC only) --------------------
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
 def parse_iso(ts: str) -> datetime:
     try:
         raw = str(ts or "").strip()
         if raw.endswith("Z"):
-            raw = raw.replace("Z", "+00:00")
+            raw = raw[:-1] + "+00:00"
+
         dt = datetime.fromisoformat(raw)
         if dt.tzinfo is None:
             raise ValueError("timezone required")
+
         return dt.astimezone(timezone.utc)
     except Exception:
         raise HTTPException(status_code=400, detail=f"invalid UTC datetime: {ts}")
+
+def iso_utc(dt: Optional[datetime]) -> Optional[str]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+# -------------------- Status helpers --------------------
+STATUS_NEW = "NEW"
+STATUS_WAITING = "WAITING"
+STATUS_ASSIGNED = "ASSIGNED"
+STATUS_IN_PROGRESS = "IN_PROGRESS"
+STATUS_FINISH = "FINISH"
+STATUS_CANCELED = "CANCELED"
+
+ACTIVE_ORDER_STATUSES = [
+    STATUS_NEW,
+    STATUS_WAITING,
+    STATUS_ASSIGNED,
+    STATUS_IN_PROGRESS,
+]
+
+FINAL_ORDER_STATUSES = [
+    STATUS_FINISH,
+    STATUS_CANCELED,
+]
+
+def canon_status(raw: str) -> str:
+    s = str(raw or "").strip().upper()
+
+    if s in ("NEW",):
+        return STATUS_NEW
+    if s in ("WAITING", "PENDING"):
+        return STATUS_WAITING
+    if s in ("ASSIGNED",):
+        return STATUS_ASSIGNED
+    if s in ("IN_PROGRESS", "STARTED", "ACTIVE"):
+        return STATUS_IN_PROGRESS
+    if s in ("FINISH", "DONE", "COMPLETED", "FINISHED"):
+        return STATUS_FINISH
+    if s in ("CANCELED", "CANCELLED", "PRICE_REJECTED"):
+        return STATUS_CANCELED
+
+    return s or STATUS_NEW
 
 # -------------------- Security helpers --------------------
 def bcrypt_hash_password(password: str) -> str:
@@ -148,7 +209,7 @@ def verify_password_secure(password: str, stored_hash: str) -> bool:
         return False
 
 def create_access_token(subject_phone: str) -> str:
-    now = datetime.now(timezone.utc)
+    now = utc_now()
     exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(subject_phone),
@@ -186,13 +247,17 @@ def require_user_phone(request: Request, expected_phone: str) -> str:
     token = extract_bearer_token(request)
     if not token:
         raise HTTPException(status_code=401, detail="missing bearer token")
+
     payload = decode_access_token(token)
     if not payload or not payload.get("sub"):
         raise HTTPException(status_code=401, detail="invalid token")
+
     sub = _normalize_phone(str(payload.get("sub") or ""))
     exp = _normalize_phone(expected_phone)
+
     if sub != exp:
         raise HTTPException(status_code=403, detail="forbidden")
+
     return sub
 
 def get_client_ip(request: Request) -> str:
@@ -201,27 +266,26 @@ def get_client_ip(request: Request) -> str:
         return xff.split(",")[0].strip()
     return request.client.host or "unknown"
 
-def require_admin(request: Request) -> None:
-    token = extract_bearer_token(request)
-    if token:
-        payload = decode_access_token(token)
-        sub = _normalize_phone(str((payload or {}).get("sub") or ""))
-        if sub and sub in ADMIN_PHONES_SET:
-            return
-
-    key = (request.headers.get("x-admin-key") or request.headers.get("X-Admin-Key") or "").strip()
-    if key and key == ADMIN_KEY:
-        return
-
-    raise HTTPException(status_code=401, detail="admin auth required")
-
-def get_admin_provider_phone(request: Request) -> str:
+def require_admin(request: Request) -> str:
     token = extract_bearer_token(request)
     if token:
         payload = decode_access_token(token)
         sub = _normalize_phone(str((payload or {}).get("sub") or ""))
         if sub and sub in ADMIN_PHONES_SET:
             return sub
+
+    key = (request.headers.get("x-admin-key") or request.headers.get("X-Admin-Key") or "").strip()
+    if key and key == ADMIN_KEY:
+        if ADMIN_PHONES_SET:
+            return sorted(list(ADMIN_PHONES_SET))[0]
+        return ""
+
+    raise HTTPException(status_code=401, detail="admin auth required")
+
+def get_admin_provider_phone(request: Request) -> str:
+    provider = require_admin(request)
+    if provider:
+        return provider
 
     if ADMIN_PHONES_SET:
         return sorted(list(ADMIN_PHONES_SET))[0]
@@ -230,10 +294,12 @@ def get_admin_provider_phone(request: Request) -> str:
 
 # -------------------- Media helpers --------------------
 _ALLOWED_IMAGE_MIMES = {
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+    "image/heic",
+    "image/heif",
 }
 
 def _safe_relpath(rel: str) -> str:
@@ -249,34 +315,83 @@ def _media_url(rel_path: str) -> Optional[str]:
         return None
     return f"{MEDIA_URL_PREFIX}/{rel}"
 
+def _target_ext_and_mime() -> Tuple[str, str]:
+    fmt = MEDIA_SAVE_FORMAT.upper()
+    if fmt == "WEBP":
+        return ".webp", "image/webp"
+    if fmt == "PNG":
+        return ".png", "image/png"
+    return ".jpg", "image/jpeg"
+
+def _normalize_and_encode_image(data: bytes) -> Tuple[bytes, str]:
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im = ImageOps.exif_transpose(im)
+
+            # برای JPEG/WEBP باید RGB شود
+            target_fmt = MEDIA_SAVE_FORMAT.upper()
+            if target_fmt in ("JPEG", "JPG", "WEBP"):
+                if im.mode not in ("RGB",):
+                    bg = Image.new("RGB", im.size, (255, 255, 255))
+                    if "A" in im.getbands():
+                        bg.paste(im, mask=im.getchannel("A"))
+                    else:
+                        bg.paste(im)
+                    im = bg
+            else:
+                if im.mode not in ("RGBA", "RGB"):
+                    im = im.convert("RGBA")
+
+            im.thumbnail((MEDIA_TARGET_WIDTH, MEDIA_TARGET_HEIGHT), Image.Resampling.LANCZOS)
+
+            out = io.BytesIO()
+            if target_fmt == "WEBP":
+                im.save(out, format="WEBP", quality=MEDIA_WEBP_QUALITY, method=6)
+            elif target_fmt == "PNG":
+                im.save(out, format="PNG", optimize=True)
+            else:
+                im.save(out, format="JPEG", quality=MEDIA_JPEG_QUALITY, optimize=True, progressive=True)
+
+            out_bytes = out.getvalue()
+            _, mime = _target_ext_and_mime()
+            return out_bytes, mime
+    except UnidentifiedImageError:
+        raise HTTPException(status_code=400, detail="invalid image file")
+    except Exception as e:
+        logger.error(f"image normalize failed: {e}")
+        raise HTTPException(status_code=400, detail="image processing failed")
+
 async def _save_image_upload(file: UploadFile, *, subdir: str) -> tuple[str, str, int]:
     if not file:
         raise HTTPException(status_code=400, detail="file required")
 
-    ct = (file.content_type or "").strip().lower()
-    if ct not in _ALLOWED_IMAGE_MIMES:
-        raise HTTPException(status_code=400, detail="unsupported image type")
-
-    data = await file.read()
-    if not data or len(data) < 10:
+    raw = await file.read()
+    if not raw or len(raw) < 16:
         raise HTTPException(status_code=400, detail="empty file")
 
-    if len(data) > MAX_IMAGE_BYTES:
+    if len(raw) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail=f"image too large (max {MAX_IMAGE_BYTES} bytes)")
 
-    ext = _ALLOWED_IMAGE_MIMES[ct]
-    name = f"{secrets.token_hex(16)}{ext}"
+    ct = (file.content_type or "").strip().lower()
+    # اگر content-type خالی/غلط بود، Pillow تصمیم نهایی را می‌گیرد؛ ولی اگر وجود داشت و خارج از لیست بود رد می‌کنیم
+    if ct and ct not in _ALLOWED_IMAGE_MIMES:
+        raise HTTPException(status_code=400, detail="unsupported image type")
 
+    encoded, mime = _normalize_and_encode_image(raw)
+    ext, _ = _target_ext_and_mime()
+
+    name = f"{secrets.token_hex(16)}{ext}"
     subdir = _safe_relpath(subdir)
+
     abs_dir = os.path.join(MEDIA_DIR, subdir)
     os.makedirs(abs_dir, exist_ok=True)
 
     abs_path = os.path.join(abs_dir, name)
     with open(abs_path, "wb") as f:
-        f.write(data)
+        f.write(encoded)
 
     rel_path = _safe_relpath(f"{subdir}/{name}")
-    return rel_path, ct, len(data)
+    return rel_path, mime, len(encoded)
 
 def _delete_media_file(rel_path: str) -> None:
     try:
@@ -297,14 +412,14 @@ class ReviewTable(Base):
     request_id = Column(Integer, ForeignKey("requests.id"), unique=True, index=True)
     user_phone = Column(String, index=True)
 
-    rating = Column(Integer)  # 1..5
+    rating = Column(Integer)
     comment = Column(String, default="")
 
     status = Column(String, default="PENDING", index=True)  # PENDING | APPROVED | REJECTED
 
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, index=True)
     decided_at = Column(DateTime(timezone=True), nullable=True)
-    decided_by = Column(String, nullable=True)  # admin phone (optional)
+    decided_by = Column(String, nullable=True)
 
 class UserTable(Base):
     __tablename__ = "users"
@@ -315,7 +430,6 @@ class UserTable(Base):
     name = Column(String, default="")
     car_list = Column(JSONB, default=list)
 
-    # new: profile photo stored on server FS (relative path under MEDIA_DIR)
     photo_path = Column(String, default="")
     photo_mime = Column(String, default="")
     photo_updated_at = Column(DateTime(timezone=True), nullable=True)
@@ -343,19 +457,18 @@ class RequestTable(Base):
     home_number = Column(String, default="")
     service_type = Column(String, index=True)
     price = Column(Integer)
-    request_datetime = Column(String)
-    status = Column(String)
-    driver_name = Column(String)
-    driver_phone = Column(String)
-    finish_datetime = Column(String)
-    payment_type = Column(String)
+    request_datetime = Column(DateTime(timezone=True), default=utc_now, index=True)
+    status = Column(String, default=STATUS_NEW, index=True)
+    driver_name = Column(String, default="")
+    driver_phone = Column(String, default="")
+    finish_datetime = Column(DateTime(timezone=True), nullable=True)
+    payment_type = Column(String, default="")
     scheduled_start = Column(DateTime(timezone=True), nullable=True)
     service_place = Column(String, default="client")
     execution_start = Column(DateTime(timezone=True), nullable=True)
 
-    # new:
-    service_types = Column(JSONB, default=list)      # bundle services
-    preferred_slots = Column(JSONB, default=list)    # two ISO utc strings
+    service_types = Column(JSONB, default=list)
+    preferred_slots = Column(JSONB, default=list)
 
 class RefreshTokenTable(Base):
     __tablename__ = "refresh_tokens"
@@ -364,7 +477,7 @@ class RefreshTokenTable(Base):
     token_hash = Column(String, unique=True, index=True)
     expires_at = Column(DateTime(timezone=True), index=True)
     revoked = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=utc_now)
     __table_args__ = (Index("ix_refresh_token_user_id_expires", "user_id", "expires_at"),)
 
 class LoginAttemptTable(Base):
@@ -373,10 +486,10 @@ class LoginAttemptTable(Base):
     phone = Column(String, index=True)
     ip = Column(String, index=True)
     attempt_count = Column(Integer, default=0)
-    window_start = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    window_start = Column(DateTime(timezone=True), default=utc_now)
     locked_until = Column(DateTime(timezone=True), nullable=True)
-    last_attempt_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    last_attempt_at = Column(DateTime(timezone=True), default=utc_now)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
     __table_args__ = (Index("ix_login_attempt_phone_ip", "phone", "ip"),)
 
 class ScheduleSlotTable(Base):
@@ -386,7 +499,7 @@ class ScheduleSlotTable(Base):
     provider_phone = Column(String, index=True)
     slot_start = Column(DateTime(timezone=True), index=True)
     status = Column(String, default="PROPOSED")
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=utc_now)
     __table_args__ = (Index("ix_schedule_slots_req_status", "request_id", "status"),)
 
 class AppointmentTable(Base):
@@ -397,7 +510,7 @@ class AppointmentTable(Base):
     start_time = Column(DateTime(timezone=True), index=True)
     end_time = Column(DateTime(timezone=True), index=True)
     status = Column(String, default="BOOKED")
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=utc_now)
     __table_args__ = (
         UniqueConstraint("provider_phone", "start_time", "end_time", name="uq_provider_slot"),
         Index("ix_provider_time", "provider_phone", "start_time", "end_time")
@@ -412,7 +525,7 @@ class NotificationTable(Base):
     data = Column(JSONB, default=dict)
     read = Column(Boolean, default=False, index=True)
     read_at = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, index=True)
     __table_args__ = (Index("ix_notifs_user_read_created", "user_phone", "read", "created_at"),)
 
 class DeviceTokenTable(Base):
@@ -422,8 +535,8 @@ class DeviceTokenTable(Base):
     role = Column(String, index=True)
     platform = Column(String, default="android", index=True)
     user_phone = Column(String, nullable=True)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now)
     __table_args__ = (Index("ix_tokens_role_platform", "role", "platform"),)
 
 class PromotionTable(Base):
@@ -434,30 +547,28 @@ class PromotionTable(Base):
     title_i18n = Column(JSONB, default=dict)
     subtitle_i18n = Column(JSONB, default=dict)
     service_types = Column(JSONB, default=list)
+    discount_amount = Column(Integer, default=0)  # مبلغ ثابت تخفیف
     image_path = Column(String, default="")
     image_mime = Column(String, default="")
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
-    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, index=True)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, index=True)
 
 class ServicePriceTable(Base):
     __tablename__ = "service_prices"
     id = Column(Integer, primary_key=True, index=True)
 
-    service_type = Column(String, unique=True, index=True)  # carwash, ...
+    service_type = Column(String, unique=True, index=True)
     base_price = Column(Integer, default=0)
 
-    # NEW: service catalog fields
     active = Column(Boolean, default=True, index=True)
     sort_order = Column(Integer, default=0, index=True)
 
-    # {"fa":"کارواش", "en":"Car wash", "de":"Autowäsche"}
     name_i18n = Column(JSONB, default=dict)
 
-    # icon stored on server FS
     icon_path = Column(String, default="")
     icon_mime = Column(String, default="")
 
-    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, index=True)
 
 # -------------------- Pydantic models --------------------
 class CarInfo(BaseModel):
@@ -484,14 +595,12 @@ class OrderRequest(BaseModel):
     address: str
     home_number: Optional[str] = ""
     service_type: str
-    price: int
-    request_datetime: str
-    payment_type: str
-    service_place: str
-
-    # new:
+    price: int = 0
+    request_datetime: Optional[str] = None
+    payment_type: str = "cash"
+    service_place: str = "client"
     service_types: Optional[List[str]] = None
-    preferred_slots: Optional[List[str]] = None  # should be 1..2 ISO utc strings
+    preferred_slots: Optional[List[str]] = None
 
 class CarListUpdateRequest(BaseModel):
     user_phone: str
@@ -670,15 +779,15 @@ def push_event_data(
     if order_ids:
         data["order_ids"] = ",".join(str(int(x)) for x in order_ids if x is not None)
     if status:
-        data["status"] = str(status).strip()
+        data["status"] = canon_status(status)
     if service_type:
         data["service_type"] = str(service_type).strip().lower()
     if user_phone:
         data["user_phone"] = _normalize_phone(user_phone)
     if scheduled_start is not None:
-        data["scheduled_start"] = scheduled_start.astimezone(timezone.utc).isoformat()
+        data["scheduled_start"] = iso_utc(scheduled_start)
     if execution_start is not None:
-        data["execution_start"] = execution_start.astimezone(timezone.utc).isoformat()
+        data["execution_start"] = iso_utc(execution_start)
     if price is not None:
         data["price"] = str(int(price))
     return data
@@ -723,6 +832,7 @@ async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict) -> 
             "data": _to_fcm_data(merged)
         }
     }
+
     url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(url, headers=headers, json=msg)
@@ -798,15 +908,17 @@ async def get_user_tokens(phone: str) -> List[str]:
 
 async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None) -> None:
     norm = _normalize_phone(phone)
-    ins = NotificationTable.__table__.insert().values(
-        user_phone=norm,
-        title=str(title or ""),
-        body=str(body or ""),
-        data=(data or {}),
-        read=False,
-        created_at=datetime.now(timezone.utc)
+
+    await database.execute(
+        NotificationTable.__table__.insert().values(
+            user_phone=norm,
+            title=str(title or ""),
+            body=str(body or ""),
+            data=(data or {}),
+            read=False,
+            created_at=utc_now()
+        )
     )
-    await database.execute(ins)
 
     tokens = await get_user_tokens(norm)
     if not tokens:
@@ -833,7 +945,6 @@ async def notify_managers(title: str, body: str, data: Optional[dict] = None, ta
 # -------------------- App & CORS --------------------
 app = FastAPI()
 
-# serve media files
 app.mount(MEDIA_URL_PREFIX, StaticFiles(directory=MEDIA_DIR), name="media")
 
 allow_origins = ["*"] if ALLOW_ORIGINS_ENV == "*" else [o.strip() for o in ALLOW_ORIGINS_ENV.split(",") if o.strip()]
@@ -858,14 +969,12 @@ async def startup() -> None:
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS scheduled_start TIMESTAMPTZ NULL;"))
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS execution_start TIMESTAMPTZ NULL;"))
         conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS service_place VARCHAR DEFAULT 'client';"))
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_slots_provider_start_active ON schedule_slots (provider_phone, slot_start) WHERE status IN ('PROPOSED','ACCEPTED');"))
+        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS service_types JSONB DEFAULT '[]'::jsonb;"))
+        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS preferred_slots JSONB DEFAULT '[]'::jsonb;"))
 
-        # new columns
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_path TEXT DEFAULT '';"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_mime VARCHAR DEFAULT '';"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_updated_at TIMESTAMPTZ NULL;"))
-        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS service_types JSONB DEFAULT '[]'::jsonb;"))
-        conn.execute(text("ALTER TABLE requests ADD COLUMN IF NOT EXISTS preferred_slots JSONB DEFAULT '[]'::jsonb;"))
 
         conn.execute(text("ALTER TABLE service_prices ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;"))
         conn.execute(text("ALTER TABLE service_prices ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0;"))
@@ -873,7 +982,12 @@ async def startup() -> None:
         conn.execute(text("ALTER TABLE service_prices ADD COLUMN IF NOT EXISTS icon_path TEXT DEFAULT '';"))
         conn.execute(text("ALTER TABLE service_prices ADD COLUMN IF NOT EXISTS icon_mime VARCHAR DEFAULT '';"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_service_prices_active_sort ON service_prices (active, sort_order);"))
-    
+
+        conn.execute(text("ALTER TABLE promotions ADD COLUMN IF NOT EXISTS discount_amount INTEGER DEFAULT 0;"))
+
+        # زمان‌های قدیمی رشته‌ای اگر لازم بود دست‌نخورده می‌مانند؛ از این به بعد درست ذخیره می‌کنیم
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_slots_provider_start_active ON schedule_slots (provider_phone, slot_start) WHERE status IN ('PROPOSED','ACCEPTED');"))
+
     await database.connect()
 
 @app.on_event("shutdown")
@@ -906,7 +1020,7 @@ async def refresh_access(body: RefreshAccessRequest):
     )
     if not row or bool(row["revoked"]):
         raise HTTPException(status_code=401, detail="invalid/revoked refresh token")
-    if row["expires_at"] <= datetime.now(timezone.utc):
+    if row["expires_at"] <= utc_now():
         raise HTTPException(status_code=401, detail="refresh token expired")
 
     user = await database.fetch_one(
@@ -918,97 +1032,6 @@ async def refresh_access(body: RefreshAccessRequest):
     access = create_access_token(_normalize_phone(user["phone"]))
     return unified_response("ok", "ACCESS_REFRESHED", "access token refreshed", {"access_token": access})
 
-@app.get("/admin/services")
-async def admin_list_services(request: Request):
-    require_admin(request)
-
-    rows = await database.fetch_all(
-        ServicePriceTable.__table__
-        .select()
-        .order_by(ServicePriceTable.__table__.c.sort_order.asc(), ServicePriceTable.__table__.c.service_type.asc())
-    )
-
-    items = []
-    for r in rows:
-        items.append({
-            "service_type": str(r["service_type"] or ""),
-            "base_price": int(r["base_price"] or 0),
-            "active": bool(r["active"]),
-            "sort_order": int(r["sort_order"] or 0),
-            "name_i18n": r["name_i18n"] or {},
-            "icon_url": _media_url(str(r["icon_path"] or "")),
-            "updated_at": (r["updated_at"].astimezone(timezone.utc).isoformat() if r["updated_at"] else None),
-        })
-
-    return unified_response("ok", "ADMIN_SERVICES", "services", {"items": items})
-
-@app.post("/admin/services")
-async def admin_upsert_service(
-    request: Request,
-    service_type: str = Form(...),
-    base_price: int = Form(0),
-    active: bool = Form(True),
-    sort_order: int = Form(0),
-    name_i18n: str = Form("{}"),   # JSON string
-    icon: Optional[UploadFile] = File(None),
-):
-    require_admin(request)
-
-    svc = str(service_type or "").strip().lower()
-    if not svc:
-        raise HTTPException(status_code=400, detail="service_type required")
-
-    bp = int(base_price or 0)
-    if bp < 0:
-        raise HTTPException(status_code=400, detail="base_price must be >= 0")
-
-    try:
-        nm = json.loads(name_i18n or "{}")
-        if not isinstance(nm, dict):
-            raise ValueError()
-    except Exception:
-        raise HTTPException(status_code=400, detail="name_i18n must be JSON object string")
-
-    existing = await database.fetch_one(ServicePriceTable.__table__.select().where(ServicePriceTable.__table__.c.service_type == svc))
-
-    patch = {
-        "base_price": bp,
-        "active": bool(active),
-        "sort_order": int(sort_order),
-        "name_i18n": nm,
-        "updated_at": datetime.now(timezone.utc),
-    }
-
-    # icon upload
-    if icon is not None:
-        rel_path, mime, _ = await _save_image_upload(icon, subdir="services")
-        # delete old icon
-        if existing and str(existing["icon_path"] or "").strip():
-            _delete_media_file(str(existing["icon_path"]))
-        patch["icon_path"] = rel_path
-        patch["icon_mime"] = mime
-
-    if existing:
-        await database.execute(
-            ServicePriceTable.__table__
-            .update()
-            .where(ServicePriceTable.__table__.c.service_type == svc)
-            .values(**patch)
-        )
-    else:
-        vals = dict(patch)
-        vals["service_type"] = svc
-
-        # اگر آیکون نفرستادند، ستون‌ها خالی بمانند (تا insert ارور ندهد)
-        vals.setdefault("icon_path", "")
-        vals.setdefault("icon_mime", "")
-
-        await database.execute(
-            ServicePriceTable.__table__.insert().values(**vals)
-        )
-
-    return unified_response("ok", "SERVICE_UPSERTED", "saved", {"service_type": svc})
-        
 @app.post("/logout")
 async def logout_user(body: LogoutRequest):
     refresh_raw = str(body.refresh_token or "").strip()
@@ -1019,6 +1042,7 @@ async def logout_user(body: LogoutRequest):
     rt_row = await database.fetch_one(
         RefreshTokenTable.__table__.select().where(RefreshTokenTable.token_hash == token_hash)
     )
+
     await database.execute(
         RefreshTokenTable.__table__.update().where(RefreshTokenTable.token_hash == token_hash).values(revoked=True)
     )
@@ -1032,24 +1056,30 @@ async def logout_user(body: LogoutRequest):
         )
         if user:
             phone = _normalize_phone(user["phone"])
-            await database.execute(DeviceTokenTable.__table__.delete().where(DeviceTokenTable.user_phone == phone))
+            await database.execute(
+                DeviceTokenTable.__table__.delete().where(DeviceTokenTable.user_phone == phone)
+            )
 
     return unified_response("ok", "LOGOUT", "logged out", {})
 
 @app.post("/push/register")
 async def register_push_token(body: PushRegister):
-    now = datetime.now(timezone.utc)
+    now = utc_now()
     norm_phone = _normalize_phone(body.user_phone) if body.user_phone else None
 
     row = await database.fetch_one(
         DeviceTokenTable.__table__.select().where(DeviceTokenTable.token == str(body.token).strip())
     )
+
+    role = str(body.role or "").strip().lower()
+    platform = str(body.platform or "android").strip().lower()
+
     if row is None:
         await database.execute(
             DeviceTokenTable.__table__.insert().values(
                 token=str(body.token).strip(),
-                role=str(body.role).strip(),
-                platform=str(body.platform or "android").strip(),
+                role=role,
+                platform=platform,
                 user_phone=norm_phone,
                 created_at=now,
                 updated_at=now
@@ -1058,13 +1088,14 @@ async def register_push_token(body: PushRegister):
     else:
         await database.execute(
             DeviceTokenTable.__table__.update().where(DeviceTokenTable.id == int(row["id"])).values(
-                role=str(body.role).strip(),
-                platform=str(body.platform or "android").strip(),
+                role=role,
+                platform=platform,
                 user_phone=norm_phone if norm_phone else row["user_phone"],
                 updated_at=now
             )
         )
-    return unified_response("ok", "TOKEN_REGISTERED", "registered", {"role": str(body.role).strip()})
+
+    return unified_response("ok", "TOKEN_REGISTERED", "registered", {"role": role})
 
 @app.post("/push/unregister")
 async def unregister_push_token(body: PushUnregister):
@@ -1076,7 +1107,10 @@ async def user_exists(phone: str):
     norm = _normalize_phone(phone)
     if not norm:
         return unified_response("ok", "USER_NOT_FOUND", "check", {"exists": False})
-    count = await database.fetch_val(select(func.count()).select_from(UserTable).where(UserTable.phone == norm))
+
+    count = await database.fetch_val(
+        select(func.count()).select_from(UserTable).where(UserTable.phone == norm)
+    )
     exists = bool(count and int(count) > 0)
     return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "check", {"exists": exists})
 
@@ -1086,7 +1120,9 @@ async def register_user(user: UserRegisterRequest):
     if not norm:
         raise HTTPException(status_code=400, detail="phone required")
 
-    count = await database.fetch_val(select(func.count()).select_from(UserTable).where(UserTable.phone == norm))
+    count = await database.fetch_val(
+        select(func.count()).select_from(UserTable).where(UserTable.phone == norm)
+    )
     if count and int(count) > 0:
         raise HTTPException(status_code=400, detail="User already exists")
 
@@ -1107,7 +1143,7 @@ async def register_user(user: UserRegisterRequest):
 
 @app.post("/login")
 async def login_user(user: UserLoginRequest, request: Request):
-    now = datetime.now(timezone.utc)
+    now = utc_now()
     client_ip = get_client_ip(request)
 
     phone_norm = _normalize_phone(user.phone)
@@ -1130,10 +1166,11 @@ async def login_user(user: UserLoginRequest, request: Request):
     else:
         locked_until = att["locked_until"]
         if locked_until and locked_until > now:
+            remain = int((locked_until - now).total_seconds())
             raise HTTPException(
                 status_code=429,
-                detail={"code": "RATE_LIMITED", "lock_remaining": int((locked_until - now).total_seconds())},
-                headers={"Retry-After": str(int((locked_until - now).total_seconds()))},
+                detail={"code": "RATE_LIMITED", "lock_remaining": remain},
+                headers={"Retry-After": str(remain)},
             )
 
         window_age = (now - (att["window_start"] or now)).total_seconds()
@@ -1155,6 +1192,7 @@ async def login_user(user: UserLoginRequest, request: Request):
     if not verify_password_secure(user.password, db_user["password_hash"]):
         cur = int(att["attempt_count"] or 0) + 1
         rem = max(0, LOGIN_MAX_ATTEMPTS - cur)
+
         if cur >= LOGIN_MAX_ATTEMPTS:
             lock_time = now + timedelta(seconds=LOGIN_LOCK_SECONDS)
             await database.execute(
@@ -1196,24 +1234,34 @@ async def login_user(user: UserLoginRequest, request: Request):
             revoked=False
         )
     )
+
     return {
         "status": "ok",
         "access_token": access,
         "refresh_token": refresh,
-        "user": {"phone": phone_norm, "address": str(db_user["address"] or ""), "name": str(db_user["name"] or "")}
+        "user": {
+            "phone": phone_norm,
+            "address": str(db_user["address"] or ""),
+            "name": str(db_user["name"] or "")
+        }
     }
 
 @app.post("/admin/login")
 async def admin_login(body: AdminLoginRequest, request: Request):
-    now = datetime.now(timezone.utc)
+    now = utc_now()
     client_ip = get_client_ip(request)
 
     phone_norm = _normalize_phone(body.phone)
     if not phone_norm:
         raise HTTPException(status_code=400, detail="invalid phone")
 
+    # فقط شماره‌های موجود در env مجازند
     if phone_norm not in ADMIN_PHONES_SET:
         raise HTTPException(status_code=401, detail={"code": "WRONG_PASSWORD", "remaining_attempts": 0})
+
+    password_raw = str(body.password or "").strip()
+    if not password_raw:
+        raise HTTPException(status_code=400, detail="password required")
 
     sel_att = LoginAttemptTable.__table__.select().where(
         (LoginAttemptTable.phone == phone_norm) & (LoginAttemptTable.ip == client_ip)
@@ -1223,57 +1271,85 @@ async def admin_login(body: AdminLoginRequest, request: Request):
     if not att:
         await database.execute(
             LoginAttemptTable.__table__.insert().values(
-                phone=phone_norm, ip=client_ip, attempt_count=0,
-                window_start=now, last_attempt_at=now, created_at=now
+                phone=phone_norm,
+                ip=client_ip,
+                attempt_count=0,
+                window_start=now,
+                last_attempt_at=now,
+                created_at=now
             )
         )
         att = await database.fetch_one(sel_att)
     else:
         locked_until = att["locked_until"]
         if locked_until and locked_until > now:
-            raise HTTPException(status_code=429, detail={"code": "RATE_LIMITED", "lock_remaining": int((locked_until - now).total_seconds())})
+            remain = int((locked_until - now).total_seconds())
+            raise HTTPException(status_code=429, detail={"code": "RATE_LIMITED", "lock_remaining": remain})
 
         if (now - (att["window_start"] or now)).total_seconds() > LOGIN_WINDOW_SECONDS or (locked_until and locked_until <= now):
             await database.execute(
                 LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(
-                    attempt_count=0, window_start=now, locked_until=None
+                    attempt_count=0,
+                    window_start=now,
+                    locked_until=None,
+                    last_attempt_at=now
                 )
             )
             att = await database.fetch_one(sel_att)
 
-    db_user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == phone_norm))
-    password_raw = str(body.password or "").strip()
-    if not password_raw:
-        raise HTTPException(status_code=400, detail="password required")
+    db_user = await database.fetch_one(
+        UserTable.__table__.select().where(UserTable.phone == phone_norm)
+    )
 
+    # شماره درست و اولین ورود => رمز را ذخیره کن و وارد شود
     if not db_user:
         password_hash = bcrypt_hash_password(password_raw)
         await database.execute(
             UserTable.__table__.insert().values(
-                phone=phone_norm, password_hash=password_hash, address="", name="Manager", car_list=[]
+                phone=phone_norm,
+                password_hash=password_hash,
+                address="",
+                name="Manager",
+                car_list=[],
+                photo_path="",
+                photo_mime="",
+                photo_updated_at=None,
             )
         )
-        db_user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == phone_norm))
+        db_user = await database.fetch_one(
+            UserTable.__table__.select().where(UserTable.phone == phone_norm)
+        )
     else:
+        # اگر شماره درست است ولی رمز اشتباه => WRONG_PASSWORD
         if not verify_password_secure(password_raw, db_user["password_hash"]):
             cur = int(att["attempt_count"] or 0) + 1
+            rem = max(0, LOGIN_MAX_ATTEMPTS - cur)
+
             if cur >= LOGIN_MAX_ATTEMPTS:
                 lock = now + timedelta(seconds=LOGIN_LOCK_SECONDS)
                 await database.execute(
                     LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(
-                        attempt_count=cur, locked_until=lock
+                        attempt_count=cur,
+                        locked_until=lock,
+                        last_attempt_at=now
                     )
                 )
                 raise HTTPException(status_code=429, detail={"code": "RATE_LIMITED", "lock_remaining": LOGIN_LOCK_SECONDS})
 
             await database.execute(
-                LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(attempt_count=cur)
+                LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(
+                    attempt_count=cur,
+                    last_attempt_at=now
+                )
             )
-            raise HTTPException(status_code=401, detail={"code": "WRONG_PASSWORD", "remaining_attempts": max(0, LOGIN_MAX_ATTEMPTS - cur)})
+            raise HTTPException(status_code=401, detail={"code": "WRONG_PASSWORD", "remaining_attempts": rem})
 
     await database.execute(
         LoginAttemptTable.__table__.update().where(LoginAttemptTable.id == int(att["id"])).values(
-            attempt_count=0, window_start=now, locked_until=None
+            attempt_count=0,
+            window_start=now,
+            locked_until=None,
+            last_attempt_at=now
         )
     )
 
@@ -1293,7 +1369,11 @@ async def admin_login(body: AdminLoginRequest, request: Request):
         "status": "ok",
         "access_token": access,
         "refresh_token": refresh,
-        "user": {"phone": phone_norm, "address": str(db_user["address"] or ""), "name": str(db_user["name"] or "")}
+        "user": {
+            "phone": phone_norm,
+            "address": str(db_user["address"] or ""),
+            "name": str(db_user["name"] or "Manager")
+        }
     }
 
 # -------------------- User profile endpoints --------------------
@@ -1303,16 +1383,17 @@ async def upload_user_photo(phone: str, request: Request, file: UploadFile = Fil
 
     rel_path, mime, size = await _save_image_upload(file, subdir=f"users/{norm}")
 
-    # delete old
-    prev = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
-    if prev and str(prev("photo_path") or "").strip():
+    prev = await database.fetch_one(
+        UserTable.__table__.select().where(UserTable.phone == norm)
+    )
+    if prev and str(prev["photo_path"] or "").strip():
         _delete_media_file(str(prev["photo_path"]))
 
     await database.execute(
         UserTable.__table__.update().where(UserTable.phone == norm).values(
             photo_path=rel_path,
             photo_mime=mime,
-            photo_updated_at=datetime.now(timezone.utc),
+            photo_updated_at=utc_now(),
         )
     )
 
@@ -1325,25 +1406,34 @@ async def upload_user_photo(phone: str, request: Request, file: UploadFile = Fil
 @app.post("/user/profile")
 async def update_profile(body: UserProfileUpdate, request: Request):
     norm = require_user_phone(request, body.phone)
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
+
+    user = await database.fetch_one(
+        UserTable.__table__.select().where(UserTable.phone == norm)
+    )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
     await database.execute(
         UserTable.__table__.update().where(UserTable.phone == norm).values(
             name=str(body.name or "").strip(),
             address=str(body.address or "").strip(),
         )
     )
+
     return unified_response("ok", "PROFILE_UPDATED", "profile saved", {"phone": norm})
 
 @app.get("/user/profile/{phone}")
 async def get_user_profile(phone: str, request: Request):
     norm = require_user_phone(request, phone)
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
+
+    user = await database.fetch_one(
+        UserTable.__table__.select().where(UserTable.phone == norm)
+    )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    photo_url = _media_url(str(user("photo_path") or ""))
+    photo_url = _media_url(str(user["photo_path"] or ""))
+
     return unified_response("ok", "PROFILE_FETCHED", "profile data", {
         "phone": norm,
         "name": str(user["name"] or ""),
@@ -1355,30 +1445,60 @@ async def get_user_profile(phone: str, request: Request):
 @app.get("/user_cars/{user_phone}")
 async def get_user_cars(user_phone: str, request: Request):
     norm = require_user_phone(request, user_phone)
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
+
+    user = await database.fetch_one(
+        UserTable.__table__.select().where(UserTable.phone == norm)
+    )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
     return unified_response("ok", "USER_CARS", "cars list", {"items": user["car_list"] or []})
 
 @app.post("/user_cars")
 async def update_user_cars(body: CarListUpdateRequest, request: Request):
     norm = require_user_phone(request, body.user_phone)
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
+
+    user = await database.fetch_one(
+        UserTable.__table__.select().where(UserTable.phone == norm)
+    )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
     cars_payload = [c.dict() for c in (body.car_list or [])]
-    await database.execute(UserTable.__table__.update().where(UserTable.phone == norm).values(car_list=cars_payload))
+    await database.execute(
+        UserTable.__table__.update().where(UserTable.phone == norm).values(car_list=cars_payload)
+    )
+
     return unified_response("ok", "USER_CARS_UPDATED", "cars updated", {"count": len(cars_payload)})
+
+# -------------------- Public helpers --------------------
+def _pick_i18n(d: dict, lang: str) -> str:
+    lang = (lang or "en").strip().lower()
+    if not isinstance(d, dict):
+        return ""
+    if d.get(lang):
+        return str(d.get(lang) or "")
+    if d.get("en"):
+        return str(d.get("en") or "")
+    for _, v in d.items():
+        if v:
+            return str(v)
+    return ""
 
 # -------------------- Orders --------------------
 @app.post("/order")
 async def create_order(order: OrderRequest, request: Request):
     norm = require_user_phone(request, order.user_phone)
-    user = await database.fetch_one(UserTable.__table__.select().where(UserTable.phone == norm))
+
+    user = await database.fetch_one(
+        UserTable.__table__.select().where(UserTable.phone == norm)
+    )
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     svc = str(order.service_type or "").strip().lower()
+    if not svc:
+        raise HTTPException(status_code=400, detail="service_type required")
 
     # new bundle services
     svc_types = []
@@ -1399,6 +1519,22 @@ async def create_order(order: OrderRequest, request: Request):
                 uniq.append(s)
         pref = uniq[:2]
 
+    req_dt = utc_now()
+    if str(order.request_datetime or "").trim():
+        try:
+            raw = str(order.request_datetime or "").strip()
+            # اگر timezone ندارد، UTC فرض می‌کنیم
+            if raw.endswith("Z"):
+                req_dt = parse_iso(raw)
+            else:
+                dt = datetime.fromisoformat(raw.replace(" ", "T"))
+                if dt.tzinfo is None:
+                    req_dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    req_dt = dt.astimezone(timezone.utc)
+        except Exception:
+            req_dt = utc_now()
+
     ins = RequestTable.__table__.insert().values(
         user_phone=norm,
         latitude=float(order.location.latitude),
@@ -1409,9 +1545,9 @@ async def create_order(order: OrderRequest, request: Request):
         service_type=svc,
         service_types=svc_types,
         preferred_slots=pref,
-        price=int(order.price),
-        request_datetime=str(order.request_datetime or "").strip(),
-        status="NEW",
+        price=int(order.price or 0),
+        request_datetime=req_dt,
+        status=STATUS_NEW,
         payment_type=str(order.payment_type or "").strip().lower(),
         service_place=str(order.service_place or "client").strip().lower(),
         driver_phone="",
@@ -1428,7 +1564,7 @@ async def create_order(order: OrderRequest, request: Request):
             data=push_event_data(
                 event="new_order",
                 order_id=int(new_id),
-                status="NEW",
+                status=STATUS_NEW,
                 service_type=svc,
                 user_phone=norm,
             ),
@@ -1437,6 +1573,38 @@ async def create_order(order: OrderRequest, request: Request):
         logger.error(f"notify_managers(create_order) failed: {e}")
 
     return unified_response("ok", "REQUEST_CREATED", "request created", {"id": new_id})
+
+@app.get("/user_orders/{phone}")
+async def get_user_orders(phone: str, request: Request):
+    norm = require_user_phone(request, phone)
+
+    rows = await database.fetch_all(
+        RequestTable.__table__
+        .select()
+        .where(RequestTable.user_phone == norm)
+        .order_by(RequestTable.request_datetime.desc(), RequestTable.id.desc())
+    )
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": int(r["id"]),
+            "user_phone": str(r["user_phone"] or ""),
+            "address": str(r["address"] or ""),
+            "service_type": str(r["service_type"] or ""),
+            "price": int(r["price"] or 0),
+            "status": canon_status(str(r["status"] or "")),
+            "latitude": float(r["latitude"]) if r["latitude"] is not None else None,
+            "longitude": float(r["longitude"]) if r["longitude"] is not None else None,
+            "scheduled_start": iso_utc(r["scheduled_start"]),
+            "execution_start": iso_utc(r["execution_start"]),
+            "driver_name": str(r["driver_name"] or ""),
+            "driver_phone": str(r["driver_phone"] or ""),
+            "request_datetime": iso_utc(r["request_datetime"]),
+            "service_place": str(r["service_place"] or "client"),
+        })
+
+    return unified_response("ok", "USER_ORDERS", "orders", {"items": items})
 
 @app.post("/cancel_order")
 async def cancel_order(cancel: CancelRequest, request: Request):
@@ -1448,12 +1616,13 @@ async def cancel_order(cancel: CancelRequest, request: Request):
     upd = RequestTable.__table__.update().where(
         (RequestTable.user_phone == norm) &
         (RequestTable.service_type == service) &
-        (RequestTable.status.in_(["NEW", "WAITING", "ASSIGNED"])) &
+        (RequestTable.status.in_([STATUS_NEW, STATUS_WAITING, STATUS_ASSIGNED])) &
         (RequestTable.execution_start.is_(None))
     ).values(
-        status="CANCELED",
+        status=STATUS_CANCELED,
         scheduled_start=None,
-        execution_start=None
+        execution_start=None,
+        finish_datetime=None
     ).returning(RequestTable.id, RequestTable.driver_phone)
 
     rows = await database.fetch_all(upd)
@@ -1478,32 +1647,18 @@ async def cancel_order(cancel: CancelRequest, request: Request):
 
     try:
         first_id = ids[0]
-        await notify_managers(
-            title="",
-            body="",
-            data=push_event_data(
-                event="canceled_by_user",
-                order_id=int(first_id),
-                order_ids=ids,
-                status="CANCELED",
-                service_type=service,
-                user_phone=norm,
-            ),
+        payload = push_event_data(
+            event="canceled_by_user",
+            order_id=int(first_id),
+            order_ids=ids,
+            status=STATUS_CANCELED,
+            service_type=service,
+            user_phone=norm,
         )
+
+        await notify_managers(title="", body="", data=payload)
         for dp in drivers:
-            await notify_managers(
-                title="",
-                body="",
-                data=push_event_data(
-                    event="canceled_by_user",
-                    order_id=int(first_id),
-                    order_ids=ids,
-                    status="CANCELED",
-                    service_type=service,
-                    user_phone=norm,
-                ),
-                target_phone=_normalize_phone(dp),
-            )
+            await notify_managers(title="", body="", data=payload, target_phone=_normalize_phone(dp))
     except Exception as e:
         logger.error(f"notify_managers(cancel_order) failed: {e}")
 
@@ -1512,13 +1667,42 @@ async def cancel_order(cancel: CancelRequest, request: Request):
 @app.get("/admin/requests/active")
 async def admin_active_requests(request: Request):
     require_admin(request)
-    active = ["NEW", "WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"]
-    rows = await database.fetch_all(
-        RequestTable.__table__.select().where(RequestTable.status.in_(active)).order_by(RequestTable.id.desc())
-    )
-    return unified_response("ok", "ACTIVE_REQUESTS", "active requests", {"items": [dict(r) for r in rows]})
 
-# -------------------- Scheduling (unchanged) --------------------
+    rows = await database.fetch_all(
+        RequestTable.__table__
+        .select()
+        .where(RequestTable.status.in_(ACTIVE_ORDER_STATUSES))
+        .order_by(RequestTable.id.desc())
+    )
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": int(r["id"]),
+            "user_phone": str(r["user_phone"] or ""),
+            "latitude": float(r["latitude"]) if r["latitude"] is not None else None,
+            "longitude": float(r["longitude"]) if r["longitude"] is not None else None,
+            "car_list": r["car_list"] or [],
+            "address": str(r["address"] or ""),
+            "home_number": str(r["home_number"] or ""),
+            "service_type": str(r["service_type"] or ""),
+            "price": int(r["price"] or 0),
+            "request_datetime": iso_utc(r["request_datetime"]),
+            "status": canon_status(str(r["status"] or "")),
+            "driver_name": str(r["driver_name"] or ""),
+            "driver_phone": str(r["driver_phone"] or ""),
+            "finish_datetime": iso_utc(r["finish_datetime"]),
+            "payment_type": str(r["payment_type"] or ""),
+            "scheduled_start": iso_utc(r["scheduled_start"]),
+            "service_place": str(r["service_place"] or "client"),
+            "execution_start": iso_utc(r["execution_start"]),
+            "service_types": r["service_types"] or [],
+            "preferred_slots": r["preferred_slots"] or [],
+        })
+
+    return unified_response("ok", "ACTIVE_REQUESTS", "active requests", {"items": items})
+
+# -------------------- Scheduling --------------------
 async def provider_is_free(provider_phone: str, start: datetime, end: datetime, exclude_order_id: Optional[int] = None) -> bool:
     provider = _normalize_phone(provider_phone)
     if not provider:
@@ -1551,7 +1735,7 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime, 
     q_exec = select(func.count()).select_from(RequestTable).where(
         (RequestTable.driver_phone == provider) &
         (RequestTable.execution_start.is_not(None)) &
-        (RequestTable.status.in_(["IN_PROGRESS", "STARTED"])) &
+        (RequestTable.status == STATUS_IN_PROGRESS) &
         (RequestTable.execution_start < end) &
         ((RequestTable.execution_start + one_hour) > start)
     )
@@ -1563,7 +1747,7 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime, 
     q_visit = select(func.count()).select_from(RequestTable).where(
         (RequestTable.driver_phone == provider) &
         (RequestTable.scheduled_start.is_not(None)) &
-        (RequestTable.status.in_(["WAITING", "ASSIGNED", "IN_PROGRESS", "STARTED"])) &
+        (RequestTable.status.in_([STATUS_WAITING, STATUS_ASSIGNED, STATUS_IN_PROGRESS])) &
         (RequestTable.scheduled_start < end) &
         ((RequestTable.scheduled_start + one_hour) > start)
     )
@@ -1577,8 +1761,10 @@ async def provider_is_free(provider_phone: str, start: datetime, end: datetime, 
 @app.get("/busy_slots")
 async def get_busy_slots(request: Request, date: str, exclude_order_id: Optional[int] = None):
     require_admin(request)
+
     d = datetime.fromisoformat(str(date).strip()).date()
     provider = get_admin_provider_phone(request)
+
     start = datetime(d.year, d.month, d.day, 0, 0, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
 
@@ -1604,7 +1790,7 @@ async def get_busy_slots(request: Request, date: str, exclude_order_id: Optional
         (RequestTable.execution_start >= start) &
         (RequestTable.execution_start < end) &
         (RequestTable.execution_start.is_not(None)) &
-        (RequestTable.status.in_(["IN_PROGRESS", "STARTED"])) &
+        (RequestTable.status == STATUS_IN_PROGRESS) &
         (RequestTable.driver_phone == provider)
     )
     if exclude_order_id:
@@ -1614,7 +1800,7 @@ async def get_busy_slots(request: Request, date: str, exclude_order_id: Optional
         (RequestTable.scheduled_start >= start) &
         (RequestTable.scheduled_start < end) &
         (RequestTable.scheduled_start.is_not(None)) &
-        (RequestTable.status.in_(["ASSIGNED", "IN_PROGRESS", "STARTED", "WAITING"])) &
+        (RequestTable.status.in_([STATUS_WAITING, STATUS_ASSIGNED, STATUS_IN_PROGRESS])) &
         (RequestTable.driver_phone == provider)
     )
     if exclude_order_id:
@@ -1637,15 +1823,20 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
     require_admin(request)
     provider = get_admin_provider_phone(request)
 
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    req = await database.fetch_one(
+        RequestTable.__table__.select().where(RequestTable.id == int(order_id))
+    )
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
-    if req["status"] in ["FINISH", "CANCELED"] or req["execution_start"]:
+
+    st = canon_status(str(req["status"] or ""))
+    if st in FINAL_ORDER_STATUSES or req["execution_start"]:
         raise HTTPException(status_code=409, detail="cannot propose slots")
 
     slots = sorted(list(set(body.slots)))[:3]
     if not slots:
         raise HTTPException(status_code=400, detail="slots required")
+
     slot_dts = [parse_iso(x) for x in slots]
 
     async with database.transaction():
@@ -1655,21 +1846,26 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
                 (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))
             ).values(status="REJECTED")
         )
+
         await database.execute(
             AppointmentTable.__table__.update().where(
                 (AppointmentTable.request_id == int(order_id)) &
                 (AppointmentTable.status == "BOOKED")
             ).values(status="CANCELED")
         )
+
         await database.execute(
             RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-                driver_phone=provider, status="WAITING", scheduled_start=None
+                driver_phone=provider,
+                status=STATUS_WAITING,
+                scheduled_start=None
             )
         )
 
         for dt in slot_dts:
             if not await provider_is_free(provider, dt, dt + timedelta(hours=1), exclude_order_id=int(order_id)):
                 raise HTTPException(status_code=409, detail="slot overlap")
+
             try:
                 await database.execute(
                     ScheduleSlotTable.__table__.insert().values(
@@ -1677,10 +1873,10 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
                         provider_phone=provider,
                         slot_start=dt,
                         status="PROPOSED",
-                        created_at=datetime.now(timezone.utc)
+                        created_at=utc_now()
                     )
                 )
-            except:
+            except Exception:
                 raise HTTPException(status_code=409, detail="slot conflict")
 
     try:
@@ -1691,7 +1887,7 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
             data=push_event_data(
                 event="visit_slots_proposed",
                 order_id=int(order_id),
-                status="WAITING",
+                status=STATUS_WAITING,
                 service_type=str(req["service_type"] or ""),
                 user_phone=str(req["user_phone"] or ""),
             ),
@@ -1699,11 +1895,18 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
     except Exception as e:
         logger.error(f"notify_user(propose_slots) failed: {e}")
 
-    return unified_response("ok", "SLOTS_PROPOSED", "slots proposed", {"accepted": [dt.isoformat() for dt in slot_dts]})
+    return unified_response(
+        "ok",
+        "SLOTS_PROPOSED",
+        "slots proposed",
+        {"accepted": [dt.isoformat() for dt in slot_dts]}
+    )
 
 @app.get("/order/{order_id}/proposed_slots")
 async def get_proposed_slots(order_id: int, request: Request):
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    req = await database.fetch_one(
+        RequestTable.__table__.select().where(RequestTable.id == int(order_id))
+    )
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
 
@@ -1715,6 +1918,7 @@ async def get_proposed_slots(order_id: int, request: Request):
             (ScheduleSlotTable.status == "PROPOSED")
         ).order_by(ScheduleSlotTable.slot_start.asc())
     )
+
     return unified_response(
         "ok",
         "PROPOSED_SLOTS",
@@ -1724,13 +1928,16 @@ async def get_proposed_slots(order_id: int, request: Request):
 
 @app.post("/order/{order_id}/confirm_slot")
 async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request):
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    req = await database.fetch_one(
+        RequestTable.__table__.select().where(RequestTable.id == int(order_id))
+    )
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
 
     require_user_phone(request, str(req["user_phone"]))
 
-    if req["execution_start"] or str(req["status"]).upper() not in ["WAITING", "ASSIGNED", "NEW"]:
+    st = canon_status(str(req["status"] or ""))
+    if req["execution_start"] or st not in [STATUS_WAITING, STATUS_ASSIGNED, STATUS_NEW]:
         raise HTTPException(status_code=409, detail="cannot confirm")
 
     slot_dt = parse_iso(body.slot)
@@ -1758,6 +1965,7 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request
                 ((AppointmentTable.start_time != slot_dt) | (AppointmentTable.end_time != end_dt))
             ).values(status="CANCELED")
         )
+
         await database.execute(
             ScheduleSlotTable.__table__.update().where(
                 (ScheduleSlotTable.request_id == int(order_id)) &
@@ -1765,6 +1973,7 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request
                 (ScheduleSlotTable.slot_start != slot_dt)
             ).values(status="REJECTED")
         )
+
         await database.execute(
             ScheduleSlotTable.__table__.update().where(
                 (ScheduleSlotTable.request_id == int(order_id)) &
@@ -1778,12 +1987,15 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request
                 (AppointmentTable.start_time == slot_dt)
             ).limit(1)
         )
+
         if exist:
             if str(exist["status"]) == "BOOKED" and int(exist["request_id"]) != int(order_id):
                 raise HTTPException(status_code=409, detail="conflict")
+
             await database.execute(
                 AppointmentTable.__table__.update().where(AppointmentTable.id == int(exist["id"])).values(
-                    request_id=int(order_id), status="BOOKED"
+                    request_id=int(order_id),
+                    status="BOOKED"
                 )
             )
         else:
@@ -1794,13 +2006,15 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request
                     start_time=slot_dt,
                     end_time=end_dt,
                     status="BOOKED",
-                    created_at=datetime.now(timezone.utc)
+                    created_at=utc_now()
                 )
             )
 
         await database.execute(
             RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-                scheduled_start=slot_dt, status="ASSIGNED", driver_phone=provider
+                scheduled_start=slot_dt,
+                status=STATUS_ASSIGNED,
+                driver_phone=provider
             )
         )
 
@@ -1811,7 +2025,7 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request
             data=push_event_data(
                 event="visit_time_confirmed",
                 order_id=int(order_id),
-                status="ASSIGNED",
+                status=STATUS_ASSIGNED,
                 service_type=str(req["service_type"] or ""),
                 user_phone=str(req["user_phone"] or ""),
                 scheduled_start=slot_dt,
@@ -1821,17 +2035,23 @@ async def confirm_slot(order_id: int, body: ConfirmSlotRequest, request: Request
     except Exception as e:
         logger.error(f"notify(confirm_slot) failed: {e}")
 
-    return unified_response("ok", "SLOT_CONFIRMED", "confirmed", {"start": slot_dt.isoformat(), "end": end_dt.isoformat()})
+    return unified_response("ok", "SLOT_CONFIRMED", "confirmed", {
+        "start": slot_dt.isoformat(),
+        "end": end_dt.isoformat()
+    })
 
 @app.post("/order/{order_id}/reject_all_and_cancel")
 async def reject_all_and_cancel(order_id: int, request: Request):
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    req = await database.fetch_one(
+        RequestTable.__table__.select().where(RequestTable.id == int(order_id))
+    )
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
 
     require_user_phone(request, str(req["user_phone"]))
 
-    if req["execution_start"] or str(req["status"]).upper() not in ["NEW", "WAITING", "ASSIGNED"]:
+    st = canon_status(str(req["status"] or ""))
+    if req["execution_start"] or st not in [STATUS_NEW, STATUS_WAITING, STATUS_ASSIGNED]:
         raise HTTPException(status_code=409, detail="cannot cancel")
 
     await database.execute(
@@ -1848,7 +2068,10 @@ async def reject_all_and_cancel(order_id: int, request: Request):
     )
     await database.execute(
         RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-            status="CANCELED", scheduled_start=None, execution_start=None
+            status=STATUS_CANCELED,
+            scheduled_start=None,
+            execution_start=None,
+            finish_datetime=None
         )
     )
 
@@ -1859,7 +2082,7 @@ async def reject_all_and_cancel(order_id: int, request: Request):
             data=push_event_data(
                 event="canceled_by_user",
                 order_id=int(order_id),
-                status="CANCELED",
+                status=STATUS_CANCELED,
                 service_type=str(req["service_type"] or ""),
                 user_phone=_normalize_phone(str(req["user_phone"])),
             ),
@@ -1872,18 +2095,24 @@ async def reject_all_and_cancel(order_id: int, request: Request):
 @app.post("/admin/order/{order_id}/price")
 async def admin_set_price(order_id: int, body: PriceBody, request: Request):
     require_admin(request)
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+
+    req = await database.fetch_one(
+        RequestTable.__table__.select().where(RequestTable.id == int(order_id))
+    )
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
 
     provider = _normalize_phone(str(req["driver_phone"] or ""))
-    new_status = "PRICE_REJECTED"
+    if not provider:
+        provider = get_admin_provider_phone(request)
+
+    new_status = STATUS_CANCELED if not body.agree else STATUS_IN_PROGRESS
     exec_dt = None
 
     async with database.transaction():
         if body.agree:
-            if not body.exec_time or not provider:
-                raise HTTPException(status_code=400, detail="exec_time/provider required")
+            if not body.exec_time:
+                raise HTTPException(status_code=400, detail="exec_time required")
 
             exec_dt = parse_iso(str(body.exec_time))
             end_dt = exec_dt + timedelta(hours=1)
@@ -1902,7 +2131,8 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):
                     raise HTTPException(status_code=409, detail="conflict")
                 await database.execute(
                     AppointmentTable.__table__.update().where(AppointmentTable.id == int(exist["id"])).values(
-                        request_id=int(order_id), status="BOOKED"
+                        request_id=int(order_id),
+                        status="BOOKED"
                     )
                 )
             else:
@@ -1913,18 +2143,36 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):
                         start_time=exec_dt,
                         end_time=end_dt,
                         status="BOOKED",
-                        created_at=datetime.now(timezone.utc)
+                        created_at=utc_now()
                     )
                 )
 
-            new_status = "IN_PROGRESS"
+        else:
+            await database.execute(
+                ScheduleSlotTable.__table__.update().where(
+                    (ScheduleSlotTable.request_id == int(order_id)) &
+                    (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))
+                ).values(status="REJECTED")
+            )
+            await database.execute(
+                AppointmentTable.__table__.update().where(
+                    (AppointmentTable.request_id == int(order_id)) &
+                    (AppointmentTable.status == "BOOKED")
+                ).values(status="CANCELED")
+            )
 
         saved = await database.fetch_one(
             RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
                 price=int(body.price),
                 status=new_status,
-                execution_start=exec_dt
-            ).returning(RequestTable.id, RequestTable.price, RequestTable.status, RequestTable.execution_start)
+                execution_start=exec_dt,
+                driver_phone=provider
+            ).returning(
+                RequestTable.id,
+                RequestTable.price,
+                RequestTable.status,
+                RequestTable.execution_start
+            )
         )
 
     try:
@@ -1936,7 +2184,7 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):
                 data=push_event_data(
                     event="execution_set",
                     order_id=int(order_id),
-                    status=str(new_status),
+                    status=STATUS_IN_PROGRESS,
                     service_type=str(req["service_type"] or ""),
                     user_phone=str(req["user_phone"] or ""),
                     scheduled_start=req["scheduled_start"],
@@ -1950,9 +2198,9 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):
                 title="",
                 body="",
                 data=push_event_data(
-                    event="price_disagreed",
+                    event="canceled_by_manager",
                     order_id=int(order_id),
-                    status=str(new_status),
+                    status=STATUS_CANCELED,
                     service_type=str(req["service_type"] or ""),
                     user_phone=str(req["user_phone"] or ""),
                     scheduled_start=req["scheduled_start"],
@@ -1967,27 +2215,31 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):
         "PRICE_SET",
         "updated",
         {
-            "order_id": saved["id"],
-            "price": saved["price"],
-            "status": saved["status"],
-            "execution_start": (saved["execution_start"].astimezone(timezone.utc).isoformat() if saved["execution_start"] else None)
+            "order_id": int(saved["id"]),
+            "price": int(saved["price"]),
+            "status": canon_status(str(saved["status"] or "")),
+            "execution_start": iso_utc(saved["execution_start"])
         }
     )
 
 @app.post("/order/{order_id}/finish")
 async def finish_order(order_id: int, request: Request):
     require_admin(request)
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+
+    req = await database.fetch_one(
+        RequestTable.__table__.select().where(RequestTable.id == int(order_id))
+    )
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
 
     async with database.transaction():
         await database.execute(
             RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-                status="FINISH",
-                finish_datetime=datetime.now(timezone.utc).isoformat()
+                status=STATUS_FINISH,
+                finish_datetime=utc_now()
             )
         )
+
         await database.execute(
             AppointmentTable.__table__.update().where(
                 (AppointmentTable.request_id == int(order_id)) &
@@ -2003,7 +2255,7 @@ async def finish_order(order_id: int, request: Request):
             data=push_event_data(
                 event="finished",
                 order_id=int(order_id),
-                status="FINISH",
+                status=STATUS_FINISH,
                 service_type=str(req["service_type"] or ""),
                 user_phone=str(req["user_phone"] or ""),
             ),
@@ -2011,28 +2263,37 @@ async def finish_order(order_id: int, request: Request):
     except Exception as e:
         logger.error(f"notify(finish) failed: {e}")
 
-    return unified_response("ok", "ORDER_FINISHED", "finished", {"order_id": int(order_id), "status": "FINISH"})
+    return unified_response("ok", "ORDER_FINISHED", "finished", {
+        "order_id": int(order_id),
+        "status": STATUS_FINISH
+    })
 
 @app.post("/admin/order/{order_id}/cancel")
 async def admin_cancel_order(order_id: int, request: Request):
     require_admin(request)
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+
+    req = await database.fetch_one(
+        RequestTable.__table__.select().where(RequestTable.id == int(order_id))
+    )
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
 
     await database.execute(
         RequestTable.__table__.update().where(RequestTable.id == int(order_id)).values(
-            status="CANCELED",
+            status=STATUS_CANCELED,
             scheduled_start=None,
-            execution_start=None
+            execution_start=None,
+            finish_datetime=None
         )
     )
+
     await database.execute(
         ScheduleSlotTable.__table__.update().where(
             (ScheduleSlotTable.request_id == int(order_id)) &
             (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"]))
         ).values(status="REJECTED")
     )
+
     await database.execute(
         AppointmentTable.__table__.update().where(
             (AppointmentTable.request_id == int(order_id)) &
@@ -2048,7 +2309,7 @@ async def admin_cancel_order(order_id: int, request: Request):
             data=push_event_data(
                 event="canceled_by_manager",
                 order_id=int(order_id),
-                status="CANCELED",
+                status=STATUS_CANCELED,
                 service_type=str(req["service_type"] or ""),
                 user_phone=str(req["user_phone"] or ""),
             ),
@@ -2056,7 +2317,10 @@ async def admin_cancel_order(order_id: int, request: Request):
     except Exception as e:
         logger.error(f"notify(admin_cancel) failed: {e}")
 
-    return unified_response("ok", "ORDER_CANCELED", "canceled by admin", {"order_id": int(order_id), "status": "CANCELED"})
+    return unified_response("ok", "ORDER_CANCELED", "canceled by admin", {
+        "order_id": int(order_id),
+        "status": STATUS_CANCELED
+    })
 
 # -------------------- Reviews --------------------
 @app.get("/reviews")
@@ -2092,7 +2356,7 @@ async def public_reviews(limit: int = 50, offset: int = 0):
             "user_name": str(r["user_name"] or ""),
             "rating": int(r["rating"] or 0),
             "comment": str(r["comment"] or ""),
-            "created_at": (r["created_at"].astimezone(timezone.utc).isoformat() if r["created_at"] else None),
+            "created_at": iso_utc(r["created_at"]),
         })
 
     avg_val = await database.fetch_val(
@@ -2113,13 +2377,15 @@ async def public_reviews(limit: int = 50, offset: int = 0):
 
 @app.post("/order/{order_id}/review/submit")
 async def submit_review(order_id: int, body: ReviewSubmitBody, request: Request):
-    req = await database.fetch_one(RequestTable.__table__.select().where(RequestTable.id == int(order_id)))
+    req = await database.fetch_one(
+        RequestTable.__table__.select().where(RequestTable.id == int(order_id))
+    )
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
 
     norm = require_user_phone(request, str(req["user_phone"]))
-    status = str(req["status"] or "").strip().upper()
-    if status not in ["FINISH", "DONE", "COMPLETED", "FINISHED"]:
+    status = canon_status(str(req["status"] or ""))
+    if status != STATUS_FINISH:
         raise HTTPException(status_code=409, detail="order is not finished")
 
     rating = int(body.rating or 0)
@@ -2140,7 +2406,7 @@ async def submit_review(order_id: int, body: ReviewSubmitBody, request: Request)
                 rating=rating,
                 comment=comment,
                 status="PENDING",
-                created_at=datetime.now(timezone.utc),
+                created_at=utc_now(),
                 decided_at=None,
                 decided_by=None,
             )
@@ -2153,7 +2419,7 @@ async def submit_review(order_id: int, body: ReviewSubmitBody, request: Request)
                 rating=rating,
                 comment=comment,
                 status="PENDING",
-                created_at=datetime.now(timezone.utc),
+                created_at=utc_now(),
             )
         )
 
@@ -2199,7 +2465,7 @@ async def admin_list_reviews(request: Request, status: str = "APPROVED", limit: 
             "rating": int(r["rating"] or 0),
             "comment": str(r["comment"] or ""),
             "status": str(r["status"] or ""),
-            "created_at": (r["created_at"].astimezone(timezone.utc).isoformat() if r["created_at"] else None),
+            "created_at": iso_utc(r["created_at"]),
         })
 
     avg = None
@@ -2225,7 +2491,9 @@ async def admin_list_reviews(request: Request, status: str = "APPROVED", limit: 
 async def admin_decide_review(review_id: int, body: ReviewDecisionBody, request: Request):
     require_admin(request)
 
-    row = await database.fetch_one(ReviewTable.__table__.select().where(ReviewTable.id == int(review_id)))
+    row = await database.fetch_one(
+        ReviewTable.__table__.select().where(ReviewTable.id == int(review_id))
+    )
     if not row:
         raise HTTPException(status_code=404, detail="review not found")
 
@@ -2235,47 +2503,318 @@ async def admin_decide_review(review_id: int, body: ReviewDecisionBody, request:
     await database.execute(
         ReviewTable.__table__.update()
         .where(ReviewTable.id == int(review_id))
-        .values(status=new_status, decided_at=datetime.now(timezone.utc), decided_by=decided_by)
+        .values(status=new_status, decided_at=utc_now(), decided_by=decided_by)
     )
 
-    return unified_response("ok", "REVIEW_DECIDED", "decided", {"id": int(review_id), "status": new_status})
+    return unified_response("ok", "REVIEW_DECIDED", "decided", {
+        "id": int(review_id),
+        "status": new_status
+    })
 
-# -------------------- Public Home (promotions + service prices + ratings) --------------------
-def _pick_i18n(d: dict, lang: str) -> str:
-    lang = (lang or "en").strip().lower()
-    if not isinstance(d, dict):
-        return ""
-    if d.get(lang):
-        return str(d.get(lang) or "")
-    if d.get("en"):
-        return str(d.get("en") or "")
-    for _, v in d.items():
-        if v:
-            return str(v)
-    return ""
+# -------------------- Admin: services --------------------
+@app.get("/admin/services")
+async def admin_list_services(request: Request):
+    require_admin(request)
 
+    # ratings per service_type
+    reviews = ReviewTable.__table__
+    reqs = RequestTable.__table__
+    q_rating = (
+        select(
+            reqs.c.service_type.label("service_type"),
+            func.avg(reviews.c.rating).label("avg_rating"),
+            func.count().label("review_count"),
+        )
+        .select_from(reviews.join(reqs, reqs.c.id == reviews.c.request_id))
+        .where(reviews.c.status == "APPROVED")
+        .group_by(reqs.c.service_type)
+    )
+    rr = await database.fetch_all(q_rating)
+    rating_map = {
+        str(x["service_type"] or "").strip().lower(): {
+            "avg": float(x["avg_rating"]) if x["avg_rating"] is not None else None,
+            "count": int(x["review_count"] or 0),
+        }
+        for x in rr
+    }
+
+    rows = await database.fetch_all(
+        ServicePriceTable.__table__
+        .select()
+        .order_by(
+            ServicePriceTable.__table__.c.sort_order.asc(),
+            ServicePriceTable.__table__.c.service_type.asc()
+        )
+    )
+
+    items = []
+    for r in rows:
+        svc = str(r["service_type"] or "").strip().lower()
+        rm = rating_map.get(svc, {"avg": None, "count": 0})
+
+        items.append({
+            "service_type": svc,
+            "base_price": int(r["base_price"] or 0),
+            "active": bool(r["active"]),
+            "sort_order": int(r["sort_order"] or 0),
+            "name_i18n": r["name_i18n"] or {},
+            "icon_url": _media_url(str(r["icon_path"] or "")),
+            "avg_rating": rm["avg"],
+            "review_count": rm["count"],
+            "updated_at": iso_utc(r["updated_at"]),
+        })
+
+    return unified_response("ok", "ADMIN_SERVICES", "services", {"items": items})
+
+@app.post("/admin/services")
+async def admin_upsert_service(
+    request: Request,
+    service_type: str = Form(...),
+    base_price: int = Form(0),
+    active: bool = Form(True),
+    sort_order: int = Form(0),
+    name_i18n: str = Form("{}"),
+    icon: Optional[UploadFile] = File(None),
+):
+    require_admin(request)
+
+    svc = str(service_type or "").strip().lower()
+    if not svc:
+        raise HTTPException(status_code=400, detail="service_type required")
+
+    bp = int(base_price or 0)
+    if bp < 0:
+        raise HTTPException(status_code=400, detail="base_price must be >= 0")
+
+    try:
+        nm = json.loads(name_i18n or "{}")
+        if not isinstance(nm, dict):
+            raise ValueError()
+    except Exception:
+        raise HTTPException(status_code=400, detail="name_i18n must be JSON object string")
+
+    existing = await database.fetch_one(
+        ServicePriceTable.__table__.select().where(ServicePriceTable.__table__.c.service_type == svc)
+    )
+
+    patch = {
+        "base_price": bp,
+        "active": bool(active),
+        "sort_order": int(sort_order),
+        "name_i18n": nm,
+        "updated_at": utc_now(),
+    }
+
+    if icon is not None:
+        rel_path, mime, _ = await _save_image_upload(icon, subdir="services")
+        if existing and str(existing["icon_path"] or "").strip():
+            _delete_media_file(str(existing["icon_path"]))
+        patch["icon_path"] = rel_path
+        patch["icon_mime"] = mime
+
+    if existing:
+        await database.execute(
+            ServicePriceTable.__table__
+            .update()
+            .where(ServicePriceTable.__table__.c.service_type == svc)
+            .values(**patch)
+        )
+    else:
+        vals = dict(patch)
+        vals["service_type"] = svc
+        vals.setdefault("icon_path", "")
+        vals.setdefault("icon_mime", "")
+        await database.execute(ServicePriceTable.__table__.insert().values(**vals))
+
+    return unified_response("ok", "SERVICE_UPSERTED", "saved", {"service_type": svc})
+
+# -------------------- Admin: promotions --------------------
+@app.get("/admin/promotions")
+async def admin_list_promotions(request: Request):
+    require_admin(request)
+
+    rows = await database.fetch_all(
+        PromotionTable.__table__.select().order_by(
+            PromotionTable.__table__.c.sort_order.asc(),
+            PromotionTable.__table__.c.id.asc()
+        )
+    )
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": int(r["id"]),
+            "active": bool(r["active"]),
+            "sort_order": int(r["sort_order"] or 0),
+            "title_i18n": r["title_i18n"] or {},
+            "subtitle_i18n": r["subtitle_i18n"] or {},
+            "service_types": r["service_types"] or [],
+            "discount_amount": int(r["discount_amount"] or 0),
+            "image_url": _media_url(str(r["image_path"] or "")),
+            "created_at": iso_utc(r["created_at"]),
+            "updated_at": iso_utc(r["updated_at"]),
+        })
+
+    return unified_response("ok", "PROMOTIONS", "promotions", {"items": items})
+
+@app.post("/admin/promotions")
+async def admin_create_promotion(
+    request: Request,
+    active: bool = Form(True),
+    sort_order: int = Form(0),
+    title_i18n: str = Form("{}"),
+    subtitle_i18n: str = Form("{}"),
+    service_types: str = Form(""),
+    discount_amount: int = Form(0),
+    image: Optional[UploadFile] = File(None),
+):
+    require_admin(request)
+
+    try:
+        title_map = json.loads(title_i18n or "{}")
+        subtitle_map = json.loads(subtitle_i18n or "{}")
+        if not isinstance(title_map, dict) or not isinstance(subtitle_map, dict):
+            raise ValueError()
+    except Exception:
+        raise HTTPException(status_code=400, detail="title_i18n/subtitle_i18n must be JSON object strings")
+
+    svc_list = []
+    if service_types.strip():
+        svc_list = [s.strip().lower() for s in service_types.split(",") if s.strip()]
+
+    if int(discount_amount or 0) < 0:
+        raise HTTPException(status_code=400, detail="discount_amount must be >= 0")
+
+    rel_path = ""
+    mime = ""
+    if image is not None:
+        rel_path, mime, _ = await _save_image_upload(image, subdir="promotions")
+
+    now = utc_now()
+    row = await database.fetch_one(
+        PromotionTable.__table__.insert().values(
+            active=bool(active),
+            sort_order=int(sort_order),
+            title_i18n=title_map,
+            subtitle_i18n=subtitle_map,
+            service_types=svc_list,
+            discount_amount=int(discount_amount or 0),
+            image_path=rel_path,
+            image_mime=mime,
+            created_at=now,
+            updated_at=now,
+        ).returning(PromotionTable.__table__.c.id)
+    )
+
+    pid = int(row["id"]) if row and row["id"] else 0
+    return unified_response("ok", "PROMOTION_CREATED", "created", {"id": pid})
+
+@app.put("/admin/promotions/{promo_id}")
+async def admin_update_promotion(
+    promo_id: int,
+    request: Request,
+    active: Optional[bool] = Form(None),
+    sort_order: Optional[int] = Form(None),
+    title_i18n: Optional[str] = Form(None),
+    subtitle_i18n: Optional[str] = Form(None),
+    service_types: Optional[str] = Form(None),
+    discount_amount: Optional[int] = Form(None),
+    image: Optional[UploadFile] = File(None),
+):
+    require_admin(request)
+
+    old = await database.fetch_one(
+        PromotionTable.__table__.select().where(PromotionTable.__table__.c.id == int(promo_id))
+    )
+    if not old:
+        raise HTTPException(status_code=404, detail="promotion not found")
+
+    patch: dict = {"updated_at": utc_now()}
+
+    if active is not None:
+        patch["active"] = bool(active)
+    if sort_order is not None:
+        patch["sort_order"] = int(sort_order)
+    if discount_amount is not None:
+        da = int(discount_amount or 0)
+        if da < 0:
+            raise HTTPException(status_code=400, detail="discount_amount must be >= 0")
+        patch["discount_amount"] = da
+
+    if title_i18n is not None:
+        try:
+            v = json.loads(title_i18n or "{}")
+            if not isinstance(v, dict):
+                raise ValueError()
+            patch["title_i18n"] = v
+        except Exception:
+            raise HTTPException(status_code=400, detail="title_i18n must be JSON object string")
+
+    if subtitle_i18n is not None:
+        try:
+            v = json.loads(subtitle_i18n or "{}")
+            if not isinstance(v, dict):
+                raise ValueError()
+            patch["subtitle_i18n"] = v
+        except Exception:
+            raise HTTPException(status_code=400, detail="subtitle_i18n must be JSON object string")
+
+    if service_types is not None:
+        patch["service_types"] = [s.strip().lower() for s in (service_types or "").split(",") if s.strip()]
+
+    if image is not None:
+        rel_path, mime, _ = await _save_image_upload(image, subdir="promotions")
+        if str(old["image_path"] or "").strip():
+            _delete_media_file(str(old["image_path"]))
+        patch["image_path"] = rel_path
+        patch["image_mime"] = mime
+
+    await database.execute(
+        PromotionTable.__table__.update().where(PromotionTable.__table__.c.id == int(promo_id)).values(**patch)
+    )
+    return unified_response("ok", "PROMOTION_UPDATED", "updated", {"id": int(promo_id)})
+
+@app.delete("/admin/promotions/{promo_id}")
+async def admin_delete_promotion(promo_id: int, request: Request):
+    require_admin(request)
+
+    old = await database.fetch_one(
+        PromotionTable.__table__.select().where(PromotionTable.__table__.c.id == int(promo_id))
+    )
+    if not old:
+        raise HTTPException(status_code=404, detail="promotion not found")
+
+    if str(old["image_path"] or "").strip():
+        _delete_media_file(str(old["image_path"]))
+
+    await database.execute(
+        PromotionTable.__table__.delete().where(PromotionTable.__table__.c.id == int(promo_id))
+    )
+    return unified_response("ok", "PROMOTION_DELETED", "deleted", {"id": int(promo_id)})
+
+# -------------------- Public Home --------------------
 @app.get("/public/home")
 async def public_home(lang: str = "en"):
-    # promotions (active + ordered)
     promos = PromotionTable.__table__
     q = (
         promos.select()
         .where(promos.c.active == True)
         .order_by(promos.c.sort_order.asc(), promos.c.id.asc())
     )
-    rows = await database.fetch_all(q)
+    promo_rows = await database.fetch_all(q)
 
     promo_items = []
-    for r in rows:
+    for r in promo_rows:
         promo_items.append({
             "id": int(r["id"]),
             "title": _pick_i18n(r["title_i18n"] or {}, lang),
             "subtitle": _pick_i18n(r["subtitle_i18n"] or {}, lang),
             "service_types": (r["service_types"] or []),
+            "discount_amount": int(r["discount_amount"] or 0),
             "image_url": _media_url(str(r["image_path"] or "")),
         })
 
-    # ratings per service_type (from approved reviews joined to requests)
+    # ratings per service_type
     reviews = ReviewTable.__table__
     reqs = RequestTable.__table__
     q_rating = (
@@ -2297,7 +2836,6 @@ async def public_home(lang: str = "en"):
         for x in rr
     }
 
-    # services from catalog table (service_prices)
     svc_rows = await database.fetch_all(
         ServicePriceTable.__table__
         .select()
@@ -2309,11 +2847,12 @@ async def public_home(lang: str = "en"):
     )
 
     services = []
+    service_map = {}
     for r in svc_rows:
         k = str(r["service_type"] or "").strip().lower()
         rm = rating_map.get(k, {"avg": None, "count": 0})
 
-        services.append({
+        item = {
             "service_type": k,
             "name": _pick_i18n(r["name_i18n"] or {}, lang),
             "icon_url": _media_url(str(r["icon_path"] or "")),
@@ -2321,185 +2860,43 @@ async def public_home(lang: str = "en"):
             "avg_rating": rm["avg"],
             "review_count": rm["count"],
             "sort_order": int(r["sort_order"] or 0),
+        }
+        services.append(item)
+        service_map[k] = item
+
+    # promotion details for user page on tap
+    promotion_details = []
+    for p in promo_rows:
+        svc_types = [str(x).strip().lower() for x in (p["service_types"] or []) if str(x).strip()]
+        details = []
+        discount_amount = int(p["discount_amount"] or 0)
+
+        for svc in svc_types:
+            if svc not in service_map:
+                continue
+            base_price = int(service_map[svc]["base_price"] or 0)
+            final_price = max(0, base_price - discount_amount)
+            details.append({
+                "service_type": svc,
+                "name": service_map[svc]["name"],
+                "icon_url": service_map[svc]["icon_url"],
+                "base_price": base_price,
+                "discount_amount": discount_amount,
+                "discounted_price": final_price,
+                "avg_rating": service_map[svc]["avg_rating"],
+            })
+
+        promotion_details.append({
+            "id": int(p["id"]),
+            "title": _pick_i18n(p["title_i18n"] or {}, lang),
+            "subtitle": _pick_i18n(p["subtitle_i18n"] or {}, lang),
+            "discount_amount": discount_amount,
+            "image_url": _media_url(str(p["image_path"] or "")),
+            "services": details,
         })
 
     return unified_response("ok", "PUBLIC_HOME", "home", {
         "promotions": promo_items,
+        "promotion_details": promotion_details,
         "services": services,
     })
-    
-# -------------------- Admin: promotions CRUD --------------------
-@app.get("/admin/promotions")
-async def admin_list_promotions(request: Request):
-    require_admin(request)
-    rows = await database.fetch_all(
-        PromotionTable.__table__.select().order_by(PromotionTable.__table__.c.sort_order.asc(), PromotionTable.__table__.c.id.asc())
-    )
-    items = []
-    for r in rows:
-        items.append({
-            "id": int(r["id"]),
-            "active": bool(r["active"]),
-            "sort_order": int(r["sort_order"] or 0),
-            "title_i18n": r["title_i18n"] or {},
-            "subtitle_i18n": r["subtitle_i18n"] or {},
-            "service_types": r["service_types"] or [],
-            "image_url": _media_url(str(r["image_path"] or "")),
-            "created_at": (r["created_at"].astimezone(timezone.utc).isoformat() if r["created_at"] else None),
-            "updated_at": (r["updated_at"].astimezone(timezone.utc).isoformat() if r["updated_at"] else None),
-        })
-    return unified_response("ok", "PROMOTIONS", "promotions", {"items": items})
-
-@app.post("/admin/promotions")
-async def admin_create_promotion(
-    request: Request,
-    active: bool = Form(True),
-    sort_order: int = Form(0),
-    title_i18n: str = Form("{}"),
-    subtitle_i18n: str = Form("{}"),
-    service_types: str = Form(""),
-    image: Optional[UploadFile] = File(None),
-):
-    require_admin(request)
-
-    try:
-        title_map = json.loads(title_i18n or "{}")
-        subtitle_map = json.loads(subtitle_i18n or "{}")
-        if not isinstance(title_map, dict) or not isinstance(subtitle_map, dict):
-            raise ValueError()
-    except Exception:
-        raise HTTPException(status_code=400, detail="title_i18n/subtitle_i18n must be JSON object strings")
-
-    svc_list = []
-    if service_types.strip():
-        svc_list = [s.strip().lower() for s in service_types.split(",") if s.strip()]
-
-    rel_path = ""
-    mime = ""
-    if image is not None:
-        rel_path, mime, _ = await _save_image_upload(image, subdir="promotions")
-
-    now = datetime.now(timezone.utc)
-    row = await database.fetch_one(
-        PromotionTable.__table__.insert().values(
-            active=bool(active),
-            sort_order=int(sort_order),
-            title_i18n=title_map,
-            subtitle_i18n=subtitle_map,
-            service_types=svc_list,
-            image_path=rel_path,
-            image_mime=mime,
-            created_at=now,
-            updated_at=now,
-        ).returning(PromotionTable.__table__.c.id)
-    )
-    pid = int(row["id"]) if row and row["id"] else 0
-    return unified_response("ok", "PROMOTION_CREATED", "created", {"id": pid})
-
-@app.put("/admin/promotions/{promo_id}")
-async def admin_update_promotion(
-    promo_id: int,
-    request: Request,
-    active: Optional[bool] = Form(None),
-    sort_order: Optional[int] = Form(None),
-    title_i18n: Optional[str] = Form(None),
-    subtitle_i18n: Optional[str] = Form(None),
-    service_types: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None),
-):
-    require_admin(request)
-
-    old = await database.fetch_one(PromotionTable.__table__.select().where(PromotionTable.__table__.c.id == int(promo_id)))
-    if not old:
-        raise HTTPException(status_code=404, detail="promotion not found")
-
-    patch: dict = {"updated_at": datetime.now(timezone.utc)}
-
-    if active is not None:
-        patch["active"] = bool(active)
-    if sort_order is not None:
-        patch["sort_order"] = int(sort_order)
-
-    if title_i18n is not None:
-        try:
-            v = json.loads(title_i18n or "{}")
-            if not isinstance(v, dict):
-                raise ValueError()
-            patch["title_i18n"] = v
-        except Exception:
-            raise HTTPException(status_code=400, detail="title_i18n must be JSON object string")
-
-    if subtitle_i18n is not None:
-        try:
-            v = json.loads(subtitle_i18n or "{}")
-            if not isinstance(v, dict):
-                raise ValueError()
-            patch["subtitle_i18n"] = v
-        except Exception:
-            raise HTTPException(status_code=400, detail="subtitle_i18n must be JSON object string")
-
-    if service_types is not None:
-        svc_list = [s.strip().lower() for s in (service_types or "").split(",") if s.strip()]
-        patch["service_types"] = svc_list
-
-    if image is not None:
-        rel_path, mime, _ = await _save_image_upload(image, subdir="promotions")
-        # delete old image
-        if str(old("image_path") or "").strip():
-            _delete_media_file(str(old["image_path"]))
-        patch["image_path"] = rel_path
-        patch["image_mime"] = mime
-
-    await database.execute(
-        PromotionTable.__table__.update().where(PromotionTable.__table__.c.id == int(promo_id)).values(**patch)
-    )
-    return unified_response("ok", "PROMOTION_UPDATED", "updated", {"id": int(promo_id)})
-
-@app.delete("/admin/promotions/{promo_id}")
-async def admin_delete_promotion(promo_id: int, request: Request):
-    require_admin(request)
-    old = await database.fetch_one(PromotionTable.__table__.select().where(PromotionTable.__table__.c.id == int(promo_id)))
-    if not old:
-        raise HTTPException(status_code=404, detail="promotion not found")
-
-    if str(old("image_path") or "").strip():
-        _delete_media_file(str(old["image_path"]))
-
-    await database.execute(PromotionTable.__table__.delete().where(PromotionTable.__table__.c.id == int(promo_id)))
-    return unified_response("ok", "PROMOTION_DELETED", "deleted", {"id": int(promo_id)})
-
-# -------------------- Admin: service prices --------------------
-@app.get("/admin/service_prices")
-async def admin_list_service_prices(request: Request):
-    require_admin(request)
-    rows = await database.fetch_all(ServicePriceTable.__table__.select().order_by(ServicePriceTable.__table__.c.service_type.asc()))
-    items = [{
-        "service_type": str(r["service_type"] or ""),
-        "base_price": int(r["base_price"] or 0),
-        "updated_at": (r["updated_at"].astimezone(timezone.utc).isoformat() if r["updated_at"] else None),
-    } for r in rows]
-    return unified_response("ok", "SERVICE_PRICES", "prices", {"items": items})
-
-@app.post("/admin/service_prices")
-async def admin_upsert_service_price(body: ServicePriceUpsertBody, request: Request):
-    require_admin(request)
-    svc = str(body.service_type or "").strip().lower()
-    if not svc:
-        raise HTTPException(status_code=400, detail="service_type required")
-    bp = int(body.base_price or 0)
-    if bp < 0:
-        raise HTTPException(status_code=400, detail="base_price must be >= 0")
-
-    now = datetime.now(timezone.utc)
-    existing = await database.fetch_one(ServicePriceTable.__table__.select().where(ServicePriceTable.__table__.c.service_type == svc))
-    if existing:
-        await database.execute(
-            ServicePriceTable.__table__.update().where(ServicePriceTable.__table__.c.service_type == svc).values(
-                base_price=bp, updated_at=now
-            )
-        )
-    else:
-        await database.execute(
-            ServicePriceTable.__table__.insert().values(service_type=svc, base_price=bp, updated_at=now)
-        )
-    return unified_response("ok", "SERVICE_PRICE_SAVED", "saved", {"service_type": svc, "base_price": bp})
