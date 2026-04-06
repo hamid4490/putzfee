@@ -11,7 +11,7 @@ import hashlib
 import secrets
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 
 import bcrypt
 import jwt
@@ -20,7 +20,7 @@ import httpx
 from dotenv import load_dotenv
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -29,10 +29,10 @@ import sqlalchemy
 from databases import Database
 from sqlalchemy import (
     Column, Integer, String, Float, Boolean, DateTime,
-    ForeignKey, Index, select, func, text, UniqueConstraint
+    ForeignKey, Index, select, func, UniqueConstraint
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 
 # -------------------- Config --------------------
 load_dotenv()
@@ -63,16 +63,18 @@ PUSH_BACKEND = os.getenv("PUSH_BACKEND", "fcm").strip().lower()
 NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh").strip()
 NTFY_AUTH = os.getenv("NTFY_AUTH", "").strip()
 
-# --- Media ---
 MEDIA_DIR = os.getenv("MEDIA_DIR", "media").strip() or "media"
 MEDIA_URL_PREFIX = os.getenv("MEDIA_URL_PREFIX", "/media").strip() or "/media"
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "5000000"))
-
 MEDIA_TARGET_WIDTH = int(os.getenv("MEDIA_TARGET_WIDTH", "1200"))
 MEDIA_TARGET_HEIGHT = int(os.getenv("MEDIA_TARGET_HEIGHT", "1200"))
-MEDIA_SAVE_FORMAT = os.getenv("MEDIA_SAVE_FORMAT", "JPEG").strip().upper()  # JPEG | PNG | WEBP
+MEDIA_SAVE_FORMAT = os.getenv("MEDIA_SAVE_FORMAT", "JPEG").strip().upper()
 MEDIA_JPEG_QUALITY = int(os.getenv("MEDIA_JPEG_QUALITY", "82"))
 MEDIA_WEBP_QUALITY = int(os.getenv("MEDIA_WEBP_QUALITY", "82"))
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
+
+ENABLE_SCHEMA_CREATE = os.getenv("ENABLE_SCHEMA_CREATE", "true").strip().lower() in ("1", "true", "yes", "on")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is empty")
@@ -114,6 +116,9 @@ FINAL_ORDER_STATUSES = [
     STATUS_FINISH,
     STATUS_CANCELED,
 ]
+
+ROLE_USER = "user"
+ROLE_ADMIN = "admin"
 
 # -------------------- Helpers: phone --------------------
 def _normalize_phone(p: str) -> str:
@@ -180,9 +185,22 @@ def iso_utc(dt: Optional[datetime]) -> Optional[str]:
 # -------------------- Helpers: status --------------------
 def canon_status(raw: str) -> str:
     s = str(raw or "").strip().upper()
-    if s in (STATUS_NEW, STATUS_WAITING, STATUS_ASSIGNED, STATUS_IN_PROGRESS, STATUS_FINISH, STATUS_CANCELED):
-        return s
-    return STATUS_NEW
+    mapping = {
+        "NEW": STATUS_NEW,
+        "WAITING": STATUS_WAITING,
+        "PENDING": STATUS_WAITING,
+        "ASSIGNED": STATUS_ASSIGNED,
+        "IN_PROGRESS": STATUS_IN_PROGRESS,
+        "STARTED": STATUS_IN_PROGRESS,
+        "FINISH": STATUS_FINISH,
+        "DONE": STATUS_FINISH,
+        "COMPLETED": STATUS_FINISH,
+        "FINISHED": STATUS_FINISH,
+        "CANCELED": STATUS_CANCELED,
+        "CANCELLED": STATUS_CANCELED,
+        "PRICE_REJECTED": STATUS_CANCELED,
+    }
+    return mapping.get(s, STATUS_NEW)
 
 # -------------------- Security helpers --------------------
 def bcrypt_hash_password(password: str) -> str:
@@ -197,11 +215,12 @@ def verify_password_secure(password: str, stored_hash: str) -> bool:
     except Exception:
         return False
 
-def create_access_token(subject_phone: str) -> str:
+def create_access_token(subject_phone: str, role: str) -> str:
     now = utc_now()
     exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(subject_phone),
+        "role": str(role),
         "type": "access",
         "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
@@ -241,6 +260,9 @@ def require_user_phone(request: Request, expected_phone: str) -> str:
     if not payload or not payload.get("sub"):
         raise HTTPException(status_code=401, detail="invalid token")
 
+    if str(payload.get("role") or "") != ROLE_USER:
+        raise HTTPException(status_code=403, detail="forbidden")
+
     sub = _normalize_phone(str(payload.get("sub") or ""))
     exp = _normalize_phone(expected_phone)
     if sub != exp:
@@ -258,7 +280,8 @@ def require_admin(request: Request) -> str:
     if token:
         payload = decode_access_token(token)
         sub = _normalize_phone(str((payload or {}).get("sub") or ""))
-        if sub and sub in ADMIN_PHONES_SET:
+        role = str((payload or {}).get("role") or "")
+        if role == ROLE_ADMIN and sub and sub in ADMIN_PHONES_SET:
             return sub
 
     key = (request.headers.get("x-admin-key") or request.headers.get("X-Admin-Key") or "").strip()
@@ -298,7 +321,10 @@ def _media_url(rel_path: str) -> Optional[str]:
     rel = _safe_relpath(rel_path)
     if not rel:
         return None
-    return f"{MEDIA_URL_PREFIX}/{rel}"
+    path = f"{MEDIA_URL_PREFIX}/{rel}"
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL.rstrip('/')}{path}"
+    return path
 
 def _target_ext_and_mime() -> Tuple[str, str]:
     fmt = MEDIA_SAVE_FORMAT.upper()
@@ -312,11 +338,10 @@ def _normalize_and_encode_image(data: bytes) -> Tuple[bytes, str]:
     try:
         with Image.open(io.BytesIO(data)) as im:
             im = ImageOps.exif_transpose(im)
-
             target_fmt = MEDIA_SAVE_FORMAT.upper()
 
             if target_fmt in ("JPEG", "JPG", "WEBP"):
-                if im.mode not in ("RGB",):
+                if im.mode != "RGB":
                     bg = Image.new("RGB", im.size, (255, 255, 255))
                     if "A" in im.getbands():
                         bg.paste(im, mask=im.getchannel("A"))
@@ -340,7 +365,6 @@ def _normalize_and_encode_image(data: bytes) -> Tuple[bytes, str]:
             encoded = out.getvalue()
             _, mime = _target_ext_and_mime()
             return encoded, mime
-
     except UnidentifiedImageError:
         raise HTTPException(status_code=400, detail="invalid image file")
     except Exception as e:
@@ -397,7 +421,6 @@ class UserTable(Base):
     address = Column(String, default="", nullable=False)
     name = Column(String, default="", nullable=False)
     car_list = Column(JSONB, default=list, nullable=False)
-
     photo_path = Column(String, default="", nullable=False)
     photo_mime = Column(String, default="", nullable=False)
     photo_updated_at = Column(DateTime(timezone=True), nullable=True)
@@ -405,49 +428,34 @@ class UserTable(Base):
 class RequestTable(Base):
     __tablename__ = "requests"
     id = Column(Integer, primary_key=True, index=True)
-
     user_phone = Column(String, index=True, nullable=False)
-
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
-
     car_list = Column(JSONB, default=list, nullable=False)
-
     address = Column(String, default="", nullable=False)
     home_number = Column(String, default="", nullable=False)
-
     service_type = Column(String, index=True, nullable=False)
     service_types = Column(JSONB, default=list, nullable=False)
     preferred_slots = Column(JSONB, default=list, nullable=False)
-
     price = Column(Integer, default=0, nullable=False)
-
     request_datetime = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
     finish_datetime = Column(DateTime(timezone=True), nullable=True)
-
     status = Column(String, default=STATUS_NEW, index=True, nullable=False)
-
     driver_name = Column(String, default="", nullable=False)
     driver_phone = Column(String, default="", nullable=False)
-
     payment_type = Column(String, default="", nullable=False)
     service_place = Column(String, default="client", nullable=False)
-
     scheduled_start = Column(DateTime(timezone=True), nullable=True)
     execution_start = Column(DateTime(timezone=True), nullable=True)
 
 class ReviewTable(Base):
     __tablename__ = "reviews"
     id = Column(Integer, primary_key=True, index=True)
-
     request_id = Column(Integer, ForeignKey("requests.id"), unique=True, index=True, nullable=False)
     user_phone = Column(String, index=True, nullable=False)
-
     rating = Column(Integer, nullable=False)
     comment = Column(String, default="", nullable=False)
-
     status = Column(String, default="PENDING", index=True, nullable=False)
-
     created_at = Column(DateTime(timezone=True), default=utc_now, index=True, nullable=False)
     decided_at = Column(DateTime(timezone=True), nullable=True)
     decided_by = Column(String, nullable=True)
@@ -519,7 +527,7 @@ class DeviceTokenTable(Base):
     __tablename__ = "device_tokens"
     id = Column(Integer, primary_key=True, index=True)
     token = Column(String, unique=True, index=True, nullable=False)
-    role = Column(String, index=True, nullable=False)  # client | manager
+    role = Column(String, index=True, nullable=False)
     platform = Column(String, default="android", index=True, nullable=False)
     user_phone = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
@@ -531,34 +539,25 @@ class PromotionTable(Base):
     id = Column(Integer, primary_key=True, index=True)
     active = Column(Boolean, default=True, index=True, nullable=False)
     sort_order = Column(Integer, default=0, index=True, nullable=False)
-
     title_i18n = Column(JSONB, default=dict, nullable=False)
     subtitle_i18n = Column(JSONB, default=dict, nullable=False)
-
     service_types = Column(JSONB, default=list, nullable=False)
     discount_amount = Column(Integer, default=0, nullable=False)
-
     image_path = Column(String, default="", nullable=False)
     image_mime = Column(String, default="", nullable=False)
-
     created_at = Column(DateTime(timezone=True), default=utc_now, index=True, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utc_now, index=True, nullable=False)
 
 class ServicePriceTable(Base):
     __tablename__ = "service_prices"
     id = Column(Integer, primary_key=True, index=True)
-
     service_type = Column(String, unique=True, index=True, nullable=False)
     base_price = Column(Integer, default=0, nullable=False)
-
     active = Column(Boolean, default=True, index=True, nullable=False)
     sort_order = Column(Integer, default=0, index=True, nullable=False)
-
     name_i18n = Column(JSONB, default=dict, nullable=False)
-
     icon_path = Column(String, default="", nullable=False)
     icon_mime = Column(String, default="", nullable=False)
-
     updated_at = Column(DateTime(timezone=True), default=utc_now, index=True, nullable=False)
 
 # -------------------- Pydantic models --------------------
@@ -653,9 +652,9 @@ class AdminLoginRequest(BaseModel):
     phone: str
     password: str
 
-class ServicePriceUpsertBody(BaseModel):
-    service_type: str
-    base_price: int
+class NotificationReadBody(BaseModel):
+    notification_id: Optional[int] = None
+    order_id: Optional[int] = None
 
 # -------------------- Push helpers --------------------
 _FCM_OAUTH_TOKEN = ""
@@ -672,10 +671,9 @@ def _load_service_account() -> Optional[dict]:
                 pk = str(data.get("private_key", ""))
                 if "\\n" in pk:
                     data["private_key"] = pk.replace("\\n", "\n")
-                logger.info("Service Account loaded successfully from Base64")
                 return data
         except Exception as e:
-            logger.error(f"Failed to load Service Account from Base64: {e}")
+            logger.error(f"Failed to load SA from Base64: {e}")
 
     raw_val = GOOGLE_APPLICATION_CREDENTIALS_JSON
     if raw_val:
@@ -685,17 +683,13 @@ def _load_service_account() -> Optional[dict]:
                 pk = str(data.get("private_key", ""))
                 if "\\n" in pk:
                     data["private_key"] = pk.replace("\\n", "\n")
-                logger.info("Service Account loaded successfully from JSON Raw")
                 return data
         except Exception as e:
-            logger.error(f"Failed to load Service Account from JSON Raw: {e}")
-
-    logger.error("No valid Service Account found. Check env vars.")
+            logger.error(f"Failed to load SA from JSON: {e}")
     return None
 
 def _get_oauth2_token_for_fcm() -> Optional[str]:
     global _FCM_OAUTH_TOKEN, _FCM_OAUTH_EXP
-
     now = time.time()
     if _FCM_OAUTH_TOKEN and (_FCM_OAUTH_EXP - 60) > now:
         return _FCM_OAUTH_TOKEN
@@ -736,7 +730,6 @@ def _get_oauth2_token_for_fcm() -> Optional[str]:
             return token
     except Exception as e:
         logger.error(f"OAuth exception: {e}")
-
     return None
 
 def _to_fcm_data(data: dict) -> dict:
@@ -780,10 +773,7 @@ def push_event_data(
     return data
 
 async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict) -> None:
-    if not tokens:
-        return
-    if not FCM_SERVER_KEY:
-        logger.error("FCM_SERVER_KEY is empty")
+    if not tokens or not FCM_SERVER_KEY:
         return
 
     headers = {
@@ -807,12 +797,7 @@ async def _send_fcm_legacy(tokens: List[str], title: str, body: str, data: dict)
 
 async def _send_fcm_v1_single(token: str, title: str, body: str, data: dict) -> None:
     access = _get_oauth2_token_for_fcm()
-    if not access:
-        logger.error("FCM v1 oauth token not available")
-        return
-
-    if not FCM_PROJECT_ID:
-        logger.error("FCM_PROJECT_ID is empty")
+    if not access or not FCM_PROJECT_ID:
         return
 
     headers = {
@@ -845,16 +830,13 @@ async def push_notify_tokens(tokens: List[str], title: str, body: str, data: dic
 
     if PUSH_BACKEND == "fcm":
         sa = _load_service_account()
-        if FCM_PROJECT_ID and (sa is not None):
+        if FCM_PROJECT_ID and sa is not None:
             for t in tokens:
                 await _send_fcm_v1_single(t, title, body, data)
             return
-
         if FCM_SERVER_KEY:
             await _send_fcm_legacy(tokens, title, body, data)
             return
-
-        logger.error("Cannot send FCM: config missing")
         return
 
     if PUSH_BACKEND == "ntfy":
@@ -866,8 +848,6 @@ async def push_notify_tokens(tokens: List[str], title: str, body: str, data: dic
             for topic in tokens:
                 await client.post(f"{base}/{topic}", headers=headers, data=body.encode("utf-8"))
         return
-
-    logger.error(f"unknown PUSH_BACKEND={PUSH_BACKEND}")
 
 async def get_manager_tokens(target_phone: Optional[str] = None) -> List[str]:
     q = DeviceTokenTable.__table__.select().where(
@@ -906,7 +886,6 @@ async def get_user_tokens(phone: str) -> List[str]:
 
 async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = None) -> None:
     norm = _normalize_phone(phone)
-
     await database.execute(
         NotificationTable.__table__.insert().values(
             user_phone=norm,
@@ -919,27 +898,18 @@ async def notify_user(phone: str, title: str, body: str, data: Optional[dict] = 
     )
 
     tokens = await get_user_tokens(norm)
-    if not tokens:
-        logger.info(f"no user tokens for phone={norm}")
-        return
-
-    await push_notify_tokens(tokens, str(title or ""), str(body or ""), data or {})
+    if tokens:
+        await push_notify_tokens(tokens, str(title or ""), str(body or ""), data or {})
 
 async def notify_managers(title: str, body: str, data: Optional[dict] = None, target_phone: Optional[str] = None) -> None:
     tokens = await get_manager_tokens(target_phone=target_phone)
-
     if not tokens and target_phone:
         tokens = await get_manager_tokens(target_phone=None)
-
-    if not tokens:
-        logger.info("no manager tokens")
-        return
-
-    await push_notify_tokens(tokens, str(title or ""), str(body or ""), data or {})
+    if tokens:
+        await push_notify_tokens(tokens, str(title or ""), str(body or ""), data or {})
 
 # -------------------- App & CORS --------------------
 app = FastAPI()
-
 app.mount(MEDIA_URL_PREFIX, StaticFiles(directory=MEDIA_DIR), name="media")
 
 allow_origins = ["*"] if ALLOW_ORIGINS_ENV == "*" else [
@@ -957,8 +927,9 @@ app.add_middleware(
 # -------------------- Startup / Shutdown --------------------
 @app.on_event("startup")
 async def startup() -> None:
-    engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))
-    Base.metadata.create_all(engine)
+    if ENABLE_SCHEMA_CREATE:
+        engine = sqlalchemy.create_engine(str(DATABASE_URL).replace("+asyncpg", ""))
+        Base.metadata.create_all(engine)
     await database.connect()
 
 @app.on_event("shutdown")
@@ -974,10 +945,18 @@ def read_root():
 def verify_token(request: Request):
     token = extract_bearer_token(request)
     if not token:
-        return {"status": "ok", "valid": False}
+        return {"status": "ok", "valid": False, "role": None, "phone": None}
 
     payload = decode_access_token(token)
-    return {"status": "ok", "valid": bool(payload and payload.get("sub"))}
+    if not payload or not payload.get("sub"):
+        return {"status": "ok", "valid": False, "role": None, "phone": None}
+
+    return {
+        "status": "ok",
+        "valid": True,
+        "role": str(payload.get("role") or ""),
+        "phone": _normalize_phone(str(payload.get("sub") or "")),
+    }
 
 # -------------------- Auth --------------------
 @app.post("/auth/refresh")
@@ -1003,9 +982,13 @@ async def refresh_access(body: RefreshAccessRequest):
     if not user:
         raise HTTPException(status_code=401, detail="user not found")
 
-    access = create_access_token(_normalize_phone(user["phone"]))
+    phone = _normalize_phone(user["phone"])
+    role = ROLE_ADMIN if phone in ADMIN_PHONES_SET else ROLE_USER
+    access = create_access_token(phone, role)
     return unified_response("ok", "ACCESS_REFRESHED", "access token refreshed", {
-        "access_token": access
+        "access_token": access,
+        "role": role,
+        "phone": phone,
     })
 
 @app.post("/logout")
@@ -1100,7 +1083,6 @@ async def user_exists(phone: str):
         select(func.count()).select_from(UserTable).where(UserTable.phone == norm)
     )
     exists = bool(count and int(count) > 0)
-
     return unified_response("ok", "USER_EXISTS" if exists else "USER_NOT_FOUND", "check", {
         "exists": exists
     })
@@ -1171,8 +1153,7 @@ async def login_user(user: UserLoginRequest, request: Request):
             headers={"Retry-After": str(remain)},
         )
 
-    window_age = (now - att["window_start"]).total_seconds()
-    if window_age > LOGIN_WINDOW_SECONDS:
+    if (now - att["window_start"]).total_seconds() > LOGIN_WINDOW_SECONDS:
         await database.execute(
             LoginAttemptTable.__table__.update().where(
                 LoginAttemptTable.id == int(att["id"])
@@ -1237,7 +1218,7 @@ async def login_user(user: UserLoginRequest, request: Request):
         )
     )
 
-    access = create_access_token(phone_norm)
+    access = create_access_token(phone_norm, ROLE_USER)
     refresh = create_refresh_token()
 
     await database.execute(
@@ -1258,6 +1239,7 @@ async def login_user(user: UserLoginRequest, request: Request):
             "phone": phone_norm,
             "address": str(db_user["address"] or ""),
             "name": str(db_user["name"] or ""),
+            "role": ROLE_USER,
         }
     }
 
@@ -1270,7 +1252,6 @@ async def admin_login(body: AdminLoginRequest, request: Request):
     if not phone_norm:
         raise HTTPException(status_code=400, detail="invalid phone")
 
-    # فقط شماره‌های ENV مجازند
     if phone_norm not in ADMIN_PHONES_SET:
         raise HTTPException(status_code=401, detail={"code": "WRONG_PASSWORD", "remaining_attempts": 0})
 
@@ -1320,7 +1301,6 @@ async def admin_login(body: AdminLoginRequest, request: Request):
         UserTable.__table__.select().where(UserTable.phone == phone_norm)
     )
 
-    # شماره درست و اولین ورود => ثبت رمز و ورود
     if not db_user:
         password_hash = bcrypt_hash_password(password_raw)
         await database.execute(
@@ -1377,7 +1357,7 @@ async def admin_login(body: AdminLoginRequest, request: Request):
         )
     )
 
-    access = create_access_token(phone_norm)
+    access = create_access_token(phone_norm, ROLE_ADMIN)
     refresh = create_refresh_token()
 
     await database.execute(
@@ -1398,6 +1378,7 @@ async def admin_login(body: AdminLoginRequest, request: Request):
             "phone": phone_norm,
             "address": str(db_user["address"] or ""),
             "name": str(db_user["name"] or "Manager"),
+            "role": ROLE_ADMIN,
         }
     }
 
@@ -1490,7 +1471,7 @@ async def update_user_cars(body: CarListUpdateRequest, request: Request):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    cars_payload = [c.dict() for c in (body.car_list or [])]
+    cars_payload = [c.model_dump() for c in (body.car_list or [])]
     await database.execute(
         UserTable.__table__.update().where(UserTable.phone == norm).values(car_list=cars_payload)
     )
@@ -1504,6 +1485,8 @@ def _pick_i18n(d: dict, lang: str) -> str:
         return ""
     if d.get(lang):
         return str(d.get(lang) or "")
+    if lang == "fa" and d.get("en"):
+        return str(d.get("en") or "")
     if d.get("en"):
         return str(d.get("en") or "")
     for _, v in d.items():
@@ -1526,6 +1509,19 @@ async def create_order(order: OrderRequest, request: Request):
     if not svc:
         raise HTTPException(status_code=400, detail="service_type required")
 
+    existing_active = await database.fetch_val(
+        select(func.count()).select_from(RequestTable).where(
+            (RequestTable.user_phone == norm) &
+            (RequestTable.service_type == svc) &
+            (RequestTable.status.in_(ACTIVE_ORDER_STATUSES))
+        )
+    )
+    if int(existing_active or 0) > 0:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "ACTIVE_ORDER_EXISTS", "message": "active order already exists for this service"}
+        )
+
     svc_types = []
     if order.service_types:
         svc_types = [str(x or "").strip().lower() for x in order.service_types if str(x or "").strip()]
@@ -1541,28 +1537,17 @@ async def create_order(order: OrderRequest, request: Request):
                 continue
             if s not in uniq:
                 uniq.append(s)
-        pref = uniq[:2]
+        pref = uniq[:3]
 
     req_dt = utc_now()
     if str(order.request_datetime or "").strip():
-        raw = str(order.request_datetime).strip()
-        try:
-            if raw.endswith("Z") or "+" in raw:
-                req_dt = parse_iso_utc(raw)
-            else:
-                dt = datetime.fromisoformat(raw.replace(" ", "T"))
-                if dt.tzinfo is None:
-                    req_dt = dt.replace(tzinfo=timezone.utc)
-                else:
-                    req_dt = dt.astimezone(timezone.utc)
-        except Exception:
-            req_dt = utc_now()
+        req_dt = parse_iso_utc(str(order.request_datetime).strip())
 
     ins = RequestTable.__table__.insert().values(
         user_phone=norm,
         latitude=float(order.location.latitude),
         longitude=float(order.location.longitude),
-        car_list=[car.dict() for car in (order.car_list or [])],
+        car_list=[car.model_dump() for car in (order.car_list or [])],
         address=str(order.address or "").strip(),
         home_number=str(order.home_number or "").strip(),
         service_type=svc,
@@ -1617,17 +1602,22 @@ async def get_user_orders(phone: str, request: Request):
             "id": int(r["id"]),
             "user_phone": str(r["user_phone"] or ""),
             "address": str(r["address"] or ""),
+            "home_number": str(r["home_number"] or ""),
             "service_type": str(r["service_type"] or ""),
+            "service_types": r["service_types"] or [],
+            "preferred_slots": r["preferred_slots"] or [],
             "price": int(r["price"] or 0),
             "status": canon_status(str(r["status"] or "")),
             "latitude": float(r["latitude"]) if r["latitude"] is not None else None,
             "longitude": float(r["longitude"]) if r["longitude"] is not None else None,
             "scheduled_start": iso_utc(r["scheduled_start"]),
             "execution_start": iso_utc(r["execution_start"]),
+            "finish_datetime": iso_utc(r["finish_datetime"]),
             "driver_name": str(r["driver_name"] or ""),
             "driver_phone": str(r["driver_phone"] or ""),
             "request_datetime": iso_utc(r["request_datetime"]),
             "service_place": str(r["service_place"] or "client"),
+            "payment_type": str(r["payment_type"] or ""),
         })
 
     return unified_response("ok", "USER_ORDERS", "orders", {"items": items})
@@ -1699,7 +1689,7 @@ async def admin_active_requests(request: Request):
         RequestTable.__table__
         .select()
         .where(RequestTable.status.in_(ACTIVE_ORDER_STATUSES))
-        .order_by(RequestTable.id.desc())
+        .order_by(RequestTable.request_datetime.desc(), RequestTable.id.desc())
     )
 
     items = []
@@ -1792,7 +1782,11 @@ async def provider_is_free(
 async def get_busy_slots(request: Request, date: str, exclude_order_id: Optional[int] = None):
     require_admin(request)
 
-    d = datetime.fromisoformat(str(date).strip()).date()
+    try:
+        d = datetime.fromisoformat(str(date).strip()).date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid date")
+
     provider = get_admin_provider_phone(request)
     start = datetime(d.year, d.month, d.day, 0, 0, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
@@ -1858,7 +1852,8 @@ async def propose_slots(order_id: int, body: ProposedSlotsRequest, request: Requ
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
 
-    if canon_status(str(req["status"] or "")) in FINAL_ORDER_STATUSES or req["execution_start"]:
+    st = canon_status(str(req["status"] or ""))
+    if st in FINAL_ORDER_STATUSES or req["execution_start"]:
         raise HTTPException(status_code=409, detail="cannot propose slots")
 
     slots = sorted(list(set(body.slots)))[:3]
@@ -2131,12 +2126,19 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
 
+    st = canon_status(str(req["status"] or ""))
+    if st in FINAL_ORDER_STATUSES:
+        raise HTTPException(status_code=409, detail="order already final")
+
     provider = _normalize_phone(str(req["driver_phone"] or "")) or get_admin_provider_phone(request)
     exec_dt = None
     new_status = STATUS_CANCELED if not body.agree else STATUS_IN_PROGRESS
 
     async with database.transaction():
         if body.agree:
+            if st != STATUS_ASSIGNED:
+                raise HTTPException(status_code=409, detail="price can be set only after time confirmation")
+
             if not body.exec_time:
                 raise HTTPException(status_code=400, detail="exec_time required")
 
@@ -2174,7 +2176,6 @@ async def admin_set_price(order_id: int, body: PriceBody, request: Request):
                         created_at=utc_now(),
                     )
                 )
-
         else:
             await database.execute(
                 ScheduleSlotTable.__table__.update().where(
@@ -2257,6 +2258,9 @@ async def finish_order(order_id: int, request: Request):
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
 
+    if canon_status(str(req["status"] or "")) != STATUS_IN_PROGRESS:
+        raise HTTPException(status_code=409, detail="only in-progress order can be finished")
+
     async with database.transaction():
         await database.execute(
             RequestTable.__table__.update().where(
@@ -2304,6 +2308,9 @@ async def admin_cancel_order(order_id: int, request: Request):
     )
     if not req:
         raise HTTPException(status_code=404, detail="order not found")
+
+    if canon_status(str(req["status"] or "")) in FINAL_ORDER_STATUSES:
+        raise HTTPException(status_code=409, detail="order already final")
 
     await database.execute(
         RequestTable.__table__.update().where(
@@ -2369,7 +2376,7 @@ async def public_reviews(limit: int = 50, offset: int = 0):
         )
         .select_from(reviews.outerjoin(users, users.c.phone == reviews.c.user_phone))
         .where(reviews.c.status == "APPROVED")
-        .order_by(reviews.c.created_at.desc())
+        .order_by(func.random())
         .limit(limit)
         .offset(offset)
     )
@@ -2651,70 +2658,6 @@ async def admin_upsert_service(
 
     return unified_response("ok", "SERVICE_UPSERTED", "saved", {"service_type": svc})
 
-@app.get("/admin/service_prices")
-async def admin_list_service_prices(request: Request):
-    require_admin(request)
-
-    rows = await database.fetch_all(
-        ServicePriceTable.__table__.select().order_by(ServicePriceTable.service_type.asc())
-    )
-
-    items = [{
-        "service_type": str(r["service_type"] or ""),
-        "base_price": int(r["base_price"] or 0),
-        "active": bool(r["active"]),
-        "sort_order": int(r["sort_order"] or 0),
-        "name_i18n": r["name_i18n"] or {},
-        "icon_url": _media_url(str(r["icon_path"] or "")),
-        "updated_at": iso_utc(r["updated_at"]),
-    } for r in rows]
-
-    return unified_response("ok", "SERVICE_PRICES", "prices", {"items": items})
-
-@app.post("/admin/service_prices")
-async def admin_upsert_service_price(body: ServicePriceUpsertBody, request: Request):
-    require_admin(request)
-
-    svc = str(body.service_type or "").strip().lower()
-    if not svc:
-        raise HTTPException(status_code=400, detail="service_type required")
-
-    bp = int(body.base_price or 0)
-    if bp < 0:
-        raise HTTPException(status_code=400, detail="base_price must be >= 0")
-
-    now = utc_now()
-    existing = await database.fetch_one(
-        ServicePriceTable.__table__.select().where(ServicePriceTable.service_type == svc)
-    )
-    if existing:
-        await database.execute(
-            ServicePriceTable.__table__.update().where(
-                ServicePriceTable.service_type == svc
-            ).values(
-                base_price=bp,
-                updated_at=now,
-            )
-        )
-    else:
-        await database.execute(
-            ServicePriceTable.__table__.insert().values(
-                service_type=svc,
-                base_price=bp,
-                active=True,
-                sort_order=0,
-                name_i18n={},
-                icon_path="",
-                icon_mime="",
-                updated_at=now,
-            )
-        )
-
-    return unified_response("ok", "SERVICE_PRICE_SAVED", "saved", {
-        "service_type": svc,
-        "base_price": bp,
-    })
-
 # -------------------- Admin: promotions --------------------
 @app.get("/admin/promotions")
 async def admin_list_promotions(request: Request):
@@ -2881,6 +2824,67 @@ async def admin_delete_promotion(promo_id: int, request: Request):
 
     return unified_response("ok", "PROMOTION_DELETED", "deleted", {"id": int(promo_id)})
 
+# -------------------- Notifications API --------------------
+@app.get("/notifications/{phone}")
+async def list_notifications(phone: str, request: Request, limit: int = Query(50, ge=1, le=200)):
+    norm = require_user_phone(request, phone)
+
+    rows = await database.fetch_all(
+        NotificationTable.__table__.select().where(
+            NotificationTable.user_phone == norm
+        ).order_by(NotificationTable.created_at.desc()).limit(limit)
+    )
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        items.append({
+            "id": int(r["id"]),
+            "title": str(r["title"] or ""),
+            "body": str(r["body"] or ""),
+            "data": r["data"] or {},
+            "read": bool(r["read"]),
+            "read_at": iso_utc(r["read_at"]),
+            "created_at": iso_utc(r["created_at"]),
+        })
+
+    return unified_response("ok", "NOTIFICATIONS", "notifications", {"items": items})
+
+@app.post("/notifications/{phone}/read")
+async def mark_notifications_read(phone: str, body: NotificationReadBody, request: Request):
+    norm = require_user_phone(request, phone)
+
+    cond = (NotificationTable.user_phone == norm) & (NotificationTable.read == False)
+
+    if body.notification_id:
+        cond = cond & (NotificationTable.id == int(body.notification_id))
+    elif body.order_id:
+        order_id_str = str(int(body.order_id))
+        rows = await database.fetch_all(
+            NotificationTable.__table__.select().where(
+                (NotificationTable.user_phone == norm) &
+                (NotificationTable.read == False)
+            )
+        )
+        ids = []
+        for r in rows:
+            data = r["data"] or {}
+            oid = str(data.get("order_id") or "").strip()
+            if oid == order_id_str:
+                ids.append(int(r["id"]))
+        if ids:
+            await database.execute(
+                NotificationTable.__table__.update().where(
+                    NotificationTable.id.in_(ids)
+                ).values(read=True, read_at=utc_now())
+            )
+            return unified_response("ok", "NOTIFICATIONS_READ", "marked read", {"count": len(ids)})
+        return unified_response("ok", "NOTIFICATIONS_READ", "marked read", {"count": 0})
+
+    await database.execute(
+        NotificationTable.__table__.update().where(cond).values(read=True, read_at=utc_now())
+    )
+    return unified_response("ok", "NOTIFICATIONS_READ", "marked read", {"count": 1 if body.notification_id else -1})
+
 # -------------------- Public home --------------------
 @app.get("/public/home")
 async def public_home(lang: str = "en"):
@@ -2897,8 +2901,10 @@ async def public_home(lang: str = "en"):
     for r in promo_rows:
         promo_items.append({
             "id": int(r["id"]),
-            "title": _pick_i18n(r["title_i18n"] or {}, lang),
-            "subtitle": _pick_i18n(r["subtitle_i18n"] or {}, lang),
+            "active": bool(r["active"]),
+            "sort_order": int(r["sort_order"] or 0),
+            "title_i18n": r["title_i18n"] or {},
+            "subtitle_i18n": r["subtitle_i18n"] or {},
             "service_types": r["service_types"] or [],
             "discount_amount": int(r["discount_amount"] or 0),
             "image_url": _media_url(str(r["image_path"] or "")),
@@ -2988,4 +2994,3 @@ async def public_home(lang: str = "en"):
         "promotion_details": promotion_details,
         "services": services,
     })
-
