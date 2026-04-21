@@ -993,13 +993,11 @@ async def refresh_access(body: RefreshAccessRequest):
 
 @app.get("/public/busy_slots")
 async def public_busy_slots(date: str, exclude_order_id: Optional[int] = None):
-    # این endpoint برای کاربر است و auth نمی‌خواهد
     try:
         d = datetime.fromisoformat(str(date).strip()).date()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid date")
 
-    # provider پیش‌فرض (همان شماره ادمین/provider)
     provider = sorted(list(ADMIN_PHONES_SET))[0] if ADMIN_PHONES_SET else ""
     if not provider:
         return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": []})
