@@ -991,6 +991,72 @@ async def refresh_access(body: RefreshAccessRequest):
         "phone": phone,
     })
 
+@app.get("/public/busy_slots")
+async def public_busy_slots(date: str, exclude_order_id: Optional[int] = None):
+    # این endpoint برای کاربر است و auth نمی‌خواهد
+    try:
+        d = datetime.fromisoformat(str(date).strip()).date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid date")
+
+    # provider پیش‌فرض (همان شماره ادمین/provider)
+    provider = sorted(list(ADMIN_PHONES_SET))[0] if ADMIN_PHONES_SET else ""
+    if not provider:
+        return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": []})
+
+    start = datetime(d.year, d.month, d.day, 0, 0, tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+
+    q_sched = ScheduleSlotTable.__table__.select().where(
+        (ScheduleSlotTable.slot_start >= start) &
+        (ScheduleSlotTable.slot_start < end) &
+        (ScheduleSlotTable.status.in_(["PROPOSED", "ACCEPTED"])) &
+        (ScheduleSlotTable.provider_phone == provider)
+    )
+    if exclude_order_id:
+        q_sched = q_sched.where(ScheduleSlotTable.request_id != int(exclude_order_id))
+
+    q_app = AppointmentTable.__table__.select().where(
+        (AppointmentTable.start_time >= start) &
+        (AppointmentTable.start_time < end) &
+        (AppointmentTable.status == "BOOKED") &
+        (AppointmentTable.provider_phone == provider)
+    )
+    if exclude_order_id:
+        q_app = q_app.where(AppointmentTable.request_id != int(exclude_order_id))
+
+    q_visit = RequestTable.__table__.select().where(
+        (RequestTable.scheduled_start >= start) &
+        (RequestTable.scheduled_start < end) &
+        (RequestTable.scheduled_start.is_not(None)) &
+        (RequestTable.status.in_([STATUS_WAITING, STATUS_ASSIGNED, STATUS_IN_PROGRESS])) &
+        (RequestTable.driver_phone == provider)
+    )
+    if exclude_order_id:
+        q_visit = q_visit.where(RequestTable.id != int(exclude_order_id))
+
+    q_exec = RequestTable.__table__.select().where(
+        (RequestTable.execution_start >= start) &
+        (RequestTable.execution_start < end) &
+        (RequestTable.execution_start.is_not(None)) &
+        (RequestTable.status == STATUS_IN_PROGRESS) &
+        (RequestTable.driver_phone == provider)
+    )
+    if exclude_order_id:
+        q_exec = q_exec.where(RequestTable.id != int(exclude_order_id))
+
+    busy = set()
+    for r in await database.fetch_all(q_sched):
+        busy.add(r["slot_start"].astimezone(timezone.utc).isoformat())
+    for r in await database.fetch_all(q_app):
+        busy.add(r["start_time"].astimezone(timezone.utc).isoformat())
+    for r in await database.fetch_all(q_visit):
+        busy.add(r["scheduled_start"].astimezone(timezone.utc).isoformat())
+    for r in await database.fetch_all(q_exec):
+        busy.add(r["execution_start"].astimezone(timezone.utc).isoformat())
+
+    return unified_response("ok", "BUSY_SLOTS", "busy slots", {"items": sorted(list(busy))})
+    
 @app.post("/logout")
 async def logout_user(body: LogoutRequest):
     refresh_raw = str(body.refresh_token or "").strip()
