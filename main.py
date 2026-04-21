@@ -993,6 +993,7 @@ async def refresh_access(body: RefreshAccessRequest):
 
 @app.get("/public/busy_slots")
 async def public_busy_slots(date: str, exclude_order_id: Optional[int] = None):
+    # public (no auth) busy slots for default provider
     try:
         d = datetime.fromisoformat(str(date).strip()).date()
     except Exception:
