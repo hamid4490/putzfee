@@ -1632,6 +1632,36 @@ async def get_user_orders(phone: str, request: Request):
 
     return unified_response("ok", "USER_ORDERS", "orders", {"items": items})
 
+def _user_order_payload(r) -> dict:
+    return {
+        "id": int(r["id"]),
+        "user_phone": str(r["user_phone"] or ""),
+        "address": str(r["address"] or ""),
+        "service_type": str(r["service_type"] or ""),
+        "price": int(r["price"] or 0),
+        "status": canon_status(str(r["status"] or "")),
+        "latitude": float(r["latitude"]) if r["latitude"] is not None else None,
+        "longitude": float(r["longitude"]) if r["longitude"] is not None else None,
+        "scheduled_start": iso_utc(r["scheduled_start"]),
+        "execution_start": iso_utc(r["execution_start"]),
+        "finish_datetime": iso_utc(r["finish_datetime"]),
+        "driver_name": str(r["driver_name"] or ""),
+        "driver_phone": str(r["driver_phone"] or ""),
+        "request_datetime": iso_utc(r["request_datetime"]),
+        "service_place": str(r["service_place"] or "client"),
+    }
+
+@app.get("/order/{order_id}")
+async def get_user_order(order_id: int, request: Request):
+    req = await database.fetch_one(
+        RequestTable.__table__.select().where(RequestTable.id == int(order_id))
+    )
+    if not req:
+        raise HTTPException(status_code=404, detail="order not found")
+
+    require_user_phone(request, str(req["user_phone"]))
+    return unified_response("ok", "USER_ORDER", "order", _user_order_payload(req))
+
 @app.post("/cancel_order")
 async def cancel_order(cancel: CancelRequest, request: Request):
     norm = require_user_phone(request, cancel.user_phone)
