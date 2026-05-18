@@ -45,7 +45,7 @@ app = FastAPI(
 )
 
 # Static media
-app.mount(MEDIA_URL_PREFIX, StaticFiles(directory=MEDIA_DIR), name="media")
+app.mount(MEDIA_URL_PREFIX, StaticFiles(directory=MEDIA_DIR), name="")
 
 # CORS
 allow_origins = (
