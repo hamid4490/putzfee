@@ -172,31 +172,25 @@ async def mark_notifications_read(phone: str, body: NotificationReadBody, reques
         return unified_response("ok", "NOTIFICATIONS_READ", "marked read", {"count": 1})
 
     if body.order_id:
-        order_id_str = str(int(body.order_id))
-        rows = await database.fetch_all(
-            NotificationTable.__table__.select().where(
+        # بهینه‌سازی مستقیم دیتابیس بدون خواندن به حافظه رم پایتون
+        query = (
+            NotificationTable.__table__.update()
+            .where(
                 (NotificationTable.user_phone == norm) &
-                (NotificationTable.read == False)
+                (NotificationTable.read == False) &
+                # پارس ایمن فیلد جیسون دیتابیس برای پیدا کردن شناسه سفارش سریع
+                (NotificationTable.data['order_id'].astext == str(int(body.order_id)))
             )
+            .values(read=True, read_at=now)
         )
-        ids = [
-            int(r["id"])
-            for r in rows
-            if str((r["data"] or {}).get("order_id") or "").strip() == order_id_str
-        ]
-        if ids:
-            await database.execute(
-                NotificationTable.__table__.update().where(
-                    NotificationTable.id.in_(ids)
-                ).values(read=True, read_at=now)
-            )
-        return unified_response("ok", "NOTIFICATIONS_READ", "marked read", {"count": len(ids)})
+        result = await database.execute(query)
+        return unified_response("ok", "NOTIFICATIONS_READ", "marked read", {"count": result})
 
-    # Mark all unread
+    # مارک کردن تمام نوتیفیکیشن‌ها به عنوان خوانده شده
     result = await database.execute(
         NotificationTable.__table__.update().where(
             (NotificationTable.user_phone == norm) &
             (NotificationTable.read == False)
         ).values(read=True, read_at=now)
     )
-    return unified_response("ok", "NOTIFICATIONS_READ", "all marked read", {"count": -1})
+    return unified_response("ok", "NOTIFICATIONS_READ", "all marked read", {"count": result})
