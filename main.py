@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from config import ALLOW_ORIGINS_ENV, MEDIA_DIR, MEDIA_URL_PREFIX
 from database import create_all_tables, database
 from routers import admin, auth, orders, scheduling, user
+from routers import ai  # ✅ جدید
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +29,7 @@ for sub in ("users", "promotions", "services"):
 # -------------------- Lifespan --------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting up...")
+    logger.info("Starting up Putz API v2...")
     create_all_tables()
     await database.connect()
     logger.info("Database connected.")
@@ -40,7 +41,8 @@ async def lifespan(app: FastAPI):
 # -------------------- App --------------------
 app = FastAPI(
     title="Putz API",
-    version="2.0.0",
+    version="2.1.0",
+    description="Backend for Putz service application",
     lifespan=lifespan,
 )
 
@@ -67,9 +69,14 @@ app.include_router(user.router)
 app.include_router(orders.router)
 app.include_router(scheduling.router)
 app.include_router(admin.router)
+app.include_router(ai.router)       # ✅ جدید
 
 
 # -------------------- Health --------------------
 @app.get("/")
 def read_root():
-    return {"message": "Putz API v2 is running"}
+    return {
+        "message": "Putz API v2.1 is running",
+        "version": "2.1.0",
+        "status": "ok",
+    }
