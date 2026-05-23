@@ -4,7 +4,7 @@
 import base64
 import json
 import logging
-import timeش# FILE: push.py
+import time # FILE: push.py
 # -*- coding: utf-8 -*-
 
 import base64
