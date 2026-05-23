@@ -172,21 +172,17 @@ async def mark_notifications_read(phone: str, body: NotificationReadBody, reques
         return unified_response("ok", "NOTIFICATIONS_READ", "marked read", {"count": 1})
 
     if body.order_id:
-        # بهینه‌سازی مستقیم دیتابیس بدون خواندن به حافظه رم پایتون
-        query = (
+        result = await database.execute(
             NotificationTable.__table__.update()
             .where(
                 (NotificationTable.user_phone == norm) &
                 (NotificationTable.read == False) &
-                # پارس ایمن فیلد جیسون دیتابیس برای پیدا کردن شناسه سفارش سریع
                 (NotificationTable.data['order_id'].astext == str(int(body.order_id)))
             )
             .values(read=True, read_at=now)
         )
-        result = await database.execute(query)
         return unified_response("ok", "NOTIFICATIONS_READ", "marked read", {"count": result})
 
-    # مارک کردن تمام نوتیفیکیشن‌ها به عنوان خوانده شده
     result = await database.execute(
         NotificationTable.__table__.update().where(
             (NotificationTable.user_phone == norm) &
