@@ -1,6 +1,8 @@
 # FILE: routers/orders.py
 # -*- coding: utf-8 -*-
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import func, select
 
@@ -13,11 +15,11 @@ from config import (
 )
 from database import (
     AppointmentTable,
+    PromotionTable,
     RequestTable,
     ReviewTable,
     ScheduleSlotTable,
     ServicePriceTable,
-    PromotionTable,
     UserTable,
     database,
 )
@@ -34,7 +36,6 @@ from utils import (
     unified_response,
     utc_now,
 )
-import logging
 
 router = APIRouter(tags=["orders"])
 logger = logging.getLogger("putz.orders")
@@ -56,7 +57,7 @@ async def create_order(order: OrderRequest, request: Request):
     if not svc:
         raise HTTPException(status_code=400, detail="service_type required")
 
-    # Prevent duplicate active order per service
+    # جلوگیری از سفارش تکراری فعال برای همان سرویس
     existing = await database.fetch_val(
         select(func.count()).select_from(RequestTable).where(
             (RequestTable.user_phone == norm) &
@@ -67,7 +68,10 @@ async def create_order(order: OrderRequest, request: Request):
     if int(existing or 0) > 0:
         raise HTTPException(
             status_code=409,
-            detail={"code": "ACTIVE_ORDER_EXISTS", "message": "active order already exists for this service"},
+            detail={
+                "code": "ACTIVE_ORDER_EXISTS",
+                "message": "شما قبلاً یک سفارش فعال برای این سرویس دارید",
+            },
         )
 
     svc_types = [
@@ -76,11 +80,14 @@ async def create_order(order: OrderRequest, request: Request):
         if str(x or "").strip()
     ] or [svc]
 
-    pref = list({s for s in (
-        str(x or "").strip()
-        for x in (order.preferred_slots or [])
-        if str(x or "").strip()
-    )})[:3]
+    # ✅ حداکثر 2 زمان پیشنهادی (طبق نیاز)
+    pref = list({
+        s for s in (
+            str(x or "").strip()
+            for x in (order.preferred_slots or [])
+            if str(x or "").strip()
+        )
+    })[:2]
 
     req_dt = utc_now()
     if str(order.request_datetime or "").strip():
@@ -111,9 +118,11 @@ async def create_order(order: OrderRequest, request: Request):
     )
     new_id = int(row["id"]) if row else 0
 
+    # ✅ نوتیف با title/body واقعی
     try:
         await notify_managers(
             title="", body="",
+            event="new_order",
             data=push_event_data(
                 event="new_order", order_id=new_id,
                 status=STATUS_NEW, service_type=svc, user_phone=norm,
@@ -122,7 +131,9 @@ async def create_order(order: OrderRequest, request: Request):
     except Exception as e:
         logger.error(f"notify_managers(create_order) failed: {e}")
 
-    return unified_response("ok", "REQUEST_CREATED", "request created", {"id": new_id})
+    return unified_response(
+        "ok", "REQUEST_CREATED", "سفارش با موفقیت ثبت شد", {"id": new_id}
+    )
 
 
 # -------------------- List user orders --------------------
@@ -158,11 +169,12 @@ async def get_user_orders(phone: str, request: Request):
             "request_datetime": iso_utc(r["request_datetime"]),
             "service_place": str(r["service_place"] or "client"),
             "payment_type": str(r["payment_type"] or ""),
+            "car_list": r["car_list"] or [],
         }
         for r in rows
     ]
 
-    return unified_response("ok", "USER_ORDERS", "orders", {"items": items})
+    return unified_response("ok", "USER_ORDERS", "لیست سفارش‌ها", {"items": items})
 
 
 # -------------------- Cancel order --------------------
@@ -173,6 +185,39 @@ async def cancel_order(cancel: CancelRequest, request: Request):
     service = str(cancel.service_type or "").strip().lower()
     if not service:
         raise HTTPException(status_code=400, detail="service_type required")
+
+    # بررسی وجود سفارش قابل لغو
+    active_row = await database.fetch_one(
+        RequestTable.__table__.select().where(
+            (RequestTable.user_phone == norm) &
+            (RequestTable.service_type == service) &
+            (RequestTable.status.in_([STATUS_NEW, "WAITING", "ASSIGNED"])) &
+            (RequestTable.execution_start.is_(None))
+        )
+    )
+
+    if not active_row:
+        # بررسی وجود سفارش PRICE_CONFIRMED یا IN_PROGRESS
+        any_active = await database.fetch_one(
+            RequestTable.__table__.select().where(
+                (RequestTable.user_phone == norm) &
+                (RequestTable.service_type == service) &
+                (RequestTable.status.in_(ACTIVE_ORDER_STATUSES))
+            )
+        )
+        if any_active:
+            st = canon_status(str(any_active["status"] or ""))
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "CANNOT_CANCEL",
+                    "message": f"سفارش در مرحله '{st}' قابل لغو توسط کاربر نیست. لطفاً با مدیر تماس بگیرید.",
+                },
+            )
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "ORDER_NOT_FOUND", "message": "سفارش فعال یافت نشد"},
+        )
 
     rows = await database.fetch_all(
         RequestTable.__table__.update().where(
@@ -187,11 +232,6 @@ async def cancel_order(cancel: CancelRequest, request: Request):
             finish_datetime=None,
         ).returning(RequestTable.id, RequestTable.driver_phone)
     )
-    if not rows:
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "CANNOT_CANCEL", "message": "cannot cancel"},
-        )
 
     ids = [int(r["id"]) for r in rows]
     drivers = list({
@@ -213,18 +253,30 @@ async def cancel_order(cancel: CancelRequest, request: Request):
         ).values(status="CANCELED")
     )
 
+    # ✅ نوتیف با متن واقعی
     try:
         payload = push_event_data(
             event="canceled_by_user", order_id=ids[0], order_ids=ids,
             status=STATUS_CANCELED, service_type=service, user_phone=norm,
         )
-        await notify_managers(title="", body="", data=payload)
+        await notify_managers(
+            title="", body="",
+            event="canceled_by_user",
+            data=payload,
+        )
         for dp in drivers:
-            await notify_managers(title="", body="", data=payload, target_phone=normalize_phone(dp))
+            await notify_managers(
+                title="", body="",
+                event="canceled_by_user",
+                data=payload,
+                target_phone=normalize_phone(dp),
+            )
     except Exception as e:
         logger.error(f"notify_managers(cancel_order) failed: {e}")
 
-    return unified_response("ok", "ORDER_CANCELED", "canceled", {"count": len(ids)})
+    return unified_response(
+        "ok", "ORDER_CANCELED", "سفارش با موفقیت لغو شد", {"count": len(ids)}
+    )
 
 
 # -------------------- Reviews --------------------
@@ -232,7 +284,7 @@ async def cancel_order(cancel: CancelRequest, request: Request):
 @router.get("/reviews")
 async def public_reviews(limit: int = 50, offset: int = 0):
     reviews = ReviewTable.__table__
-    users = UserTable.__table__
+    users   = UserTable.__table__
 
     q = (
         select(
@@ -247,8 +299,8 @@ async def public_reviews(limit: int = 50, offset: int = 0):
         .select_from(reviews.outerjoin(users, users.c.phone == reviews.c.user_phone))
         .where(reviews.c.status == "APPROVED")
         .order_by(func.random())
-        .limit(limit)
-        .offset(offset)
+        .limit(min(int(limit or 50), 100))
+        .offset(max(int(offset or 0), 0))
     )
 
     rows = await database.fetch_all(q)
@@ -272,9 +324,9 @@ async def public_reviews(limit: int = 50, offset: int = 0):
         select(func.count()).select_from(reviews).where(reviews.c.status == "APPROVED")
     )
 
-    return unified_response("ok", "PUBLIC_REVIEWS", "reviews", {
+    return unified_response("ok", "PUBLIC_REVIEWS", "نظرات کاربران", {
         "items": items,
-        "avg_rating": float(avg_val) if avg_val is not None else None,
+        "avg_rating": round(float(avg_val), 2) if avg_val is not None else None,
         "count": int(count_val or 0),
     })
 
@@ -285,16 +337,17 @@ async def submit_review(order_id: int, body: ReviewSubmitBody, request: Request)
         RequestTable.__table__.select().where(RequestTable.id == int(order_id))
     )
     if not req:
-        raise HTTPException(status_code=404, detail="order not found")
+        raise HTTPException(status_code=404, detail="سفارش یافت نشد")
 
     norm = require_user_phone(request, str(req["user_phone"]))
+
     if canon_status(str(req["status"] or "")) != STATUS_FINISH:
-        raise HTTPException(status_code=409, detail="order is not finished")
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "ORDER_NOT_FINISHED", "message": "فقط سفارش‌های تکمیل شده قابل امتیازدهی هستند"},
+        )
 
-    rating = int(body.rating or 0)
-    if rating < 1 or rating > 5:
-        raise HTTPException(status_code=400, detail="rating must be 1..5")
-
+    rating  = int(body.rating or 0)
     comment = str(body.comment or "").strip()
 
     existing = await database.fetch_one(
@@ -319,15 +372,34 @@ async def submit_review(order_id: int, body: ReviewSubmitBody, request: Request)
             )
         )
 
-    return unified_response("ok", "REVIEW_SUBMITTED", "review submitted", {
-        "order_id": int(order_id)
-    })
+    # ✅ نوتیف به مدیر
+    try:
+        await notify_managers(
+            title="", body="",
+            event="review_submitted",
+            data={
+                "event": "review_submitted",
+                "order_id": str(order_id),
+                "rating": str(rating),
+            },
+        )
+    except Exception as e:
+        logger.error(f"notify_managers(review) failed: {e}")
+
+    return unified_response(
+        "ok", "REVIEW_SUBMITTED", "نظر شما ثبت شد و در انتظار تأیید است",
+        {"order_id": int(order_id)}
+    )
 
 
 # -------------------- Public home --------------------
 
 @router.get("/public/home")
-async def public_home(lang: str = "en"):
+async def public_home(lang: str = "fa"):
+    lang = str(lang or "fa").strip().lower()
+    if lang not in ("fa", "en", "de"):
+        lang = "fa"
+
     promo_rows = await database.fetch_all(
         PromotionTable.__table__.select()
         .where(PromotionTable.active == True)
@@ -335,7 +407,7 @@ async def public_home(lang: str = "en"):
     )
 
     reviews = ReviewTable.__table__
-    reqs = RequestTable.__table__
+    reqs    = RequestTable.__table__
     q_rating = (
         select(
             reqs.c.service_type.label("service_type"),
@@ -348,7 +420,7 @@ async def public_home(lang: str = "en"):
     )
     rating_map = {
         str(x["service_type"] or "").strip().lower(): {
-            "avg": float(x["avg_rating"]) if x["avg_rating"] is not None else None,
+            "avg": round(float(x["avg_rating"]), 2) if x["avg_rating"] is not None else None,
             "count": int(x["count"] or 0),
         }
         for x in await database.fetch_all(q_rating)
@@ -363,11 +435,12 @@ async def public_home(lang: str = "en"):
     service_map = {}
     services = []
     for r in svc_rows:
-        k = str(r["service_type"] or "").strip().lower()
+        k  = str(r["service_type"] or "").strip().lower()
         rm = rating_map.get(k, {"avg": None, "count": 0})
         item = {
             "service_type": k,
             "name": pick_i18n(r["name_i18n"] or {}, lang),
+            "name_i18n": r["name_i18n"] or {},
             "icon_url": media_url(str(r["icon_path"] or "")),
             "base_price": int(r["base_price"] or 0),
             "avg_rating": rm["avg"],
@@ -377,23 +450,11 @@ async def public_home(lang: str = "en"):
         services.append(item)
         service_map[k] = item
 
-    promo_items = []
     promotion_details = []
     for p in promo_rows:
-        promo_items.append({
-            "id": int(p["id"]),
-            "active": bool(p["active"]),
-            "sort_order": int(p["sort_order"] or 0),
-            "title_i18n": p["title_i18n"] or {},
-            "subtitle_i18n": p["subtitle_i18n"] or {},
-            "service_types": p["service_types"] or [],
-            "discount_amount": int(p["discount_amount"] or 0),
-            "image_url": media_url(str(p["image_path"] or "")),
-        })
-
         svc_types = [str(x).strip().lower() for x in (p["service_types"] or []) if str(x).strip()]
-        discount = int(p["discount_amount"] or 0)
-        details = []
+        discount  = int(p["discount_amount"] or 0)
+        details   = []
         for svc in svc_types:
             if svc not in service_map:
                 continue
@@ -411,14 +472,18 @@ async def public_home(lang: str = "en"):
         promotion_details.append({
             "id": int(p["id"]),
             "title": pick_i18n(p["title_i18n"] or {}, lang),
+            "title_i18n": p["title_i18n"] or {},
             "subtitle": pick_i18n(p["subtitle_i18n"] or {}, lang),
+            "subtitle_i18n": p["subtitle_i18n"] or {},
             "discount_amount": discount,
             "image_url": media_url(str(p["image_path"] or "")),
             "services": details,
+            "sort_order": int(p["sort_order"] or 0),
+            "active": bool(p["active"]),
         })
 
     return unified_response("ok", "PUBLIC_HOME", "home", {
-        "promotions": promo_items,
         "promotion_details": promotion_details,
         "services": services,
+        "lang": lang,
     })
