@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../../core/localization/app_localizations.dart';
 import '../../core/network/api_client.dart';
@@ -39,8 +40,14 @@ class UserHomeScreen extends ConsumerWidget {
         title: Text(l10n.t('app_title')),
         actions: [
           IconButton(
+            icon: const Icon(Icons.directions_car_outlined),
+            tooltip: l10n.t('cars.title'),
+            onPressed: () => context.push('/cars'),
+          ),
+          IconButton(
             icon: const Icon(Icons.notifications_none),
-            onPressed: () {},
+            tooltip: l10n.t('notifications.title'),
+            onPressed: () => context.push('/notifications'),
           ),
         ],
       ),
@@ -62,9 +69,7 @@ class UserHomeScreen extends ConsumerWidget {
                 leading: const Icon(Icons.add_box_outlined),
                 title: Text(l10n.t('home.bookNow')),
                 trailing: const Icon(Icons.chevron_right),
-                onTap: () {
-                  // TODO: navigate to new-order flow.
-                },
+                onTap: () => context.push('/orders/new'),
               ),
             ),
             const SizedBox(height: 24),

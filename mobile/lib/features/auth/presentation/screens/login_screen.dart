@@ -126,6 +126,11 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                     '${l10n.t('auth.noAccount')} ${l10n.t('auth.register')}',
                   ),
                 ),
+                TextButton(
+                  onPressed:
+                      _busy ? null : () => context.push('/forgot-password'),
+                  child: Text(l10n.t('auth.forgotPassword')),
+                ),
               ],
             ),
           ),
