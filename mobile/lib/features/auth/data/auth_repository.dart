@@ -78,6 +78,16 @@ class AuthRepository {
   Future<void> forgotPassword(String phone) async {
     await _api.post<dynamic>('/auth/forgot-password', body: {'phone': phone});
   }
+
+  Future<void> resetPassword({
+    required String token,
+    required String newPassword,
+  }) async {
+    await _api.post<dynamic>(
+      '/auth/reset-password',
+      body: {'token': token, 'new_password': newPassword},
+    );
+  }
 }
 
 final authRepositoryProvider = Provider<AuthRepository>((ref) {

@@ -4,8 +4,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'core/localization/app_localizations.dart';
 import 'core/network/api_client.dart';
+import 'core/notifications/push_service.dart';
 import 'core/routing/app_router.dart';
 import 'core/theme/app_theme.dart';
+import 'features/auth/presentation/providers/auth_provider.dart';
 
 void main() {
   runApp(const ProviderScope(child: PutzfeeApp()));
@@ -24,6 +26,14 @@ class PutzfeeApp extends ConsumerWidget {
     ref.listen<Locale?>(localeProvider, (_, next) {
       if (next != null) {
         ref.read(apiClientProvider).languageCode = next.languageCode;
+      }
+    });
+
+    // Initialize push notifications once the user is authenticated.
+    ref.listen<AuthState>(authProvider, (prev, next) {
+      if (next.status == AuthStatus.authenticated &&
+          prev?.status != AuthStatus.authenticated) {
+        ref.read(pushServiceProvider).init();
       }
     });
 

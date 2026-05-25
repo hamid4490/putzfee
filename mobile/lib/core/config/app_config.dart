@@ -22,5 +22,22 @@ class AppConfig {
     defaultValue: 'Europe/Berlin',
   );
 
+  /// Default map center when no location is selected (Berlin, DE).
+  static const double defaultLatitude = 52.5200;
+  static const double defaultLongitude = 13.4050;
+
+  /// Mapbox raster tile URL template. Falls back to OpenStreetMap
+  /// when no Mapbox token is provided.
+  static String get mapTileUrl {
+    if (mapboxAccessToken.isEmpty) {
+      return 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+    }
+    return 'https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/'
+        '256/{z}/{x}/{y}@2x?access_token=$mapboxAccessToken';
+  }
+
+  static const String mapAttribution =
+      '© Mapbox / OpenStreetMap contributors';
+
   static bool get isDebug => kDebugMode;
 }

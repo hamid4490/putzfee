@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/localization/app_localizations.dart';
+import '../admin/presentation/screens/admin_orders_screen.dart';
+import '../admin/presentation/screens/admin_promotions_screen.dart';
+import '../admin/presentation/screens/admin_services_screen.dart';
 import '../profile/presentation/screens/profile_screen.dart';
 import 'admin_dashboard_screen.dart';
 
@@ -17,8 +20,9 @@ class _AdminMainScreenState extends ConsumerState<AdminMainScreen> {
 
   final List<Widget> _screens = const [
     AdminDashboardScreen(),
-    _AdminPlaceholderScreen(title: 'Services'),
-    _AdminPlaceholderScreen(title: 'Promotions'),
+    AdminOrdersScreen(),
+    AdminServicesScreen(),
+    AdminPromotionsScreen(),
     ProfileScreen(),
   ];
 
@@ -41,6 +45,11 @@ class _AdminMainScreenState extends ConsumerState<AdminMainScreen> {
             label: l10n.t('nav.dashboard'),
           ),
           BottomNavigationBarItem(
+            icon: const Icon(Icons.receipt_long_outlined),
+            activeIcon: const Icon(Icons.receipt_long),
+            label: l10n.t('admin.orders'),
+          ),
+          BottomNavigationBarItem(
             icon: const Icon(Icons.cleaning_services_outlined),
             activeIcon: const Icon(Icons.cleaning_services),
             label: l10n.t('nav.services'),
@@ -57,20 +66,6 @@ class _AdminMainScreenState extends ConsumerState<AdminMainScreen> {
           ),
         ],
       ),
-    );
-  }
-}
-
-class _AdminPlaceholderScreen extends StatelessWidget {
-  const _AdminPlaceholderScreen({required this.title});
-
-  final String title;
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text(title)),
-      body: Center(child: Text('$title — coming soon')),
     );
   }
 }

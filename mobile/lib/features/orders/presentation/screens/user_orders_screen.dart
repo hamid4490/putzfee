@@ -1,16 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:intl/intl.dart';
 
 import '../../../../core/localization/app_localizations.dart';
-import '../../../../core/network/api_client.dart';
 import '../../../../core/network/api_exception.dart';
-
-final _ordersProvider =
-    FutureProvider<List<Map<String, dynamic>>>((ref) async {
-  final api = ref.watch(apiClientProvider);
-  final data = await api.get<List<dynamic>>('/orders');
-  return data.map((e) => Map<String, dynamic>.from(e as Map)).toList();
-});
+import '../../data/orders_repository.dart';
 
 class UserOrdersScreen extends ConsumerWidget {
   const UserOrdersScreen({super.key});
@@ -19,11 +14,14 @@ class UserOrdersScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final l10n = AppLocalizations.of(context);
     final theme = Theme.of(context);
-    final orders = ref.watch(_ordersProvider);
+    final orders = ref.watch(myOrdersProvider);
+    final code = Localizations.localeOf(context).languageCode;
+    final df = DateFormat.yMMMd(code).add_Hm();
+
     return Scaffold(
       appBar: AppBar(title: Text(l10n.t('nav.orderHistory'))),
       body: RefreshIndicator(
-        onRefresh: () async => ref.refresh(_ordersProvider.future),
+        onRefresh: () async => ref.refresh(myOrdersProvider.future),
         child: orders.when(
           data: (list) {
             if (list.isEmpty) {
@@ -43,15 +41,23 @@ class UserOrdersScreen extends ConsumerWidget {
               separatorBuilder: (_, __) => const SizedBox(height: 8),
               itemBuilder: (context, i) {
                 final o = list[i];
-                final status = o['status']?.toString() ?? '';
                 return Card(
                   child: ListTile(
                     leading: const Icon(Icons.cleaning_services_outlined),
-                    title: Text('#${o['id']}'),
-                    subtitle: Text(l10n.t('orders.status.$status')),
-                    trailing: o['total_price'] != null
-                        ? Text('${o['total_price']} €')
-                        : null,
+                    title: Text('#${o.id} – ${o.serviceKeys.join(', ')}'),
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(l10n.t('orders.status.${o.status}')),
+                        Text(df.format(o.createdAt),
+                            style: theme.textTheme.bodySmall),
+                      ],
+                    ),
+                    trailing: o.totalPrice != null
+                        ? Text('${o.totalPrice!.toStringAsFixed(2)} €',
+                            style: theme.textTheme.titleSmall)
+                        : const Icon(Icons.chevron_right),
+                    onTap: () => context.push('/orders/${o.id}'),
                   ),
                 );
               },
