@@ -14,7 +14,8 @@ The companion Android app for the PUTZFEE booking API.
 
 ```
 lib/
-├── main.dart
+├── main.dart            # user flavor entry point
+├── main_admin.dart      # admin flavor entry point
 ├── core/
 │   ├── config/        # compile-time settings (API base url, mapbox token)
 │   ├── localization/  # AppLocalizations + locale provider
@@ -37,15 +38,33 @@ lib/
 cd mobile
 flutter pub get
 
-# Point to your backend (defaults to the Android emulator host 10.0.2.2)
-flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8000
+# Copy the example defines file and fill in your values
+cp dart_defines.json.example dart_defines.json
 
-# Or run with custom Mapbox / timezone overrides
-flutter run \
-  --dart-define=API_BASE_URL=https://api.example.com \
+# Run the admin flavor
+flutter run --flavor admin -t lib/main_admin.dart \
+  --dart-define-from-file=dart_defines.json
+
+# Run the user (default) flavor
+flutter run --flavor user -t lib/main.dart \
+  --dart-define-from-file=dart_defines.json
+
+# Or pass dart-defines inline instead of using a file
+flutter run --flavor user \
+  --dart-define=API_BASE_URL=http://10.0.2.2:8000 \
   --dart-define=MAPBOX_TOKEN=pk.eyJ... \
   --dart-define=SERVER_TIMEZONE=Europe/Berlin
 ```
+
+### Build flavors
+
+| Flavor  | Entry point          | Application ID              |
+|---------|----------------------|-----------------------------|
+| `admin` | `lib/main_admin.dart`| `de.putzfee.putzfee.admin`  |
+| `user`  | `lib/main.dart`      | `de.putzfee.putzfee`        |
+
+Both flavors share the same codebase; admin vs. user routing is decided
+at login time by the backend (`is_admin` flag).
 
 ## What's wired up
 
