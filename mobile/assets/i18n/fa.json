@@ -20,6 +20,13 @@
   "common.submit": "ارسال",
   "common.required": "الزامی",
 
+  "network.noConnection": "اتصال اینترنت برقرار نیست. لطفاً اتصال خود را بررسی کرده و دوباره تلاش کنید.",
+  "network.timeout": "سرور پاسخ نداد. ممکن است سرور در حال بیدار شدن باشد — لطفاً چند لحظه دیگر دوباره تلاش کنید.",
+  "network.badCertificate": "اتصال امن برقرار نشد. لطفاً بعداً دوباره تلاش کنید.",
+  "network.unreachable": "دسترسی به سرور پوتسفه ممکن نیست. لطفاً دوباره تلاش کنید.",
+  "network.serverBaseUrl": "سرور: {url}",
+  "network.retry": "تلاش مجدد",
+
   "nav.home": "خانه",
   "nav.orderHistory": "سفارش‌ها",
   "nav.aiAssistant": "دستیار",

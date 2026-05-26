@@ -20,6 +20,13 @@
   "common.submit": "Submit",
   "common.required": "Required",
 
+  "network.noConnection": "No internet connection. Please check your network and try again.",
+  "network.timeout": "Could not reach the server. The server might be waking up — please try again in a moment.",
+  "network.badCertificate": "Secure connection failed. Please try again later.",
+  "network.unreachable": "Cannot reach the PUTZFEE server. Please try again.",
+  "network.serverBaseUrl": "Server: {url}",
+  "network.retry": "Retry",
+
   "nav.home": "Home",
   "nav.orderHistory": "Order history",
   "nav.aiAssistant": "Assistant",

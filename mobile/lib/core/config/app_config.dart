@@ -6,9 +6,16 @@ import 'package:flutter/foundation.dart';
 class AppConfig {
   const AppConfig._();
 
+  /// Production backend on Render. Override at build time with
+  /// `--dart-define=API_BASE_URL=https://example.com` (or via
+  /// `dart_defines.json`) to point at a staging / local server.
+  ///
+  /// For an Android emulator hitting the host machine, use
+  /// `http://10.0.2.2:8000` and add `android:usesCleartextTraffic="true"`
+  /// to AndroidManifest if you build a non-debug variant.
   static const String apiBaseUrl = String.fromEnvironment(
     'API_BASE_URL',
-    defaultValue: 'http://10.0.2.2:8000',
+    defaultValue: 'https://putzfee-5o2g.onrender.com',
   );
 
   static const String mapboxAccessToken = String.fromEnvironment(
