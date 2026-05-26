@@ -9,6 +9,12 @@ import '../config/app_config.dart';
 import '../storage/token_storage.dart';
 import 'api_exception.dart';
 
+/// How long Dio waits for a TCP connection. The Render free tier can take
+/// 30-60 s to wake up from sleep, so we keep this generous on the first hit.
+const Duration _kConnectTimeout = Duration(seconds: 60);
+const Duration _kReceiveTimeout = Duration(seconds: 60);
+const Duration _kSendTimeout = Duration(seconds: 60);
+
 /// Thin Dio wrapper that:
 /// * attaches the bearer access token
 /// * transparently refreshes on 401
@@ -19,9 +25,9 @@ class ApiClient {
     _dio = Dio(
       BaseOptions(
         baseUrl: AppConfig.apiBaseUrl,
-        connectTimeout: const Duration(seconds: 15),
-        receiveTimeout: const Duration(seconds: 30),
-        sendTimeout: const Duration(seconds: 30),
+        connectTimeout: _kConnectTimeout,
+        receiveTimeout: _kReceiveTimeout,
+        sendTimeout: _kSendTimeout,
         headers: {
           HttpHeaders.contentTypeHeader: 'application/json',
         },
@@ -145,24 +151,52 @@ class ApiClient {
 
   ApiException _convert(DioException e) {
     final data = e.response?.data;
+    final code = _categorise(e);
     String message;
     if (data is Map && data['detail'] is String) {
       message = data['detail'] as String;
     } else if (data is Map && data['message'] is String) {
       message = data['message'] as String;
-    } else if (e.type == DioExceptionType.connectionTimeout ||
-        e.type == DioExceptionType.receiveTimeout) {
-      message = 'Network timeout';
-    } else if (e.type == DioExceptionType.connectionError) {
-      message = 'No internet connection';
     } else {
-      message = e.message ?? 'Network error';
+      message = switch (code) {
+        ApiErrorCode.timeout =>
+          'Could not reach the server. Please check your connection and try again.',
+        ApiErrorCode.noConnection =>
+          'No internet connection. Please check your network and try again.',
+        ApiErrorCode.badCertificate =>
+          'Secure connection failed. Please try again later.',
+        ApiErrorCode.cancelled => 'Request cancelled.',
+        ApiErrorCode.http || ApiErrorCode.unknown =>
+          e.message ?? 'Something went wrong. Please try again.',
+      };
     }
     return ApiException(
       message: message,
       statusCode: e.response?.statusCode,
       data: data,
+      code: code,
     );
+  }
+
+  ApiErrorCode _categorise(DioException e) {
+    switch (e.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.receiveTimeout:
+        return ApiErrorCode.timeout;
+      case DioExceptionType.connectionError:
+        return ApiErrorCode.noConnection;
+      case DioExceptionType.badCertificate:
+        return ApiErrorCode.badCertificate;
+      case DioExceptionType.cancel:
+        return ApiErrorCode.cancelled;
+      case DioExceptionType.badResponse:
+        return ApiErrorCode.http;
+      case DioExceptionType.unknown:
+        final err = e.error;
+        if (err is SocketException) return ApiErrorCode.noConnection;
+        return ApiErrorCode.unknown;
+    }
   }
 }
 

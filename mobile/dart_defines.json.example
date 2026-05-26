@@ -1,5 +1,10 @@
 {
-  "API_BASE_URL": "http://10.0.2.2:8000",
+  "_comment_api": "Production Render backend. For Android emulator + local server use 'http://10.0.2.2:8000'.",
+  "API_BASE_URL": "https://putzfee-5o2g.onrender.com",
+
+  "_comment_mapbox": "Optional. Get a token from https://account.mapbox.com/access-tokens/. Leave empty to fall back to OpenStreetMap tiles.",
   "MAPBOX_TOKEN": "",
+
+  "_comment_timezone": "Must match the server's SERVER_TIMEZONE setting.",
   "SERVER_TIMEZONE": "Europe/Berlin"
 }

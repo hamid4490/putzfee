@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../../../core/config/app_config.dart';
 import '../../../../core/localization/app_localizations.dart';
+import '../../../../core/network/error_messages.dart';
 import '../providers/auth_provider.dart';
 
 class LoginScreen extends ConsumerStatefulWidget {
@@ -39,7 +41,10 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
             password: _password.text,
           );
     } catch (e) {
-      setState(() => _error = '$e');
+      if (!mounted) return;
+      final message = localiseError(context, e);
+      setState(() => _error = message);
+      showErrorSnackBar(context, e);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -130,6 +135,15 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                   onPressed:
                       _busy ? null : () => context.push('/forgot-password'),
                   child: Text(l10n.t('auth.forgotPassword')),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  l10n.t('network.serverBaseUrl',
+                      args: {'url': AppConfig.apiBaseUrl}),
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.outline,
+                  ),
                 ),
               ],
             ),

@@ -20,6 +20,13 @@
   "common.submit": "Absenden",
   "common.required": "Pflichtfeld",
 
+  "network.noConnection": "Keine Internetverbindung. Bitte prüfen Sie Ihr Netzwerk und versuchen Sie es erneut.",
+  "network.timeout": "Der Server konnte nicht erreicht werden. Möglicherweise startet er gerade — bitte gleich noch einmal versuchen.",
+  "network.badCertificate": "Sichere Verbindung fehlgeschlagen. Bitte später erneut versuchen.",
+  "network.unreachable": "Der PUTZFEE-Server ist nicht erreichbar. Bitte erneut versuchen.",
+  "network.serverBaseUrl": "Server: {url}",
+  "network.retry": "Erneut versuchen",
+
   "nav.home": "Start",
   "nav.orderHistory": "Bestellungen",
   "nav.aiAssistant": "Assistent",

@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../../../core/localization/app_localizations.dart';
+import '../../../../core/network/error_messages.dart';
 import '../providers/auth_provider.dart';
 
 class RegisterScreen extends ConsumerStatefulWidget {
@@ -47,7 +48,10 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
             locale: locale,
           );
     } catch (e) {
-      setState(() => _error = '$e');
+      if (!mounted) return;
+      final message = localiseError(context, e);
+      setState(() => _error = message);
+      showErrorSnackBar(context, e);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
