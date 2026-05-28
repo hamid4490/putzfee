@@ -55,6 +55,18 @@ async def upsert_service(body: ServiceIn) -> ServiceOut:
     )
     now = datetime.now(timezone.utc)
     if existing is None:
+        # Check for duplicate sort order and swap if needed
+        duplicate = await database.fetch_one(
+            services.select().where(services.c.sort_order == body.sort_order)
+        )
+        if duplicate is not None:
+            # Swap sort orders
+            await database.execute(
+                services.update().where(services.c.id == duplicate["id"]).values(
+                    sort_order=existing["sort_order"] if existing else 0,
+                    updated_at=now
+                )
+            )
         new_id = await database.execute(
             services.insert().values(
                 key=body.key,
@@ -70,6 +82,20 @@ async def upsert_service(body: ServiceIn) -> ServiceOut:
         sid = int(new_id)
     else:
         sid = int(existing["id"])
+        # Check for duplicate sort order (excluding current service)
+        duplicate = await database.fetch_one(
+            services.select()
+            .where(services.c.sort_order == body.sort_order)
+            .where(services.c.id != sid)
+        )
+        if duplicate is not None:
+            # Swap sort orders
+            await database.execute(
+                services.update().where(services.c.id == duplicate["id"]).values(
+                    sort_order=existing["sort_order"],
+                    updated_at=now
+                )
+            )
         await database.execute(
             services.update().where(services.c.id == sid).values(
                 name_i18n=body.name_i18n,
