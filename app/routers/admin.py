@@ -20,7 +20,7 @@ from ..database import (
 )
 from ..deps import current_admin, current_locale
 from ..i18n import Locale, t
-from ..media import save_image
+from ..media import absolute_url, save_image
 from ..push import push_to_user
 from ..schemas import (
     Message,
@@ -98,9 +98,10 @@ async def upload_service_icon(service_id: int, file: UploadFile = File(...)) -> 
     if row is None:
         raise HTTPException(status_code=404, detail="service not found")
     url = await save_image(file, sub_dir="services")
+    absolute = absolute_url(url)
     await database.execute(
         services.update().where(services.c.id == service_id).values(
-            icon=url, updated_at=datetime.now(timezone.utc)
+            icon=absolute, updated_at=datetime.now(timezone.utc)
         )
     )
     row = await database.fetch_one(services.select().where(services.c.id == service_id))
