@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from ..database import cars, database, device_tokens, notifications, users
 from ..deps import current_locale, current_user, rate_limit
 from ..i18n import Locale, t
-from ..media import save_image
+from ..media import absolute_url, save_image
 from ..schemas import (
     CarIn,
     CarOut,
@@ -52,10 +52,11 @@ async def upload_photo(
     user=Depends(current_user),
 ) -> UserPublic:
     url = await save_image(file, sub_dir="avatars")
+    absolute = absolute_url(url)
     await database.execute(
         users.update()
         .where(users.c.id == user["id"])
-        .values(photo_url=url, updated_at=datetime.now(timezone.utc))
+        .values(photo_url=absolute, updated_at=datetime.now(timezone.utc))
     )
     row = await database.fetch_one(users.select().where(users.c.id == user["id"]))
     return UserPublic(**dict(row))
