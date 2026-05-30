@@ -292,68 +292,52 @@ async def list_taken_slots(
 @router.get("/available-slots", response_model=List[SlotOut])
 async def list_available_slots(
     date: str,
-    offset: str | None = Query(default=None),
     user=Depends(current_user),
 ) -> List[SlotOut]:
     """Return available time slots for a specific date.
 
-    Returns all slots within working hours that are not already booked.
-    Date is ISO ``YYYY-MM-DD`` interpreted in the user's timezone (if offset provided).
-    Optional offset parameter (e.g., "3.5" for UTC+3:30) to interpret date in user's timezone.
+    Returns all slots within working hours (8:00 - 19:00 UTC).
+    Date is ISO ``YYYY-MM-DD``.
+    Slots are returned in UTC and should be converted to local time on the client.
     """
-    from datetime import date as _date, timezone as tz_module
+    from datetime import date as _date
 
     s = get_settings()
     d = _date.fromisoformat(date)
 
-    # Use provided offset or fall back to server timezone
-    if offset:
-        try:
-            offset_hours = float(offset)
-            # Create a fixed offset timezone
-            tz = tz_module(timedelta(hours=offset_hours))
-        except:
-            tz = s.tz
-    else:
-        tz = s.tz
-
-    # Create start and end of day in the user's timezone
-    start_of_day = datetime.combine(d, datetime.min.time(), tzinfo=tz)
-    end_of_day = datetime.combine(d, datetime.max.time(), tzinfo=tz)
-
-    # Convert to UTC for database query
-    start_utc = start_of_day.astimezone(timezone.utc)
-    end_utc = end_of_day.astimezone(timezone.utc)
+    # Create start and end of day in UTC
+    start_of_day = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+    end_of_day = datetime.combine(d, datetime.max.time(), tzinfo=timezone.utc)
 
     # Get all taken slots for this date (in UTC)
     taken_rows = await database.fetch_all(
         appointments.select()
-        .where(appointments.c.start_at >= start_utc)
-        .where(appointments.c.start_at <= end_utc)
+        .where(appointments.c.start_at >= start_of_day)
+        .where(appointments.c.start_at <= end_of_day)
     )
     taken_starts = {r["start_at"] for r in taken_rows}
 
-    # Generate all possible slots within working hours (8:00 - 19:00)
+    # Generate all possible slots within working hours (8:00 - 19:00 UTC)
     slot_duration = timedelta(hours=s.SLOT_DURATION_HOURS)
     available_slots: list[dict] = []
 
-    # Start at 8:00 AM in user's timezone
-    current = datetime.combine(d, datetime.min.time(), tzinfo=tz).replace(
+    # Start at 8:00 AM UTC
+    current = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc).replace(
         hour=s.WORK_START_HOUR
     )
-    # End at 7:00 PM (19:00) in user's timezone
-    end_time = datetime.combine(d, datetime.min.time(), tzinfo=tz).replace(
+    # End at 7:00 PM (19:00) UTC
+    end_time = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc).replace(
         hour=s.WORK_END_HOUR
     )
 
     while current + slot_duration <= end_time:
-        current_utc = current.astimezone(timezone.utc)
+        current_utc = current
         if current_utc not in taken_starts:
             available_slots.append({
                 "id": 0,  # Placeholder ID for available slots
                 "request_id": 0,
                 "start_at": current_utc,
-                "end_at": (current + slot_duration).astimezone(timezone.utc),
+                "end_at": (current + slot_duration),
                 "status": "AVAILABLE",
                 "created_at": datetime.now(timezone.utc),
             })
