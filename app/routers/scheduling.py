@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List
 
 from asyncpg import UniqueViolationError
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..config import get_settings
 from ..database import (
