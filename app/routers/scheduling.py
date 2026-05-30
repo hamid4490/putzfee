@@ -292,21 +292,34 @@ async def list_taken_slots(
 @router.get("/available-slots", response_model=List[SlotOut])
 async def list_available_slots(
     date: str,
+    offset: str | None = Query(default=None),
     user=Depends(current_user),
 ) -> List[SlotOut]:
     """Return available time slots for a specific date.
 
     Returns all slots within working hours that are not already booked.
     Date is ISO ``YYYY-MM-DD`` interpreted in the business timezone.
+    Optional offset parameter (e.g., "3.5" for UTC+3:30) to interpret date in user's timezone.
     """
-    from datetime import date as _date
+    from datetime import date as _date, timezone as tz_module
 
     s = get_settings()
     d = _date.fromisoformat(date)
-    start_of_day = datetime.combine(d, datetime.min.time(), tzinfo=s.tz)
-    end_of_day = datetime.combine(d, datetime.max.time(), tzinfo=s.tz)
 
-    # Get all taken slots for this date
+    # Use provided offset or fall back to server timezone
+    if offset:
+        try:
+            offset_hours = float(offset)
+            tz = tz_module.timezone(timedelta(hours=offset_hours))
+        except:
+            tz = s.tz
+    else:
+        tz = s.tz
+
+    start_of_day = datetime.combine(d, datetime.min.time(), tzinfo=tz)
+    end_of_day = datetime.combine(d, datetime.max.time(), tzinfo=tz)
+
+    # Get all taken slots for this date (in UTC)
     taken_rows = await database.fetch_all(
         appointments.select()
         .where(appointments.c.start_at >= start_of_day.astimezone(timezone.utc))
@@ -318,10 +331,10 @@ async def list_available_slots(
     slot_duration = timedelta(hours=s.SLOT_DURATION_HOURS)
     available_slots: list[dict] = []
 
-    current = datetime.combine(d, datetime.min.time(), tzinfo=s.tz).replace(
+    current = datetime.combine(d, datetime.min.time(), tzinfo=tz).replace(
         hour=s.WORK_START_HOUR
     )
-    end_time = datetime.combine(d, datetime.min.time(), tzinfo=s.tz).replace(
+    end_time = datetime.combine(d, datetime.min.time(), tzinfo=tz).replace(
         hour=s.WORK_END_HOUR
     )
 
