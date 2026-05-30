@@ -15,7 +15,7 @@ from ..database import (
     reviews,
     schedule_slots,
     services,
-)
+) 
 from ..deps import current_locale, current_user
 from ..i18n import Locale, t
 from ..push import push_to_admins
